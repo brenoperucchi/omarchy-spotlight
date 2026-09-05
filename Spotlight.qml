@@ -9,6 +9,7 @@ import "lib/Units.js" as Units
 import "lib/NaturalTime.js" as NaturalTime
 import "lib/Web.js" as Web
 import "lib/Fuzzy.js" as Fuzzy
+import "lib/Frecency.js" as Frecency
 import "lib/Commands.js" as Commands
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
@@ -52,12 +53,28 @@ Item {
   // Destructive commands need a second Enter. Holds the row key that is armed.
   property string armedKey: ""
 
-  // The query the current rows were built for. Selection is only carried over
-  // when a rebuild is an async refresh of the *same* query.
-  property string rowsFor: ""
+  // The row the user deliberately put the cursor on — arrow keys, or a pointer
+  // that actually moved. Empty means "whatever is top right now", and that is
+  // the rule that makes Enter safe while async rows are still landing: a late
+  // rebuild can reshuffle the list without the cursor ever drifting off the
+  // best answer onto a web suggestion.
+  property string pinnedKey: ""
 
-  // launch counts, for the "most used first" ordering Raycast gets from usage
+  // Decayed launch counts, keyed by row key. See lib/Frecency.js.
   property var usage: ({})
+
+  // Frecency is a bonus on top of the match score, never a replacement for it.
+  // Both caps sit under the smallest gap between two match tiers (500 in the
+  // shell's AppSearch, 500 in Fuzzy), so usage reorders rows that matched
+  // equally well and can never lift a weak match over a name that starts with
+  // what was typed.
+  readonly property int appFrecencyBoost: 450
+  readonly property int commandFrecencyBoost: 400
+  // With no query there is no match score to respect, so frecency owns the
+  // order outright and the alphabetical fallback only breaks its ties.
+  readonly property int idleFrecencyBoost: 100000
+  // Cap on remembered keys. Everything past it is the tail nothing ranks by.
+  readonly property int usageKeepCount: 400
 
   property var settings: ({
     webSuggestions: true,
@@ -126,7 +143,7 @@ Item {
     root.opened = true
     root.armedKey = ""
     root.rows = []
-    root.rowsFor = "\u0000"
+    root.pinnedKey = ""
     input.text = initial
     input.cursorPosition = initial.length
     root.selectedIndex = 0
@@ -135,6 +152,10 @@ Item {
     root.suggestionFor = ""
     root.fileRows = []
     root.fileFor = ""
+    // The panel appears under wherever the pointer already is. Hold the cursor
+    // for the same beat a keystroke would, so opening over a row does not hand
+    // it the selection before the first character is typed.
+    typingGuard.restart()
     if (root.appLibrary) root.appLibrary.refreshIcons()
     remindersProbe.running = true
     root.rebuild()
@@ -167,21 +188,19 @@ Item {
   }
 
   // ------------------------------------------------------------- usage
-  function usageBonus(key) {
-    var entry = root.usage[key]
-    if (!entry) return 0
-    var count = Number(entry.count) || 0
-    var ageDays = (Date.now() - (Number(entry.last) || 0)) / 86400000
-    var recency = ageDays < 1 ? 300 : (ageDays < 7 ? 180 : (ageDays < 30 ? 80 : 0))
-    return Math.min(700, count * 45) + recency
+  // Only keys that still mean the same thing next week are worth remembering.
+  // A web suggestion, a file hit or a window is spelled out of the query that
+  // produced it and is never looked up again, so counting one only grows the
+  // file.
+  function trackable(key) {
+    var k = String(key || "")
+    return k.indexOf("app:") === 0 || k.indexOf("cmd:") === 0 || k.indexOf("bang.") === 0
   }
 
   function bumpUsage(key) {
-    if (!key) return
-    var next = ({})
-    for (var k in root.usage) next[k] = root.usage[k]
-    var prev = next[key] || { count: 0 }
-    next[key] = { count: (Number(prev.count) || 0) + 1, last: Date.now() }
+    if (!root.trackable(key)) return
+    var now = Date.now()
+    var next = Frecency.prune(Frecency.bump(root.usage, key, now), root.usageKeepCount, now)
     root.usage = next
     usageFile.setText(JSON.stringify(next))
   }
@@ -307,36 +326,51 @@ Item {
       }))
     }
 
-    var bang = Web.bang(q)
-    if (bang) {
-      out.push(root.row({
-        key: "bang." + bang.key, section: "Search", kind: "url",
-        title: bang.query, subtitle: "Search " + bang.engine.name,
-        accessory: bang.engine.name, icon: bang.engine.icon,
-        primaryLabel: "Search " + bang.engine.name,
-        payload: { url: Web.searchUrl(bang.query, bang.key) }
-      }))
-    }
-
     return out
+  }
+
+  // A bare bang is a prefix, not a sigil — "gh quickshell" is a GitHub search.
+  // That makes it a trap for any application whose name starts with an engine
+  // key and carries a space, "docker desktop" being the obvious one, so the
+  // bang row is built here and pushed below the applications rather than
+  // taking the cursor off them.
+  function bangRows(q) {
+    var bang = Web.bang(q)
+    if (!bang) return []
+    return [root.row({
+      key: "bang." + bang.key, section: "Search", kind: "url",
+      title: bang.query, subtitle: "Search " + bang.engine.name,
+      accessory: bang.engine.name, icon: bang.engine.icon,
+      primaryLabel: "Search " + bang.engine.name,
+      payload: { url: Web.searchUrl(bang.query, bang.key) }
+    })]
   }
 
   function appRows(q) {
     if (!root.appLibrary) return []
     var entries = root.appLibrary.sortedEntries(q)
+    var now = Date.now()
     var candidates = []
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i].entry
-      var id = String(entry.id || "")
+      var key = "app:" + String(entry.id || "")
+      // sortedEntries scored the match as well as ordering it, and keeping
+      // that number instead of the position is what lets frecency stay a
+      // bounded bonus. Flattened to a rank position, "the name starts with the
+      // query" and "one letter of the acronym matched" sit a single point
+      // apart, so any usage at all was enough to swap them.
       candidates.push({
-        key: "app:" + id,
+        key: key,
         entry: entry,
-        // sortedEntries already ranked these; keep that order and only let
-        // usage lift an app past its neighbours.
-        score: (entries.length - i) + root.usageBonus("app:" + id) * (q ? 1 : 4)
+        order: i,
+        score: (q ? (Number(entries[i].score) || 0) : 0)
+          + Frecency.weight(root.usage[key], now) * (q ? root.appFrecencyBoost : root.idleFrecencyBoost)
       })
     }
-    candidates.sort(function(a, b) { return b.score - a.score })
+    candidates.sort(function(a, b) {
+      if (b.score !== a.score) return b.score - a.score
+      return a.order - b.order
+    })
 
     var limit = q ? Math.max(3, Number(root.settings.maxApps) || 8) : 60
     var out = []
@@ -400,9 +434,15 @@ Item {
 
     // Usage reorders within the matched set without overriding a strong
     // title match, hence the bonus being added to the fuzzy score.
+    var now = Date.now()
     var scored = []
     for (var i = 0; i < ranked.length; i++) {
-      scored.push({ cmd: ranked[i], score: Fuzzy.score(ranked[i], q) + root.usageBonus("cmd:" + ranked[i].key), order: i })
+      var key = "cmd:" + ranked[i].key
+      scored.push({
+        cmd: ranked[i],
+        score: Fuzzy.score(ranked[i], q) + Frecency.weight(root.usage[key], now) * root.commandFrecencyBoost,
+        order: i
+      })
     }
     scored.sort(function(a, b) {
       if (b.score !== a.score) return b.score - a.score
@@ -536,14 +576,6 @@ Item {
   function rebuild() {
     var q = String(root.query || "").trim()
 
-    // Carrying the cursor across a rebuild is only right when late results
-    // arrive for the query the user is still looking at. On a new query the
-    // cursor must go back to the top — otherwise a row whose key survives
-    // every query (the web-search fallback) captures the selection
-    // permanently, and typing an app name would launch a web search.
-    var sameQuery = (q === root.rowsFor)
-    var previousKey = sameQuery ? root.selectedRowKey() : ""
-
     var next = []
     function push(list) { for (var i = 0; i < list.length; i++) next.push(list[i]) }
 
@@ -552,13 +584,13 @@ Item {
     push(root.reminderListRows(q))
     push(root.appRows(q))
     push(root.windowRows(q))
+    push(root.bangRows(q))
     push(root.commandRows(q))
     push(root.fileResultRows(q))
     push(root.suggestionResultRows(q))
     push(root.webFallbackRows(q))
 
     root.rows = next
-    root.rowsFor = q
 
     displayModel.clear()
     for (var j = 0; j < next.length; j++) {
@@ -576,9 +608,13 @@ Item {
       })
     }
 
-    // Keep the cursor on the same row across an async refresh; otherwise land
-    // on the first selectable row.
-    var restored = previousKey ? root.indexOfKey(previousKey) : -1
+    // A deliberate cursor is restored by key, so an async refresh cannot move
+    // it. Everything else follows the top row on every single rebuild: a key
+    // that outlives the query it was built for — the web-search fallback, a
+    // suggestion still on screen while its replacement is in flight — must
+    // never inherit the cursor and turn the next Enter into a web search.
+    var restored = root.pinnedKey ? root.indexOfKey(root.pinnedKey) : -1
+    if (root.pinnedKey && restored < 0) root.pinnedKey = ""
     root.selectedIndex = restored >= 0 ? restored : root.firstSelectableIndex()
     root.cursorActive = next.length > 0
     pointerGate.reset()
@@ -606,12 +642,18 @@ Item {
     return root.rows[root.selectedIndex] || null
   }
 
-  // Only a pointer that actually moved may move the cursor.
+  // Only a pointer that actually moved may move the cursor, and not while the
+  // keyboard is still mid-thought. The card animates its height as rows
+  // arrive, so a pointer resting anywhere over the list has rows sliding under
+  // it on every keystroke; hover winning that race is how "stea" ends up
+  // selecting a web suggestion instead of Steam.
   function selectFromPointer(index, item, mouse) {
+    if (typingGuard.running) return
     if (!root.rows[index] || root.rows[index].kind === "noop") return
     if (!pointerGate.moved(item, mouse)) return
     root.cursorActive = true
     root.selectedIndex = index
+    root.pinnedKey = root.selectedRowKey()
     root.armedKey = ""
   }
 
@@ -626,6 +668,7 @@ Item {
       if (root.rows[index] && root.rows[index].kind !== "noop") break
     }
     root.selectedIndex = index
+    root.pinnedKey = root.selectedRowKey()
     root.cursorActive = true
     root.armedKey = ""
     pointerGate.reset()
@@ -641,6 +684,7 @@ Item {
       index += delta > 0 ? 1 : -1
     if (index < 0 || index >= count) index = delta > 0 ? count - 1 : 0
     root.selectedIndex = index
+    root.pinnedKey = root.selectedRowKey()
     root.cursorActive = true
     root.armedKey = ""
     pointerGate.reset()
@@ -651,6 +695,14 @@ Item {
   function openUrl(url) {
     if (!url) return
     Util.execArgv(["omarchy-launch-browser", String(url)])
+  }
+
+  // Enter comes through here rather than going straight at selectedIndex.
+  // With no deliberate cursor the intent is always "the best row for what I
+  // typed", and resolving that at the keystroke closes the window between a
+  // rebuild landing and the cursor settling onto it.
+  function activateSelection(secondary) {
+    root.activate(root.pinnedKey ? root.selectedIndex : root.firstSelectableIndex(), secondary)
   }
 
   function activate(index, secondary) {
@@ -831,7 +883,10 @@ Item {
   // fast typist does not spawn a process per keystroke.
   onQueryChanged: {
     root.armedKey = ""
-    root.rebuild()
+    // A new query invalidates a deliberate cursor: the row it named may not
+    // even be in the list any more.
+    root.pinnedKey = ""
+    typingGuard.restart()
 
     var q = String(root.query || "").trim()
 
@@ -853,10 +908,31 @@ Item {
     if (wantSuggestions) {
       suggestDebounce.forQuery = q
       suggestDebounce.restart()
+      // Suggestions go stale the moment the query stops being a continuation
+      // of the one that fetched them. Keeping the ones the new query still
+      // narrows is what stops the list collapsing on every keystroke; dropping
+      // the rest is what stops "stea" offering what "ste" asked for.
+      if (root.suggestionFor && q.indexOf(root.suggestionFor) !== 0) {
+        root.suggestionRows = []
+        root.suggestionFor = ""
+      }
     } else {
       suggestDebounce.stop()
       if (root.suggestionRows.length > 0) { root.suggestionRows = []; root.suggestionFor = "" }
     }
+
+    // Last, so the rows show the caches this pass just invalidated rather than
+    // the ones it is about to.
+    root.rebuild()
+  }
+
+  // A keystroke owns the cursor for a moment afterwards: long enough to cover
+  // the card's height animation and the hover events it generates as rows
+  // slide under a stationary pointer, short enough that reaching for the mouse
+  // straight after typing still works.
+  Timer {
+    id: typingGuard
+    interval: 400
   }
 
   Timer {
@@ -956,7 +1032,7 @@ Item {
   // whatever row happens to land under it, so Enter runs the wrong thing.
   PointerMoveGate {
     id: pointerGate
-    referenceItem: card
+    referenceItem: pointerFrame
   }
 
   // ------------------------------------------------------------- surface
@@ -975,6 +1051,15 @@ Item {
     Rectangle {
       anchors.fill: parent
       color: root.scrim
+    }
+
+    // A screen-fixed frame for the pointer gate to measure against. The card
+    // is the wrong reference: it animates its height and stays centred, so it
+    // slides under a stationary pointer on every rebuild and every row that
+    // maps into it reads as deliberate movement.
+    Item {
+      id: pointerFrame
+      anchors.fill: parent
     }
 
     MouseArea {
@@ -1080,6 +1165,7 @@ Item {
           // keeps Ctrl+V, selection and caret movement intact.
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
+            typingGuard.restart()
             if (event.key === Qt.Key_Escape) {
               if (input.text.length > 0) input.text = ""
               else root.dismiss()
@@ -1100,7 +1186,7 @@ Item {
               event.accepted = true
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               var secondary = (event.modifiers & Qt.ShiftModifier) || (event.modifiers & Qt.ControlModifier)
-              root.activate(root.selectedIndex, secondary ? true : false)
+              root.activateSelection(secondary ? true : false)
               event.accepted = true
             } else if (event.key === Qt.Key_Tab) {
               // Tab completes the query with the selected row's title, the way

@@ -94,7 +94,7 @@ And, if you made them, two files the plugin owns and nothing else reads:
 
 ```bash
 rm -f ~/.config/omarchy/spotlight.json            # your settings, if you wrote one
-rm -f ~/.local/state/omarchy/spotlight-usage.json # launch counts
+rm -f ~/.local/state/omarchy/spotlight-usage.json # launch counts, for frecency
 ```
 
 ## What it answers
@@ -104,7 +104,7 @@ obvious thing:
 
 | Type this | You get |
 |---|---|
-| `chrom` | Applications, ranked by how often you launch them |
+| `chrom` | Applications, ranked by how well the name matches and then by frecency |
 | `disc` | …plus any open window whose title or app id matches |
 | `screenshot`, `lock`, `theme` | Omarchy and system commands |
 | `12*7+3`, `sqrt(144)`, `20% of 250`, `15 mod 4` | Calculator — Enter copies the result |
@@ -115,12 +115,43 @@ obvious thing:
 | `meeting with sarah tomorrow at 14:00 for 90min` | Calendar event → Google Calendar, or ⇧↵ for an `.ics` file |
 | `f invoice`, `~/Downloads/`, `/etc/` | File and folder search |
 | `cb ssh` | Clipboard history search — Enter copies |
-| `gh quickshell`, `yt lofi`, `aw hyprland` | Bang searches |
+| `gh quickshell`, `yt lofi`, `aw hyprland` | Bang searches, below any application that also matched |
 | `example.com`, `localhost:3000` | Opens the URL |
 | anything else | Live web suggestions, then "Search Google for …" |
 
 Bang prefixes: `g` `ddg` `yt` `gh` `w` `wde` `aw` `aur` `pkg` `so` `mdn` `npm`
 `crates` `docker` `maps` `tr` `img` `hn` `omarchy`.
+
+## Ranking
+
+Applications are scored by the shell's own `AppSearch` — an exact name, a name
+that starts with the query, a name that contains it, then the id, the keywords
+and the acronym, each its own tier — and then nudged by **frecency**: the
+launch count decayed by how long ago the last launch was, the way `z` and
+zoxide rank directories. Two launches this morning outrank forty from last
+spring.
+
+The nudge is bounded and it saturates, so it only ever reorders apps that
+matched about as well as each other. No amount of usage moves an app past one
+whose name starts with what you typed — `stea` is Steam on a fresh install and
+still Steam after a thousand launches of something else. On an empty query
+there is no match to respect, so the list is pure frecency: your most-used apps,
+most-used first.
+
+Commands and quicklinks are ranked the same way.
+
+## The cursor
+
+The top row is selected, and it stays selected as the list changes underneath
+it. Async rows — web suggestions, file hits — land a few hundred milliseconds
+after the keystroke that asked for them, and none of them may take the cursor:
+type an app name at speed and press Enter and you get the app, never the web
+search that happened to be under the highlight.
+
+The cursor only moves where you put it — `↑` `↓`, `PageUp` `PageDown`, or a
+pointer that actually travelled. A pointer resting over the panel does not
+count, and hover is ignored for a moment after each keystroke, because the card
+resizes as results arrive and rows slide under a still mouse.
 
 ## Keys
 
@@ -157,8 +188,9 @@ on your machine; the "Search Google for …" row still works, because it only
 opens a URL. `searchEngine` takes any bang key above, so `"ddg"` makes
 DuckDuckGo both the fallback and the suggestion source.
 
-Launch counts live in `~/.local/state/omarchy/spotlight-usage.json`. Delete it
-to forget the ranking.
+Launch counts live in `~/.local/state/omarchy/spotlight-usage.json` — one
+`{count, last}` per app, command and bang, capped at 400 entries. Delete it to
+forget the ranking.
 
 ## What it talks to
 
@@ -192,11 +224,13 @@ effect. `lib/` is pure logic, all of it runnable under plain node:
 | `NaturalTime.js` | "in 20m", "tomorrow at 9", durations, ICS timestamps |
 | `Web.js` | Bangs, URL detection, suggestion parsing |
 | `Fuzzy.js` | Ranking for everything that is not an application |
+| `Frecency.js` | Decayed launch counts — how often, weighted by how recently |
 | `Commands.js` | The command and quicklink catalogue — plain data |
 
-Applications are ranked by the shell's own `AppLibrary`, so they order the same
-way as the Omarchy menu. Colors come from the active theme's `[menu]` tokens,
-so the panel rethemes with everything else.
+Applications are matched by the shell's own `AppLibrary`, so they match the same
+way as the Omarchy menu; only the frecency nudge on top is this plugin's.
+Colors come from the active theme's `[menu]` tokens, so the panel rethemes with
+everything else.
 
 **The plugin is `keepLoaded`, so saving a `.qml` file is not enough to see the
 change.** The shell reloads the component but keeps the instance it already
@@ -208,6 +242,15 @@ Static check, without starting a shell:
 ```bash
 mkdir -p /tmp/imports && ln -sfn /usr/share/omarchy/shell /tmp/imports/qs
 /usr/lib/qt6/bin/qmllint -I /tmp/imports -I /usr/lib/qt6/qml Spotlight.qml
+```
+
+On Qt 6.11.2 `qmllint` segfaults on a file this size — on any commit, so a
+crash there says nothing about your edit. `qmlformat -n Spotlight.qml` still
+parses it, and the `lib/` modules run under plain node:
+
+```bash
+/usr/lib/qt6/bin/qmlformat -n Spotlight.qml > /dev/null
+node --check lib/Frecency.js
 ```
 
 ## License
