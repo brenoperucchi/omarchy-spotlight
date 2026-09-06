@@ -169,8 +169,8 @@ field is a real input, so `Ctrl+V`, selection and caret movement work normally.
 
 ## Settings
 
-Optional, at `~/.config/omarchy/spotlight.json`. It hot-reloads; the plugin
-never writes to it.
+Optional, at `~/.config/omarchy/spotlight.json`. It is re-read every time you
+open Spotlight; the plugin never writes to it.
 
 ```json
 {
@@ -187,6 +187,11 @@ autocomplete endpoint as you type.** Set it to `false` to keep every keystroke
 on your machine; the "Search Google for …" row still works, because it only
 opens a URL. `searchEngine` takes any bang key above, so `"ddg"` makes
 DuckDuckGo both the fallback and the suggestion source.
+
+Every value is range-checked on the way in and a bad one falls back to its
+default rather than being used: `maxApps` is clamped to 3–24, `maxSuggestions`
+to 0–8, `searchEngine` has to name an engine in the bang table, and the two
+booleans have to be real JSON `true`/`false`.
 
 Launch counts live in `~/.local/state/omarchy/spotlight-usage.json` — one
 `{count, last}` per app, command and bang, capped at 400 entries. Delete it to
@@ -208,6 +213,7 @@ part of a standard Omarchy install; a missing one only disables its feature:
 
 | Package | Used for |
 |---|---|
+| `python3` | `bin/spotlight-helper`, which brokers every file read and subprocess |
 | `curl` | Web suggestions |
 | `fd` | File search |
 | `wl-clipboard` | The copy actions |
@@ -225,7 +231,38 @@ effect. `lib/` is pure logic, all of it runnable under plain node:
 | `Web.js` | Bangs, URL detection, suggestion parsing |
 | `Fuzzy.js` | Ranking for everything that is not an application |
 | `Frecency.js` | Decayed launch counts — how often, weighted by how recently |
-| `Commands.js` | The command and quicklink catalogue — plain data |
+| `Commands.js` | The command and quicklink catalogue — plain data, argv vectors rather than command lines |
+
+`bin/spotlight-helper` sits between the QML and everything outside it. Spotlight
+is `keepLoaded`, so it lives inside the long-running `omarchy-shell` process and
+anything it reads stays resident for the session; an unbounded read is therefore
+a leak that never ends. Every crossing goes through the helper instead, and each
+one is bounded three ways: a byte ceiling on what is read, a wall-clock deadline
+with a TERM → KILL process-group teardown, and a normalised, count-limited
+projection as the only thing that comes back. Directories are opened as verified
+descriptors — owned by you, not group- or world-writable — and each path
+component is opened relative to the one before it, so no ancestor can be
+swapped between the check and the use. Files are opened `O_NOFOLLOW` and have to
+be regular files you own, which is what keeps a planted symlink, FIFO or device
+out. Writes are locked, atomic `0600` replacements; the `.ics` is created
+`O_EXCL` so an existing name is stepped over rather than written through.
+
+Every subcommand prints exactly one JSON object and exits 0 — a refusal is
+`{"ok": false, …}`, and the caller keeps its defaults:
+
+```bash
+bin/spotlight-helper read-settings
+bin/spotlight-helper read-usage
+bin/spotlight-helper read-clipboard
+bin/spotlight-helper suggest "quicksh"
+bin/spotlight-helper files "$HOME" spotlight
+bin/spotlight-helper reminders
+```
+
+The clipboard is the one place this changes behaviour rather than just bounding
+it: only the one-line titles ever reach the shell process, and `clipboard-copy`
+re-reads the chosen entry and pipes it to `wl-copy` itself, so a history full of
+tokens and passwords is never resident in a process that outlives the query.
 
 Applications are matched by the shell's own `AppLibrary`, so they match the same
 way as the Omarchy menu; only the frecency nudge on top is this plugin's.

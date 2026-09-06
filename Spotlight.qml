@@ -30,6 +30,33 @@ Item {
   readonly property var appLibrary: root.shell ? root.shell.appLibrary : null
   readonly property string home: Quickshell.env("HOME")
 
+  // Spotlight is `keepLoaded`, so it lives inside the long-running
+  // omarchy-shell process rather than being torn down with the overlay.
+  // Nothing it reads may therefore be open-ended: a file, a process output or
+  // a network response that is unbounded at the point of reading stays
+  // resident for the life of the session. Every one of those crossings goes
+  // through bin/spotlight-helper, which caps the bytes, imposes its own
+  // wall-clock deadline with a process-group teardown, and hands back a
+  // normalised, count-limited projection. No FileView, no raw subprocess.
+  readonly property string helper: decodeURIComponent(
+    String(Qt.resolvedUrl("bin/spotlight-helper")).replace(/^file:\/\//, ""))
+
+  function helperArgv(args) {
+    return ["python3", root.helper].concat(args)
+  }
+
+  // Every helper call answers with a single JSON object carrying an `ok` flag.
+  // A refusal is not an error path here — the caller keeps its defaults, which
+  // is what failing closed looks like for a launcher.
+  function helperReply(raw) {
+    try {
+      var parsed = JSON.parse(String(raw || ""))
+      if (parsed && typeof parsed === "object" && parsed.ok === true) return parsed
+    } catch (e) {
+    }
+    return null
+  }
+
   // ------------------------------------------------------------- state
   property bool opened: false
   property string query: ""
@@ -61,7 +88,7 @@ Item {
   property string pinnedKey: ""
 
   // Decayed launch counts, keyed by row key. See lib/Frecency.js.
-  property var usage: ({})
+  property var usage: Frecency.emptyMap()
 
   // Frecency is a bonus on top of the match score, never a replacement for it.
   // Both caps sit under the smallest gap between two match tiers (500 in the
@@ -74,7 +101,20 @@ Item {
   // order outright and the alphabetical fallback only breaks its ties.
   readonly property int idleFrecencyBoost: 100000
   // Cap on remembered keys. Everything past it is the tail nothing ranks by.
+  // The helper enforces the same number on the way in and on the way out, so
+  // the store cannot grow past it by being edited by hand either.
   readonly property int usageKeepCount: 400
+
+  // Hard ceilings on everything the model will hold, applied where the rows
+  // are built rather than after. maxApps is a user setting, so it is clamped
+  // rather than trusted; the rest bound lists that arrive from outside.
+  readonly property int maxAppRows: 24
+  readonly property int maxIdleAppRows: 60
+  // The helper returns at most 40 hits; the list shows the first 10 of them.
+  readonly property int maxFileRows: 10
+  readonly property int maxClipboardRows: 8
+  readonly property int maxReminderRows: 50
+  readonly property int maxQueryChars: 512
 
   property var settings: ({
     webSuggestions: true,
@@ -157,7 +197,12 @@ Item {
     // it the selection before the first character is typed.
     typingGuard.restart()
     if (root.appLibrary) root.appLibrary.refreshIcons()
-    remindersProbe.running = true
+    // Settings are re-read on every open rather than watched. A watcher on a
+    // predictable path is a standing invitation to whatever can write it; one
+    // bounded read when the user asks for the launcher costs nothing and picks
+    // up an edit just as promptly.
+    root.refreshSettings()
+    root.refreshReminders()
     root.rebuild()
     pointerGate.reset()
     Qt.callLater(function() {
@@ -169,8 +214,38 @@ Item {
   function close() {
     root.opened = false
     root.armedKey = ""
+    root.stopQueryWork()
+  }
+
+  // Nothing that was started for a query outlives the overlay it was typed
+  // into: the debounces stop, the readers are terminated, and the rows they
+  // were filling are dropped rather than left resident.
+  function stopQueryWork() {
     suggestDebounce.stop()
     fileDebounce.stop()
+    clipboardDebounce.stop()
+    suggestProc.running = false
+    fileProc.running = false
+    clipboardProc.running = false
+    root.clipboardRows = []
+  }
+
+  function refreshSettings() {
+    settingsProc.running = false
+    settingsProc.command = root.helperArgv(["read-settings"])
+    settingsProc.running = true
+  }
+
+  function refreshUsage() {
+    usageReadProc.running = false
+    usageReadProc.command = root.helperArgv(["read-usage"])
+    usageReadProc.running = true
+  }
+
+  function refreshReminders() {
+    remindersProc.running = false
+    remindersProc.command = root.helperArgv(["reminders"])
+    remindersProc.running = true
   }
 
   // Escape and successful activations go through here so the shell's
@@ -202,34 +277,55 @@ Item {
     var now = Date.now()
     var next = Frecency.prune(Frecency.bump(root.usage, key, now), root.usageKeepCount, now)
     root.usage = next
-    usageFile.setText(JSON.stringify(next))
+    root.persistUsage(JSON.stringify(next))
   }
 
   function loadUsage(raw) {
-    try {
-      var parsed = JSON.parse(String(raw || "{}"))
-      root.usage = (parsed && typeof parsed === "object") ? parsed : ({})
-    } catch (e) {
-      root.usage = ({})
-    }
+    var reply = root.helperReply(raw)
+    // adopt() rebuilds the store as a null-prototype map. The helper has
+    // already dropped anything that is not one of our own keys, and this is
+    // the second half of the same guarantee: on an ordinary object a key of
+    // `__proto__` is an assignment to the prototype rather than an entry, so
+    // one such line in the file would quietly reshape every lookup after it.
+    root.usage = Frecency.adopt(reply ? reply.usage : null)
   }
 
+  // Writes go through the helper too: a locked, atomic 0600 replacement inside
+  // a directory it has verified it owns. Only one write is ever in flight, and
+  // a bump that lands during one is folded into the next.
+  property string pendingUsage: ""
+
+  function persistUsage(json) {
+    root.pendingUsage = json
+    root.flushUsage()
+  }
+
+  function flushUsage() {
+    if (usageWriteProc.running || !root.pendingUsage) return
+    var payload = root.pendingUsage
+    root.pendingUsage = ""
+    usageWriteProc.stdinEnabled = true
+    usageWriteProc.command = root.helperArgv(["write-usage"])
+    usageWriteProc.running = true
+    usageWriteProc.write(payload)
+    usageWriteProc.stdinEnabled = false
+  }
+
+  // Settings arrive already type-checked and clamped. The one thing the helper
+  // cannot judge is whether the engine key names an engine that exists, so
+  // that is settled here against the table that will be asked for it.
   function loadSettings(raw) {
-    var next = {
-      webSuggestions: true,
-      searchEngine: "g",
-      fileSearch: true,
-      maxApps: 8,
-      maxSuggestions: 4
+    var reply = root.helperReply(raw)
+    var parsed = (reply && reply.settings) ? reply.settings : {}
+    root.settings = {
+      webSuggestions: parsed.webSuggestions !== false,
+      searchEngine: Web.hasEngine(parsed.searchEngine) ? parsed.searchEngine : "g",
+      fileSearch: parsed.fileSearch !== false,
+      maxApps: isFinite(parsed.maxApps)
+        ? Util.clamp(parsed.maxApps, 3, root.maxAppRows) : 8,
+      maxSuggestions: isFinite(parsed.maxSuggestions)
+        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4
     }
-    try {
-      var parsed = JSON.parse(String(raw || "{}"))
-      for (var k in next) if (parsed[k] !== undefined) next[k] = parsed[k]
-    } catch (e) {
-      // Malformed settings fall back to the defaults rather than breaking the
-      // launcher; printErrors stays off so a missing file is silent.
-    }
-    root.settings = next
   }
 
   // ------------------------------------------------------------- providers
@@ -372,7 +468,7 @@ Item {
       return a.order - b.order
     })
 
-    var limit = q ? Math.max(3, Number(root.settings.maxApps) || 8) : 60
+    var limit = q ? Util.clamp(root.settings.maxApps, 3, root.maxAppRows) : root.maxIdleAppRows
     var out = []
     for (var j = 0; j < candidates.length && out.length < limit; j++) {
       var c = candidates[j]
@@ -461,7 +557,7 @@ Item {
         icon: c.icon,
         primaryLabel: c.kind === "url" ? "Open in browser" : "Run",
         confirm: c.confirm === true,
-        payload: { cmd: c.cmd || "", id: c.id || "", url: c.url || "" }
+        payload: { argv: c.argv || [], id: c.id || "", url: c.url || "" }
       }))
     }
     return out
@@ -472,19 +568,24 @@ Item {
     return m ? m[1].trim() : ""
   }
 
+  // Only the one-line titles are held here. A clipboard history is the last
+  // thing that should be resident in a process that outlives the query — it is
+  // where tokens and passwords end up — so the bodies stay on disk and the
+  // helper pipes the chosen one straight into wl-copy without it ever crossing
+  // back into the shell.
   function clipboardResultRows(q) {
     var needle = root.clipboardQuery(q)
     if (!needle) return []
-    var ranked = Fuzzy.rank(root.clipboardRows, needle, 8)
+    var ranked = Fuzzy.rank(root.clipboardRows, needle, root.maxClipboardRows)
     var out = []
     for (var i = 0; i < ranked.length; i++) {
       out.push(root.row({
-        key: "clip:" + i,
-        section: "Clipboard History", kind: "copy",
+        key: "clip:" + ranked[i].index,
+        section: "Clipboard History", kind: "clipcopy",
         title: ranked[i].title, subtitle: "",
         accessory: "Copy", icon: "󰅌", mono: true,
         primaryLabel: "Copy to clipboard",
-        payload: { text: ranked[i].fullText }
+        payload: { index: ranked[i].index, title: ranked[i].title }
       }))
     }
     return out
@@ -500,7 +601,7 @@ Item {
       })]
     }
     var out = []
-    for (var i = 0; i < root.reminderRows.length; i++) {
+    for (var i = 0; i < root.reminderRows.length && i < root.maxReminderRows; i++) {
       var r = root.reminderRows[i]
       out.push(root.row({
         key: "reminder.active." + i,
@@ -514,7 +615,7 @@ Item {
       key: "reminder.clear", section: "Reminders", kind: "shell",
       title: "Clear all reminders", subtitle: root.reminderRows.length + " active",
       accessory: "Command", icon: "󰩹",
-      primaryLabel: "Clear", payload: { cmd: "omarchy reminder clear" }
+      primaryLabel: "Clear", payload: { argv: ["omarchy", "reminder", "clear"] }
     }))
     return out
   }
@@ -522,7 +623,7 @@ Item {
   function fileResultRows(q) {
     if (root.fileRows.length === 0) return []
     var out = []
-    for (var i = 0; i < root.fileRows.length && i < 10; i++) {
+    for (var i = 0; i < root.fileRows.length && i < root.maxFileRows; i++) {
       var f = root.fileRows[i]
       out.push(root.row({
         key: "file:" + f.path,
@@ -726,7 +827,10 @@ Item {
     case "shell":
       root.bumpUsage(r.key)
       root.dismiss()
-      Util.execDetached(r.payload.cmd)
+      // execArgv, not execDetached: the catalogue holds argv vectors rather
+      // than command lines, so nothing here is ever re-tokenized by a shell.
+      if (Array.isArray(r.payload.argv) && r.payload.argv.length > 0)
+        Util.execArgv(r.payload.argv)
       break
 
     case "url":
@@ -746,6 +850,18 @@ Item {
       root.dismiss()
       // wl-copy over argv, never a shell string: the text is user data.
       Util.execArgv(["wl-copy", "--", String(r.payload.text || "")])
+      break
+
+    case "clipcopy":
+      root.dismiss()
+      // The body was never loaded, so the helper is told which entry to copy
+      // rather than what to copy. It re-reads the history under the same
+      // bounds, re-identifies the row by the title the user actually saw — the
+      // list may have shifted since — and pipes it to wl-copy itself.
+      clipCopyProc.running = false
+      clipCopyProc.command = root.helperArgv([
+        "clipboard-copy", String(r.payload.index), String(r.payload.title || "")])
+      clipCopyProc.running = true
       break
 
     case "reminder":
@@ -780,11 +896,18 @@ Item {
   }
 
   // Writes the event as an .ics next to the user's downloads and hands it to
-  // the desktop. The payload goes in as positional args so a title with
-  // quotes in it cannot break out of the command.
+  // the desktop.
+  //
+  // The path is predictable, which is the whole problem with writing one: a
+  // shell redirect follows whatever symlink is already sitting at that name,
+  // so anything able to drop a file in ~/Downloads first picks the target. The
+  // helper creates the file O_EXCL|O_NOFOLLOW relative to a directory
+  // descriptor it has verified it owns, so an existing name — symlink or not —
+  // is stepped over rather than written through, and it reports back the path
+  // it actually used.
   function saveIcs(payload) {
-    var stamp = payload.start.replace(/[^0-9TZ]/g, "")
-    var path = root.home + "/Downloads/omarchy-event-" + stamp + ".ics"
+    var stamp = String(payload.start).replace(/[^0-9TZ]/g, "").slice(0, 32)
+    if (!stamp) return
     var ics = [
       "BEGIN:VCALENDAR",
       "VERSION:2.0",
@@ -796,23 +919,38 @@ Item {
       "DTSTAMP:" + payload.start,
       "DTSTART:" + payload.start,
       "DTEND:" + payload.end,
-      "SUMMARY:" + String(payload.title).replace(/([,;\\])/g, "\\$1"),
+      "SUMMARY:" + String(payload.title).replace(/([,;\\])/g, "\\$1").slice(0, 400),
       "END:VEVENT",
       "END:VCALENDAR",
       ""
     ].join("\r\n")
 
-    Quickshell.execDetached([
-      "bash", "-lc",
-      'mkdir -p "$(dirname "$2")" && printf %s "$1" > "$2" && exec xdg-open "$2"',
-      "bash", ics, path
-    ])
+    icsProc.running = false
+    icsProc.stdinEnabled = true
+    icsProc.command = root.helperArgv(["write-ics", stamp])
+    icsProc.running = true
+    icsProc.write(ics)
+    icsProc.stdinEnabled = false
   }
 
   // ------------------------------------------------------------- async data
   function loadSuggestions(raw, forQuery) {
     if (forQuery !== String(root.query || "").trim()) return
-    root.suggestionRows = Web.parseSuggestions(raw, forQuery, Math.max(0, Number(root.settings.maxSuggestions) || 4))
+    var reply = root.helperReply(raw)
+    var list = (reply && Array.isArray(reply.suggestions)) ? reply.suggestions : []
+    var limit = Util.clamp(root.settings.maxSuggestions, 0, 8)
+    var lower = forQuery.toLowerCase()
+    var out = []
+    var seen = Object.create(null)
+    for (var i = 0; i < list.length && out.length < limit; i++) {
+      var text = String(list[i] || "").trim()
+      if (!text) continue
+      var k = text.toLowerCase()
+      if (k === lower || seen[k]) continue
+      seen[k] = true
+      out.push(text)
+    }
+    root.suggestionRows = out
     root.suggestionFor = forQuery
     root.rebuild()
   }
@@ -832,18 +970,17 @@ Item {
 
   function loadFiles(raw, forQuery) {
     if (forQuery !== String(root.query || "").trim()) return
-    var lines = String(raw || "").split("\n")
+    var reply = root.helperReply(raw)
+    var list = (reply && Array.isArray(reply.files)) ? reply.files : []
     var out = []
-    for (var i = 0; i < lines.length; i++) {
-      var path = lines[i].replace(/\/$/, "")
-      if (!path) continue
-      var isDir = lines[i].slice(-1) === "/"
-      var slash = path.lastIndexOf("/")
+    for (var i = 0; i < list.length && out.length < root.maxFileRows; i++) {
+      var f = list[i]
+      if (!f || !f.path) continue
       out.push({
-        path: path,
-        name: slash >= 0 ? path.slice(slash + 1) : path,
-        dir: slash > 0 ? path.slice(0, slash) : "/",
-        isDir: isDir
+        path: String(f.path),
+        name: String(f.name || ""),
+        dir: String(f.dir || "/"),
+        isDir: f.isDir === true
       })
     }
     root.fileRows = out
@@ -852,31 +989,33 @@ Item {
   }
 
   function loadReminders(raw) {
-    try {
-      var parsed = JSON.parse(String(raw || "{}"))
-      root.reminderRows = Array.isArray(parsed.reminders) ? parsed.reminders : []
-    } catch (e) {
-      root.reminderRows = []
+    var reply = root.helperReply(raw)
+    var list = (reply && Array.isArray(reply.reminders)) ? reply.reminders : []
+    var out = []
+    for (var i = 0; i < list.length && out.length < root.maxReminderRows; i++) {
+      var r = list[i]
+      if (!r) continue
+      out.push({
+        label: String(r.label || ""),
+        remaining: String(r.remaining || ""),
+        atTime: String(r.atTime || "")
+      })
     }
+    root.reminderRows = out
     if (root.opened) root.rebuild()
   }
 
   function loadClipboard(raw) {
+    var reply = root.helperReply(raw)
+    var list = (reply && Array.isArray(reply.items)) ? reply.items : []
     var out = []
-    try {
-      var parsed = JSON.parse(String(raw || "[]"))
-      for (var i = 0; i < parsed.length && i < 200; i++) {
-        var item = parsed[i]
-        if (!item || item.type !== "text") continue
-        var text = String(item.text || "")
-        var flat = text.replace(/\s+/g, " ").trim()
-        if (!flat) continue
-        out.push({ title: flat.length > 120 ? flat.slice(0, 120) + "…" : flat, fullText: text })
-      }
-    } catch (e) {
-      out = []
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i]
+      if (!item || typeof item.title !== "string" || !item.title) continue
+      out.push({ index: Util.clamp(item.index, 0, 1000), title: item.title })
     }
     root.clipboardRows = out
+    if (root.opened) root.rebuild()
   }
 
   // Query changes fan out to the async providers on a short debounce so a
@@ -889,6 +1028,16 @@ Item {
     typingGuard.restart()
 
     var q = String(root.query || "").trim()
+
+    // The clipboard list is fetched while a clipboard query is on screen and
+    // dropped the moment it is not, so the titles are resident for the length
+    // of the query rather than the length of the session.
+    if (root.clipboardQuery(q)) {
+      clipboardDebounce.restart()
+    } else {
+      clipboardDebounce.stop()
+      if (root.clipboardRows.length > 0) root.clipboardRows = []
+    }
 
     var target = root.settings.fileSearch ? root.fileSearchTarget(q) : null
     if (target && target.pattern.length >= 1) {
@@ -940,13 +1089,16 @@ Item {
     interval: 220
     property string forQuery: ""
     onTriggered: {
-      if (suggestProc.running) suggestProc.running = false
+      suggestProc.running = false
       suggestProc.forQuery = suggestDebounce.forQuery
-      suggestProc.command = Web.suggestArgv(suggestDebounce.forQuery)
+      suggestProc.command = root.helperArgv(["suggest", suggestDebounce.forQuery])
       suggestProc.running = true
     }
   }
 
+  // The helper builds the endpoint itself and runs curl under a byte ceiling
+  // and its own deadline, so neither a slow endpoint nor an oversized response
+  // can hold or fill the shell process.
   Process {
     id: suggestProc
     property string forQuery: ""
@@ -963,18 +1115,17 @@ Item {
     property string dir: ""
     property string forQuery: ""
     onTriggered: {
-      if (fileProc.running) fileProc.running = false
+      fileProc.running = false
       fileProc.forQuery = fileDebounce.forQuery
-      fileProc.command = [
-        "fd", "--hidden", "--follow",
-        "--exclude", ".git", "--exclude", "node_modules", "--exclude", ".cache",
-        "--max-results", "40",
-        "--", fileDebounce.pattern, fileDebounce.dir
-      ]
+      fileProc.command = root.helperArgv(["files", fileDebounce.dir, fileDebounce.pattern])
       fileProc.running = true
     }
   }
 
+  // fd is bounded by --max-results, but a result count is not a time bound:
+  // a deep or slow tree can keep it walking long after the query is stale.
+  // The helper holds an independent wall-clock deadline over it and tears the
+  // whole process group down when it expires.
   Process {
     id: fileProc
     property string forQuery: ""
@@ -984,40 +1135,83 @@ Item {
     }
   }
 
+  Timer {
+    id: clipboardDebounce
+    interval: 160
+    onTriggered: {
+      clipboardProc.running = false
+      clipboardProc.command = root.helperArgv(["read-clipboard"])
+      clipboardProc.running = true
+    }
+  }
+
   Process {
-    id: remindersProbe
-    command: ["omarchy-reminder", "show", "--json"]
+    id: clipboardProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadClipboard(text)
+    }
+  }
+
+  Process { id: clipCopyProc }
+
+  Process {
+    id: remindersProc
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.loadReminders(text)
     }
   }
 
-  FileView {
-    path: root.home + "/.config/omarchy/spotlight.json"
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.loadSettings(text())
-    onFileChanged: reload()
-    onLoadFailed: root.loadSettings("{}")
+  Process {
+    id: settingsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadSettings(text)
+    }
   }
 
-  FileView {
-    id: usageFile
-    path: root.home + "/.local/state/omarchy/spotlight-usage.json"
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.loadUsage(text())
-    onLoadFailed: root.loadUsage("{}")
+  Process {
+    id: usageReadProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadUsage(text)
+    }
   }
 
-  FileView {
-    path: root.home + "/.local/state/omarchy/clipboard-history.json"
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.loadClipboard(text())
-    onFileChanged: reload()
-    onLoadFailed: root.loadClipboard("[]")
+  Process {
+    id: usageWriteProc
+    onExited: root.flushUsage()
+  }
+
+  Process {
+    id: icsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (reply && reply.path) Util.execArgv(["xdg-open", String(reply.path)])
+      }
+    }
+  }
+
+  Component.onCompleted: {
+    if (root.appLibrary) root.appLibrary.refreshIcons()
+    root.refreshSettings()
+    root.refreshUsage()
+  }
+
+  // Unloading the plugin must not leave a reader behind. Each helper run has
+  // its own deadline as a backstop, but the processes are terminated here so
+  // teardown does not depend on one.
+  Component.onDestruction: {
+    root.stopQueryWork()
+    clipCopyProc.running = false
+    remindersProc.running = false
+    settingsProc.running = false
+    usageReadProc.running = false
+    usageWriteProc.running = false
+    icsProc.running = false
   }
 
   Connections {
@@ -1139,6 +1333,10 @@ Item {
           selectedTextColor: root.foreground
           font.family: root.fontFamily
           font.pixelSize: root.searchFontSize
+          // A query is a line someone typed, and every provider fans out from
+          // it — the web fallback interpolates it into a row title, the file
+          // search hands it to fd. Bounding it here bounds all of them.
+          maximumLength: root.maxQueryChars
           clip: true
           focus: true
           activeFocusOnTab: false
@@ -1467,9 +1665,5 @@ Item {
       total += root.rowHeight
     }
     return total
-  }
-
-  Component.onCompleted: {
-    if (root.appLibrary) root.appLibrary.refreshIcons()
   }
 }
