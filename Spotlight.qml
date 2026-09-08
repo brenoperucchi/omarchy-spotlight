@@ -62,7 +62,9 @@ Item {
   // is what failing closed looks like for a launcher.
   function helperReply(raw) {
     try {
-      var parsed = JSON.parse(String(raw || ""))
+      var text = String(raw || "")
+      if (text.length > root.maxHelperPayloadChars) return null
+      var parsed = JSON.parse(text)
       if (parsed && typeof parsed === "object" && parsed.ok === true) return parsed
     } catch (e) {
     }
@@ -132,9 +134,15 @@ Item {
   readonly property int maxClipboardRows: 8
   readonly property int maxReminderRows: 50
   readonly property int maxQueryChars: 512
+  readonly property int maxPayloadChars: 4096
+  readonly property int maxHelperPayloadChars: 524288
+  readonly property int maxAppCandidates: 512
+  readonly property int maxWindowCandidates: 256
+  readonly property int maxTitleChars: 512
+  readonly property int maxSubtitleChars: 1024
 
   property var settings: ({
-    webSuggestions: true,
+    webSuggestions: false,
     searchEngine: "g",
     fileSearch: true,
     maxApps: 8,
@@ -191,8 +199,11 @@ Item {
   function open(payloadJson) {
     var initial = ""
     try {
-      var payload = JSON.parse(String(payloadJson || "{}"))
-      if (payload && typeof payload.query === "string") initial = payload.query
+      var rawPayload = String(payloadJson || "{}")
+      if (rawPayload.length > root.maxPayloadChars) rawPayload = "{}"
+      var payload = JSON.parse(rawPayload)
+      if (payload && typeof payload.query === "string")
+        initial = payload.query.slice(0, root.maxQueryChars)
     } catch (e) {
       initial = ""
     }
@@ -202,7 +213,7 @@ Item {
     root.rows = []
     root.pinnedKey = ""
     input.text = initial
-    input.cursorPosition = initial.length
+    input.cursorPosition = input.text.length
     root.selectedIndex = 0
     root.cursorActive = true
     root.suggestionRows = []
@@ -349,7 +360,7 @@ Item {
     var reply = root.helperReply(raw)
     var parsed = (reply && reply.settings) ? reply.settings : {}
     root.settings = {
-      webSuggestions: parsed.webSuggestions !== false,
+      webSuggestions: parsed.webSuggestions === true,
       searchEngine: Web.hasEngine(parsed.searchEngine) ? parsed.searchEngine : "g",
       fileSearch: parsed.fileSearch !== false,
       maxApps: isFinite(parsed.maxApps)
@@ -362,14 +373,14 @@ Item {
   // ------------------------------------------------------------- providers
   function row(spec) {
     return {
-      key: spec.key || "",
-      section: spec.section || "",
-      kind: spec.kind || "noop",
-      title: String(spec.title || ""),
-      subtitle: String(spec.subtitle || ""),
-      accessory: String(spec.accessory || ""),
-      icon: String(spec.icon || ""),
-      image: String(spec.image || ""),
+      key: String(spec.key || "").slice(0, 2048),
+      section: String(spec.section || "").slice(0, 128),
+      kind: String(spec.kind || "noop").slice(0, 32),
+      title: String(spec.title || "").slice(0, root.maxTitleChars),
+      subtitle: String(spec.subtitle || "").slice(0, root.maxSubtitleChars),
+      accessory: String(spec.accessory || "").slice(0, 128),
+      icon: String(spec.icon || "").slice(0, 128),
+      image: String(spec.image || "").slice(0, 2048),
       mono: spec.mono === true,
       primaryLabel: spec.primaryLabel || "Open",
       secondaryLabel: spec.secondaryLabel || "",
@@ -476,10 +487,14 @@ Item {
   // Both sources answer with the same [{entry, score}] shape, so nothing below
   // has to know which one produced the list.
   function appEntries(q) {
-    if (root.appLibrary) return root.appLibrary.sortedEntries(q)
+    if (root.appLibrary) {
+      var ranked = root.appLibrary.sortedEntries(q) || []
+      return ranked.slice(0, root.maxAppCandidates)
+    }
     var values = []
     try { values = DesktopEntries.applications.values || [] } catch (e) { return [] }
-    return Apps.sortedEntries(values, q, root.appHides)
+    return Apps.sortedEntries(values, q, root.appHides,
+      root.maxAppCandidates, root.maxAppCandidates * 8)
   }
 
   function appName(entry) {
@@ -568,11 +583,11 @@ Item {
     var values = []
     try { values = ToplevelManager.toplevels.values || [] } catch (e) { return [] }
 
-    for (var i = 0; i < values.length; i++) {
+    for (var i = 0; i < values.length && i < root.maxWindowCandidates; i++) {
       var t = values[i]
       if (!t) continue
-      var title = String(t.title || "")
-      var appId = String(t.appId || "")
+      var title = String(t.title || "").slice(0, root.maxTitleChars)
+      var appId = String(t.appId || "").slice(0, 256)
       if (!title && !appId) continue
       candidates.push({
         title: title || appId,

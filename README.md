@@ -14,17 +14,12 @@ web search — one input, ranked so the top row is the one you meant.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/maajix/omarchy-spotlight.git
-omarchy plugin enable io.github.maajix.spotlight
+omarchy plugin add https://github.com/maajix/omarchy-spotlight.git --enable
 ```
 
-`omarchy plugin add` clones the repository to
-`~/.config/omarchy/plugins/io.github.maajix.spotlight/` and leaves it disabled
-so you can read the code first. Enabling adds the id to `plugins[]` in
-`~/.config/omarchy/shell.json`.
+Omit `--enable` if you want to inspect the code before enabling the plugin.
 
-Nothing else is written for you. The two steps below edit your Hyprland config,
-so they are yours to paste in.
+The two optional steps below are manual changes to your Hyprland configuration.
 
 ### 1. A key to open it
 
@@ -62,25 +57,18 @@ hl.layer_rule({
 })
 ```
 
-`ignore_alpha` is not optional here. The plugin's layer surface is fullscreen —
-a dim scrim with the card floating in it — so `blur = true` on its own frosts
-your entire desktop. The threshold is what keeps the blur on the card:
+Keep `ignore_alpha`: the surface is fullscreen, and the threshold limits blur
+to the card. Then run `hyprctl reload`.
 
+## Update
+
+```bash
+omarchy plugin update io.github.maajix.spotlight
 ```
-card  alpha 0.62  >  0.4  ->  blurred, reads as glass
-scrim alpha 0.25  <  0.4  ->  untouched, only dims
-```
-
-Then `hyprctl reload`.
-
-> Turning on global blur affects every layer rule you already have. If another
-> plugin sets `blur = true` on a fullscreen surface without `ignore_alpha`, that
-> plugin will now frost the whole screen. Check with `hyprctl layers`.
 
 ## Uninstall
 
 ```bash
-omarchy plugin disable io.github.maajix.spotlight
 omarchy plugin remove io.github.maajix.spotlight
 ```
 
@@ -90,7 +78,7 @@ Then delete what you pasted in by hand:
 - the `hl.layer_rule` block for `omarchy-spotlight` in `~/.config/hypr/looknfeel.lua`
   (leave the `hl.config` blur block if anything else uses it), then `hyprctl reload`
 
-And, if you made them, two files the plugin owns and nothing else reads:
+The plugin may also leave its optional settings and local ranking history:
 
 ```bash
 rm -f ~/.config/omarchy/spotlight.json            # your settings, if you wrote one
@@ -117,7 +105,7 @@ obvious thing:
 | `cb ssh` | Clipboard history search — Enter copies |
 | `gh quickshell`, `yt lofi`, `aw hyprland` | Bang searches, below any application that also matched |
 | `example.com`, `localhost:3000` | Opens the URL |
-| anything else | Live web suggestions, then "Search Google for …" |
+| anything else | A web-search row; optional live suggestions appear when enabled |
 
 Bang prefixes: `g` `ddg` `yt` `gh` `w` `wde` `aw` `aur` `pkg` `so` `mdn` `npm`
 `crates` `docker` `maps` `tr` `img` `hn` `omarchy`.
@@ -174,7 +162,7 @@ open Spotlight; the plugin never writes to it.
 
 ```json
 {
-  "webSuggestions": true,
+  "webSuggestions": false,
   "searchEngine": "g",
   "fileSearch": true,
   "maxApps": 8,
@@ -182,11 +170,10 @@ open Spotlight; the plugin never writes to it.
 }
 ```
 
-**`webSuggestions` is on by default and sends your query to Google's public
-autocomplete endpoint as you type.** Set it to `false` to keep every keystroke
-on your machine; the "Search Google for …" row still works, because it only
-opens a URL. `searchEngine` takes any bang key above, so `"ddg"` makes
-DuckDuckGo both the fallback and the suggestion source.
+`webSuggestions` is off by default. Enabling it sends the query to Google's
+public autocomplete endpoint as you type. The regular web-search row only opens
+a URL after activation. `searchEngine` accepts any bang key above and controls
+that row's destination; live suggestions still come from Google.
 
 Every value is range-checked on the way in and a bad one falls back to its
 default rather than being used: `maxApps` is clamped to 3–24, `maxSuggestions`
@@ -208,8 +195,8 @@ Everything else is local. No telemetry, no analytics, no background network.
 
 ## Requirements
 
-Omarchy 4 (Quattro) with the Quickshell-based `omarchy-shell`. These are all
-part of a standard Omarchy install; a missing one only disables its feature:
+Omarchy 4 (Quattro) with the Quickshell-based `omarchy-shell`. Python is required;
+the other commands only provide their corresponding optional feature:
 
 | Package | Used for |
 |---|---|
@@ -218,96 +205,27 @@ part of a standard Omarchy install; a missing one only disables its feature:
 | `fd` | File search |
 | `wl-clipboard` | The copy actions |
 
-## Hacking on it
+## Privacy and security
 
-`Spotlight.qml` is the surface and the only place an action turns into an
-effect. `lib/` is pure logic, all of it runnable under plain node:
+The plugin has no telemetry or background service. Its helper bounds file and
+subprocess output, validates persistent files through directory descriptors,
+refuses symlinks and unsafe ownership or permissions, and uses atomic private
+writes. Subprocesses have deadlines and their process groups are cleaned up.
+Clipboard contents are read only when the selected entry is copied; the shell
+receives the bounded one-line preview.
 
-| File | Job |
-|---|---|
-| `Calc.js` | Recursive-descent arithmetic parser. Deliberately not `eval()` — the query is untrusted and this runs inside the shell process. |
-| `Units.js` | Unit families and conversion |
-| `NaturalTime.js` | "in 20m", "tomorrow at 9", durations, ICS timestamps |
-| `Web.js` | Bangs, URL detection, suggestion parsing |
-| `Fuzzy.js` | Ranking for everything that is not an application |
-| `Frecency.js` | Decayed launch counts — how often, weighted by how recently |
-| `Commands.js` | The command and quicklink catalogue — plain data, argv vectors rather than command lines |
-| `Apps.js` | Application ranking for the fallback app source — a port of Omarchy's own `AppSearch.js`, tier for tier |
+## Development
 
-`bin/spotlight-helper` sits between the QML and everything outside it. Spotlight
-is `keepLoaded`, so it lives inside the long-running `omarchy-shell` process and
-anything it reads stays resident for the session; an unbounded read is therefore
-a leak that never ends. Every crossing goes through the helper instead, and each
-one is bounded three ways: a byte ceiling on what is read, a wall-clock deadline
-with a TERM → KILL process-group teardown, and a normalised, count-limited
-projection as the only thing that comes back. Directories are opened as verified
-descriptors — owned by you, not group- or world-writable — and each path
-component is opened relative to the one before it, so no ancestor can be
-swapped between the check and the use. Files are opened `O_NOFOLLOW` and have to
-be regular files you own, which is what keeps a planted symlink, FIFO or device
-out. `read-hides` is the one exception to "you own it": it reads a packaged
-file under Omarchy's install prefix, so root is accepted as an owner alongside
-you, and a group- or world-writable file is refused either way. Writes are locked, atomic `0600` replacements; the `.ics` is created
-`O_EXCL` so an existing name is stepped over rather than written through.
-
-Every subcommand prints exactly one JSON object and exits 0 — a refusal is
-`{"ok": false, …}`, and the caller keeps its defaults:
+`Spotlight.qml` contains the UI and actions. `lib/` contains the JavaScript
+parsers and ranking logic. `bin/spotlight-helper` is the bounded interface to
+files and subprocesses. Restart the shell after QML changes because the plugin
+is kept loaded.
 
 ```bash
-bin/spotlight-helper read-settings
-bin/spotlight-helper read-usage
-bin/spotlight-helper read-hides
-bin/spotlight-helper read-clipboard
-bin/spotlight-helper suggest "quicksh"
-bin/spotlight-helper files "$HOME" spotlight
-bin/spotlight-helper reminders
-```
-
-The clipboard is the one place this changes behaviour rather than just bounding
-it: only the one-line titles ever reach the shell process, and `clipboard-copy`
-re-reads the chosen entry and pipes it to `wl-copy` itself, so a history full of
-tokens and passwords is never resident in a process that outlives the query.
-
-Applications come from the shell's own `AppLibrary` when the host hands one
-over, so they match the same way as the Omarchy menu; only the frecency nudge
-on top is this plugin's.
-
-Omarchy 4.0.3 stopped handing it over. The library is now gated behind a
-manifest kind of `menu`, which this manifest declares — but the manifest that
-gate reads has been through an `Instantiator` model by the time it arrives, and
-the `QVariantMap` round trip leaves `kinds` an array that no longer answers to
-`Array.isArray`. `manifestHasKind()` tests exactly that, so the check cannot
-pass for any third-party plugin, whatever it declares, and `shell.appLibrary`
-is null. Nothing is logged; the Applications section simply comes back empty.
-
-While that holds, the list is built here instead: `DesktopEntries` — the same
-source `AppLibrary` reads — ranked by `lib/Apps.js`, filtered by the same
-packaged hide list the menu uses, and launched the same way the menu launches
-(`uwsm-app -- gtk-launch <id>.desktop`). What is lost is Omarchy's launch OSD
-and its index of icons installed since login. The moment a release hands the
-library back, every one of those paths switches to it on its own.
-Colors come from the active theme's `[menu]` tokens, so the panel rethemes with
-everything else.
-
-**The plugin is `keepLoaded`, so saving a `.qml` file is not enough to see the
-change.** The shell reloads the component but keeps the instance it already
-mounted, and you end up testing the old build. Run `omarchy restart shell`
-after editing.
-
-Static check, without starting a shell:
-
-```bash
-mkdir -p /tmp/imports && ln -sfn /usr/share/omarchy/shell /tmp/imports/qs
-/usr/lib/qt6/bin/qmllint -I /tmp/imports -I /usr/lib/qt6/qml Spotlight.qml
-```
-
-On Qt 6.11.2 `qmllint` segfaults on a file this size — on any commit, so a
-crash there says nothing about your edit. `qmlformat -n Spotlight.qml` still
-parses it, and the `lib/` modules run under plain node:
-
-```bash
-/usr/lib/qt6/bin/qmlformat -n Spotlight.qml > /dev/null
-node --check lib/Frecency.js
+omarchy plugin validate .
+python3 -m py_compile bin/spotlight-helper
+/usr/lib/qt6/bin/qmlformat -n Spotlight.qml >/dev/null
+for file in lib/*.js; do node --check "$file"; done
 ```
 
 ## License

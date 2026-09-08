@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.maajix.spotlight",
   "name": "Spotlight",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "Max Randhahn",
   "description": "Raycast-style command palette: apps, windows, calculator, unit conversion, reminders, calendar events, file search and web search",
   "kinds": [
@@ -11,7 +11,8 @@
   ],
   "keepLoaded": true,
   "entryPoints": {
-    "overlay": "Spotlight.qml"
+    "overlay": "Spotlight.qml",
+    "menu": "Spotlight.qml"
   },
   "license": "MIT",
   "homepage": "https://github.com/maajix/omarchy-spotlight"
