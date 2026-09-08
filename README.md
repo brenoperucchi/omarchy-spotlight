@@ -232,6 +232,7 @@ effect. `lib/` is pure logic, all of it runnable under plain node:
 | `Fuzzy.js` | Ranking for everything that is not an application |
 | `Frecency.js` | Decayed launch counts — how often, weighted by how recently |
 | `Commands.js` | The command and quicklink catalogue — plain data, argv vectors rather than command lines |
+| `Apps.js` | Application ranking for the fallback app source — a port of Omarchy's own `AppSearch.js`, tier for tier |
 
 `bin/spotlight-helper` sits between the QML and everything outside it. Spotlight
 is `keepLoaded`, so it lives inside the long-running `omarchy-shell` process and
@@ -244,7 +245,9 @@ descriptors — owned by you, not group- or world-writable — and each path
 component is opened relative to the one before it, so no ancestor can be
 swapped between the check and the use. Files are opened `O_NOFOLLOW` and have to
 be regular files you own, which is what keeps a planted symlink, FIFO or device
-out. Writes are locked, atomic `0600` replacements; the `.ics` is created
+out. `read-hides` is the one exception to "you own it": it reads a packaged
+file under Omarchy's install prefix, so root is accepted as an owner alongside
+you, and a group- or world-writable file is refused either way. Writes are locked, atomic `0600` replacements; the `.ics` is created
 `O_EXCL` so an existing name is stepped over rather than written through.
 
 Every subcommand prints exactly one JSON object and exits 0 — a refusal is
@@ -253,6 +256,7 @@ Every subcommand prints exactly one JSON object and exits 0 — a refusal is
 ```bash
 bin/spotlight-helper read-settings
 bin/spotlight-helper read-usage
+bin/spotlight-helper read-hides
 bin/spotlight-helper read-clipboard
 bin/spotlight-helper suggest "quicksh"
 bin/spotlight-helper files "$HOME" spotlight
@@ -264,8 +268,24 @@ it: only the one-line titles ever reach the shell process, and `clipboard-copy`
 re-reads the chosen entry and pipes it to `wl-copy` itself, so a history full of
 tokens and passwords is never resident in a process that outlives the query.
 
-Applications are matched by the shell's own `AppLibrary`, so they match the same
-way as the Omarchy menu; only the frecency nudge on top is this plugin's.
+Applications come from the shell's own `AppLibrary` when the host hands one
+over, so they match the same way as the Omarchy menu; only the frecency nudge
+on top is this plugin's.
+
+Omarchy 4.0.3 stopped handing it over. The library is now gated behind a
+manifest kind of `menu`, which this manifest declares — but the manifest that
+gate reads has been through an `Instantiator` model by the time it arrives, and
+the `QVariantMap` round trip leaves `kinds` an array that no longer answers to
+`Array.isArray`. `manifestHasKind()` tests exactly that, so the check cannot
+pass for any third-party plugin, whatever it declares, and `shell.appLibrary`
+is null. Nothing is logged; the Applications section simply comes back empty.
+
+While that holds, the list is built here instead: `DesktopEntries` — the same
+source `AppLibrary` reads — ranked by `lib/Apps.js`, filtered by the same
+packaged hide list the menu uses, and launched the same way the menu launches
+(`uwsm-app -- gtk-launch <id>.desktop`). What is lost is Omarchy's launch OSD
+and its index of icons installed since login. The moment a release hands the
+library back, every one of those paths switches to it on its own.
 Colors come from the active theme's `[menu]` tokens, so the panel rethemes with
 everything else.
 

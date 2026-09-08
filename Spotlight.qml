@@ -11,6 +11,7 @@ import "lib/Web.js" as Web
 import "lib/Fuzzy.js" as Fuzzy
 import "lib/Frecency.js" as Frecency
 import "lib/Commands.js" as Commands
+import "lib/Apps.js" as Apps
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -24,9 +25,20 @@ Item {
   // ------------------------------------------------------------- injected
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
+  onShellChanged: root.refreshHides()
   property var manifest: null
 
   readonly property string pluginId: (manifest && manifest.id) || "majix.spotlight"
+  // The shell's own application library, when the host hands one over.
+  //
+  // Omarchy 4.0.3 gates it behind a manifest kind of "menu" — which this
+  // manifest now declares — but the manifest that gate reads has been through
+  // an Instantiator model by the time it arrives, and a QVariantMap round trip
+  // leaves `kinds` an array that no longer answers to Array.isArray. The
+  // check inside manifestHasKind() therefore cannot pass for any third-party
+  // plugin, whatever it declares. Applications come from DesktopEntries
+  // instead while that holds; the moment the host starts handing the library
+  // over again, every path below switches back to it on its own.
   readonly property var appLibrary: root.shell ? root.shell.appLibrary : null
   readonly property string home: Quickshell.env("HOME")
 
@@ -86,6 +98,11 @@ Item {
   // rebuild can reshuffle the list without the cursor ever drifting off the
   // best answer onto a web suggestion.
   property string pinnedKey: ""
+
+  // Desktop ids Omarchy keeps out of its own launcher. AppLibrary applies this
+  // list itself, so it is read only when the fallback source is the one
+  // building the list.
+  property var appHides: Apps.hiddenMap([])
 
   // Decayed launch counts, keyed by row key. See lib/Frecency.js.
   property var usage: Frecency.emptyMap()
@@ -240,6 +257,20 @@ Item {
     usageReadProc.running = false
     usageReadProc.command = root.helperArgv(["read-usage"])
     usageReadProc.running = true
+  }
+
+  // Read once, when the host injects its shell: the file is packaged and only
+  // an Omarchy update changes it, which restarts the shell anyway.
+  function refreshHides() {
+    if (!root.shell || root.shell.appLibrary) return
+    hidesProc.running = false
+    hidesProc.command = root.helperArgv(["read-hides"])
+    hidesProc.running = true
+  }
+
+  function loadHides(raw) {
+    var reply = root.helperReply(raw)
+    root.appHides = Apps.hiddenMap(reply ? reply.hides : null)
   }
 
   function refreshReminders() {
@@ -442,9 +473,53 @@ Item {
     })]
   }
 
+  // Both sources answer with the same [{entry, score}] shape, so nothing below
+  // has to know which one produced the list.
+  function appEntries(q) {
+    if (root.appLibrary) return root.appLibrary.sortedEntries(q)
+    var values = []
+    try { values = DesktopEntries.applications.values || [] } catch (e) { return [] }
+    return Apps.sortedEntries(values, q, root.appHides)
+  }
+
+  function appName(entry) {
+    return root.appLibrary ? root.appLibrary.entryName(entry) : Apps.entryName(entry)
+  }
+
+  function appSubtext(entry) {
+    return root.appLibrary ? root.appLibrary.entrySubtext(entry) : Apps.entrySubtext(entry)
+  }
+
+  // AppLibrary keeps its own index of icons installed after the shell started,
+  // because this process's themed-icon cache never re-scans. Without it, the
+  // themed lookup is what there is, and an app installed since login falls
+  // back to the generic icon rather than showing none.
+  function appIcon(icon) {
+    if (root.appLibrary) return root.appLibrary.iconSource(icon)
+    var value = String(icon || "")
+    if (value.length === 0) return Quickshell.iconPath("application-x-executable", true)
+    if (value.indexOf("file://") === 0 || value.indexOf("image://") === 0) return value
+    if (value.charAt(0) === "/") return Util.fileUrl(value)
+    var themed = Quickshell.iconPath(value, true)
+    return themed.length > 0 ? themed : Quickshell.iconPath("application-x-executable", true)
+  }
+
+  // The launch Omarchy itself performs, minus its OSD: gtk-launch resolves the
+  // desktop id — including ids with spaces and ones UWSM rejects — and
+  // uwsm-app puts the app under app-graphical.slice rather than leaving it a
+  // child of the shell's own unit.
+  function launchApp(appId, name) {
+    if (root.appLibrary) {
+      root.appLibrary.launch(appId, name)
+      return
+    }
+    var id = String(appId || "")
+    if (!id) return
+    Util.execArgv(["uwsm-app", "--", "gtk-launch", id + ".desktop"])
+  }
+
   function appRows(q) {
-    if (!root.appLibrary) return []
-    var entries = root.appLibrary.sortedEntries(q)
+    var entries = root.appEntries(q)
     var now = Date.now()
     var candidates = []
     for (var i = 0; i < entries.length; i++) {
@@ -475,12 +550,12 @@ Item {
       out.push(root.row({
         key: c.key,
         section: "Applications", kind: "app",
-        title: root.appLibrary.entryName(c.entry),
-        subtitle: root.appLibrary.entrySubtext(c.entry),
+        title: root.appName(c.entry),
+        subtitle: root.appSubtext(c.entry),
         accessory: "Application",
-        image: root.appLibrary.iconSource(c.entry.icon),
+        image: root.appIcon(c.entry.icon),
         primaryLabel: "Open",
-        payload: { appId: String(c.entry.id || ""), name: root.appLibrary.entryName(c.entry) }
+        payload: { appId: String(c.entry.id || ""), name: root.appName(c.entry) }
       }))
     }
     return out
@@ -821,7 +896,7 @@ Item {
     case "app":
       root.bumpUsage(r.key)
       root.dismiss()
-      if (root.appLibrary) root.appLibrary.launch(r.payload.appId, r.payload.name)
+      root.launchApp(r.payload.appId, r.payload.name)
       break
 
     case "shell":
@@ -1172,6 +1247,14 @@ Item {
   }
 
   Process {
+    id: hidesProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadHides(text)
+    }
+  }
+
+  Process {
     id: usageReadProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -1209,6 +1292,7 @@ Item {
     clipCopyProc.running = false
     remindersProc.running = false
     settingsProc.running = false
+    hidesProc.running = false
     usageReadProc.running = false
     usageWriteProc.running = false
     icsProc.running = false

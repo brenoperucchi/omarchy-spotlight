@@ -71,18 +71,29 @@ REMINDER_FIELD_CHARS = 200
 
 ICS_STAMP_RE = re.compile(r"^[0-9TZ]{1,32}$")
 
+# The packaged list of desktop ids Omarchy keeps out of its own launcher.
+# It lives under /usr/share, so it is the one read that is not ours: root
+# owns it, and root is the only other owner any read here will accept.
+OMARCHY_FALLBACK_PATH = "/usr/share/omarchy"
+HIDES_PARTS = ("default", "omarchy")
+HIDES_NAME = "launcher.hides"
+HIDES_BYTES = 64 * 1024
+HIDES_COUNT = 400
+HIDES_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+SYSTEM_OWNERS = (0, EUID)
+
 
 class Denied(Exception):
     """Any boundary violation. Always fails closed."""
 
 
 # ------------------------------------------------------------ descriptors
-def _verify_dir(fd, label):
+def _verify_dir(fd, label, owners=(EUID,)):
     st = os.fstat(fd)
     if not stat.S_ISDIR(st.st_mode):
         raise Denied("%s is not a directory" % label)
-    if st.st_uid != EUID:
-        raise Denied("%s is not owned by this user" % label)
+    if st.st_uid not in owners:
+        raise Denied("%s is not owned by an accepted user" % label)
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise Denied("%s is group- or world-writable" % label)
 
@@ -128,7 +139,33 @@ def walk(parts, create=False):
     return fd
 
 
-def read_file(dirfd, name, cap):
+def system_dir(path):
+    """Open an absolute system directory, verifying every component in turn.
+
+    Same walk as walk(), one descriptor per component so no ancestor can be
+    swapped between the check and the use, with root allowed as an owner
+    alongside us. Nothing outside Omarchy's own install prefix is read this
+    way, and nothing read this way is ever written.
+    """
+    if not path.startswith("/"):
+        raise Denied("system path is not absolute")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        _verify_dir(fd, "/", SYSTEM_OWNERS)
+        for part in [p for p in path.split("/") if p]:
+            if part == "..":
+                raise Denied("system path escapes upward")
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            _verify_dir(fd, part, SYSTEM_OWNERS)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_file(dirfd, name, cap, owners=(EUID,)):
     """Read at most `cap` bytes from a regular file we own, never following a symlink."""
     try:
         # O_NONBLOCK so a FIFO planted at this name cannot block the open
@@ -145,8 +182,10 @@ def read_file(dirfd, name, cap):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise Denied("%s is not a regular file" % name)
-        if st.st_uid != EUID:
-            raise Denied("%s is not owned by this user" % name)
+        if st.st_uid not in owners:
+            raise Denied("%s is not owned by an accepted user" % name)
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise Denied("%s is group- or world-writable" % name)
         if st.st_size > cap:
             raise Denied("%s is larger than %d bytes" % (name, cap))
         os.set_blocking(fd, True)
@@ -407,6 +446,33 @@ def cmd_read_settings():
     emit({"settings": normalize_settings(parsed)})
 
 
+def cmd_read_hides():
+    """The desktop ids Omarchy keeps out of its own launcher.
+
+    Omarchy's AppLibrary filters these before it hands a list to the menu.
+    When the shell withholds that library, Spotlight builds the list itself
+    and has to apply the same filter, or it shows a page of entries the menu
+    has always hidden.
+    """
+    base = os.environ.get("OMARCHY_PATH", "").strip() or OMARCHY_FALLBACK_PATH
+    fd = system_dir(base.rstrip("/") + "/" + "/".join(HIDES_PARTS))
+    try:
+        raw = read_file(fd, HIDES_NAME, HIDES_BYTES, SYSTEM_OWNERS)
+    finally:
+        os.close(fd)
+
+    hides = []
+    for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        value = line.strip()
+        if value.endswith(".desktop"):
+            value = value[:-8]
+        if HIDES_ID_RE.match(value):
+            hides.append(value)
+        if len(hides) >= HIDES_COUNT:
+            break
+    emit({"hides": hides})
+
+
 def cmd_read_usage():
     fd = walk([".local", "state", "omarchy"], create=True)
     try:
@@ -650,6 +716,7 @@ def cmd_write_ics(argv):
 COMMANDS = {
     "read-settings": (cmd_read_settings, False),
     "read-usage": (cmd_read_usage, False),
+    "read-hides": (cmd_read_hides, False),
     "write-usage": (cmd_write_usage, False),
     "read-clipboard": (cmd_read_clipboard, False),
     "clipboard-copy": (cmd_clipboard_copy, True),
