@@ -108,11 +108,16 @@ class HelperTests(unittest.TestCase):
     def test_files_json_stays_under_the_qml_payload_ceiling_with_non_bmp_paths(self):
         # Non-BMP characters (outside U+0000-U+FFFF, e.g. most emoji) are
         # exactly the case where Python len() and JS String.length diverge -
-        # this is what the 2x margin in FILES_JSON_BUDGET_CHARS is for.
-        emoji_component = "\U0001F600" * 60  # U+1F600, outside the BMP
+        # this is what the 2x margin in FILES_JSON_BUDGET_CHARS is for. The
+        # component is sized close to FILES_PATH_CHARS so the *budget* is
+        # what stops row-building here, not FILES_COUNT - a short component
+        # would let all 400 rows through under either cutoff and never
+        # actually exercise the margin this test exists to protect.
+        emoji_component = "\U0001F600" * 450  # U+1F600, outside the BMP
         line = "/home/user/" + emoji_component + "/Downloads%04d"
         long_lines = "\n".join(line % i for i in range(400)).encode("utf-8") + b"\n"
-        self._assert_payload_fits_qml(self._run_cmd_files(long_lines))
+        parsed = self._assert_payload_fits_qml(self._run_cmd_files(long_lines))
+        self.assertLess(len(parsed["files"]), 400)
 
     def test_files_truncated_output_drops_the_last_line(self):
         original = HELPER.run_bounded
