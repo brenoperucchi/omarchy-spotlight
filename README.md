@@ -105,7 +105,7 @@ obvious thing:
 | `remind me tomorrow at 9 to call the dentist` | Natural times: `in 1h30`, `at 15:30`, `friday 9am`, `24.12. 10:00` |
 | `reminders` | Lists what is pending, with a row to clear them |
 | `meeting with sarah tomorrow at 14:00 for 90min` | Calendar event → Google Calendar, or ⇧↵ for an `.ics` file |
-| `f invoice`, `~/Downloads/`, `/etc/` | File and folder search |
+| `f invoice`, `~/Downloads/`, `/etc/` | File and folder search — the prefix scopes results to files only; any other query also runs it when `fileSearchAlways` is on |
 | `cb ssh` | Clipboard history search — Enter copies |
 | `gh quickshell`, `yt lofi`, `aw hyprland` | Bang searches, below any application that also matched |
 | `example.com`, `localhost:3000` | Opens the URL |
@@ -169,6 +169,7 @@ open Spotlight; the plugin never writes to it.
   "webSuggestions": false,
   "searchEngine": "g",
   "fileSearch": true,
+  "fileSearchAlways": false,
   "maxApps": 8,
   "maxSuggestions": 4
 }
@@ -179,9 +180,15 @@ public autocomplete endpoint as you type. The regular web-search row only opens
 a URL after activation. `searchEngine` accepts any bang key above and controls
 that row's destination; live suggestions still come from Google.
 
+`fileSearchAlways` is off by default. `fileSearch` on its own only runs `fd`
+for the `f `/`file `/`files ` prefix and typed paths; turning `fileSearchAlways`
+on as well runs it for every other query too, one result group among the
+rest, the way Spotlight itself does it — at the cost of one more bounded `fd`
+run per keystroke.
+
 Every value is range-checked on the way in and a bad one falls back to its
 default rather than being used: `maxApps` is clamped to 3–24, `maxSuggestions`
-to 0–8, `searchEngine` has to name an engine in the bang table, and the two
+to 0–8, `searchEngine` has to name an engine in the bang table, and the three
 booleans have to be real JSON `true`/`false`.
 
 Launch counts live in `~/.local/state/omarchy/spotlight-usage.json` — one
