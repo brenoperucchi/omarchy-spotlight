@@ -897,6 +897,21 @@ Item {
     Util.execArgv(["omarchy-launch-browser", String(url)])
   }
 
+  function openPath(path) {
+    var target = String(path || "")
+    if (!target) {
+      console.warn("spotlight: refusing to open an empty path")
+      return
+    }
+    if (openProc.running) {
+      console.warn("spotlight: file opener is already running; skipped:", target)
+      return
+    }
+    openProc.target = target
+    openProc.command = ["gio", "open", target]
+    openProc.running = true
+  }
+
   // Enter comes through here rather than going straight at selectedIndex.
   // With no deliberate cursor the intent is always "the best row for what I
   // typed", and resolving that at the keystroke closes the window between a
@@ -988,8 +1003,8 @@ Item {
 
     case "file":
       root.dismiss()
-      if (secondary) Util.execArgv(["xdg-open", String(r.payload.dir || "")])
-      else Util.execArgv(["xdg-open", String(r.payload.path || "")])
+      if (secondary) root.openPath(r.payload.dir)
+      else root.openPath(r.payload.path)
       break
     }
   }
@@ -1297,8 +1312,17 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         var reply = root.helperReply(text)
-        if (reply && reply.path) Util.execArgv(["xdg-open", String(reply.path)])
+        if (reply && reply.path) root.openPath(reply.path)
       }
+    }
+  }
+
+  Process {
+    id: openProc
+    property string target: ""
+    onExited: function(exitCode) {
+      if (exitCode !== 0)
+        console.warn("spotlight: gio open failed for", target, "with exit code", exitCode)
     }
   }
 
