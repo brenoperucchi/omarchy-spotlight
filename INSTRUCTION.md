@@ -1,4 +1,11 @@
-# Why this fork exists
+# omarchy-spotlight (fork) — what this is
+
+> Process, workflow and stack — how to test a change, how PRs go upstream, who
+> reviews — live in **`AGENTS.md`**. Read it too; only one of these two files
+> is loaded automatically by whichever CLI you are (Claude loads `CLAUDE.md`,
+> which is a symlink to this file; Codex loads `AGENTS.md`).
+
+## Why this fork exists
 
 Fork of [`maajix/omarchy-spotlight`](https://github.com/maajix/omarchy-spotlight),
 created 2026-09-10 from `main` at 1.1.4.
@@ -96,4 +103,4 @@ the compositor gets its job back.
 The plugin's *installed* copy lives at
 `~/.config/omarchy/plugins/io.github.maajix.spotlight` and is updated with
 `omarchy plugin update` from **upstream**. Local edits there are for testing
-and get overwritten. See `AGENTS.md` for the test loop and its traps.
+and get overwritten. The test loop and its traps are in `AGENTS.md`.

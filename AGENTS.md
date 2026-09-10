@@ -1,9 +1,14 @@
-# omarchy-spotlight (fork) — agent instructions
+# omarchy-spotlight (fork) — process, workflow, stack
 
-Read `docs/FORK.md` in full before touching anything here, every session,
-whichever coding agent you are. It says what this fork is for, what is already
-upstream, what is still open, and the one rule that makes the whole thing work:
-**improvements are written here and offered upstream as PRs.**
+**Read `INSTRUCTION.md` first, every session.** It is the context: what this
+fork is for, what is already upstream, what is still open. This file is only
+the *how* — how to test, how a change becomes a PR, who reviews it.
+
+Do not assume the other file was loaded for you: each CLI loads exactly one of
+these automatically. Claude loads `CLAUDE.md` (a symlink to `INSTRUCTION.md`)
+and never reads this one on its own; Codex loads this one and never reads
+`INSTRUCTION.md` on its own. Verified on Claude Code 2.1.266 — an `AGENTS.md`
+alone is invisible to it unless something tells it to go read the file.
 
 This is a fork of [`maajix/omarchy-spotlight`](https://github.com/maajix/omarchy-spotlight).
 `origin` is ours, `upstream` is theirs. The upstream maintainer has been fast
@@ -12,8 +17,10 @@ and receptive (issues #1 and #2 accepted and fixed within hours), so treat
 
 ## Working here
 
-- **Never mix fork-only files into a PR branch.** `AGENTS.md`, `docs/FORK.md`
-  and `.herdr/` exist for us and mean nothing to upstream. Branch from
+- **Never mix fork-only files into a PR branch.** `AGENTS.md`,
+  `INSTRUCTION.md`, `CLAUDE.md` and `.herdr/` exist for us and mean nothing to
+  upstream. `README.md` is theirs — it is the plugin's own README and changes
+  to it are a PR like any other, not a place for fork notes. Branch from
   `upstream/main`, not from a branch that carries them.
 - One branch and one PR per issue item. They are independent on purpose.
 - Rebase on `upstream/main` before opening a PR — upstream moves fast.
