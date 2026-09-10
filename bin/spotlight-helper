@@ -61,7 +61,12 @@ SUGGEST_QUERY_CHARS = 200
 
 FILES_BYTES = 256 * 1024
 FILES_DEADLINE = 3.0
-FILES_COUNT = 40
+# The shell ranks and shows only the best few of these, so this is a scan
+# pool, not a display count: raising it costs `fd` little (its own walk
+# dominates the latency, not the result cap) but is what lets a real match
+# survive being buried behind everything a bare directory walk happens to
+# find first. 400 short paths sits well under FILES_BYTES.
+FILES_COUNT = 400
 FILES_PATH_CHARS = 1024
 FILES_PATTERN_CHARS = 256
 FILES_MAX_TERMS = 8
@@ -691,10 +696,19 @@ def cmd_files(argv):
         fd_argv += ["--and", term]
     fd_argv += ["--", terms[0], directory]
 
-    raw, _ = run_bounded(fd_argv, FILES_BYTES, FILES_DEADLINE)
+    raw, truncated = run_bounded(fd_argv, FILES_BYTES, FILES_DEADLINE)
+
+    lines = raw.decode("utf-8", "replace").split("\n")
+    if truncated:
+        # The byte cap can land mid-path. Whether that clean-looking last
+        # line is really complete or was just cut on a lucky boundary is not
+        # knowable from here, so it is dropped rather than risk emitting a
+        # path that was never real - one fewer candidate costs nothing this
+        # deep in the pool.
+        lines = lines[:-1]
 
     rows = []
-    for line in raw.decode("utf-8", "replace").split("\n"):
+    for line in lines:
         if len(rows) >= FILES_COUNT:
             break
         if not line or len(line) > FILES_PATH_CHARS:

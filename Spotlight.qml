@@ -130,7 +130,8 @@ Item {
   // rather than trusted; the rest bound lists that arrive from outside.
   readonly property int maxAppRows: 24
   readonly property int maxIdleAppRows: 60
-  // The helper returns at most 40 hits; the list shows the first 10 of them.
+  // The helper returns at most 400 hits (a scan pool, ranked below); the
+  // list shows the best 10 of them.
   readonly property int maxFileRows: 10
   readonly property int maxClipboardRows: 8
   readonly property int maxReminderRows: 50
@@ -141,6 +142,17 @@ Item {
   readonly property int maxWindowCandidates: 256
   readonly property int maxTitleChars: 512
   readonly property int maxSubtitleChars: 1024
+
+  // File-result ranking tiers (see fileNameTier/rankFiles below). Spaced far
+  // enough apart that filePathPenalty, capped under fileTierStep, can never
+  // carry a hit across a tier boundary - a worse-matching name never wins
+  // just for sitting in a shallower directory.
+  readonly property int fileTierExact: 5
+  readonly property int fileTierPrefix: 4
+  readonly property int fileTierWord: 3
+  readonly property int fileTierSubstring: 2
+  readonly property int fileTierResidual: 1
+  readonly property int fileTierStep: 10000
 
   property var settings: ({
     webSuggestions: false,
@@ -1093,21 +1105,92 @@ Item {
     return null
   }
 
+  // Name-match quality, evaluated against the basename only - never the
+  // directory, which is exactly how a deep, unrelated path (a stray
+  // ".claude/projects/-home-…-Downloads-…" snapshot) used to outrank the
+  // real folder once dir was thrown into a shared search surface. A term fd
+  // only admitted through its regex (not a literal hit in the name) still
+  // gets the lowest, non-rejecting tier: fd already decided it belongs in
+  // the results, ranking only decides where.
+  function fileNameTier(name, term) {
+    var n = String(name || "").toLowerCase()
+    var t = String(term || "").toLowerCase()
+    if (!t) return root.fileTierResidual
+    if (n === t) return root.fileTierExact
+    if (n.indexOf(t) === 0) return root.fileTierPrefix
+    var idx = n.indexOf(t)
+    if (idx < 0) return root.fileTierResidual
+    var prev = n.charAt(idx - 1)
+    return /[a-z0-9]/i.test(prev) ? root.fileTierSubstring : root.fileTierWord
+  }
+
+  // The combined tier is only as good as the term that matches the name
+  // worst - a term that only matched elsewhere (an --and'd extension inside
+  // a regex, a directory component) does not get to borrow another term's
+  // exact hit.
+  function fileMatchTier(name, terms) {
+    var tier = root.fileTierExact
+    for (var i = 0; i < terms.length; i++) {
+      tier = Math.min(tier, root.fileNameTier(name, terms[i]))
+    }
+    return tier
+  }
+
+  // Penalty for how far below the searched root a hit sits and whether it
+  // passes through a dotdir - capped well under fileTierStep so it can
+  // never carry a hit across a tier boundary, the same invariant
+  // Frecency.weight documents for usage nudges: match quality always wins.
+  function filePathPenalty(dir, name, searchRoot) {
+    var root_ = String(searchRoot || "").replace(/\/+$/, "")
+    var d = String(dir || "")
+    var rel = d.indexOf(root_) === 0 ? d.slice(root_.length) : d
+    var segments = rel.split("/").filter(function(s) { return s.length > 0 })
+    var hiddenAncestor = segments.some(function(s) { return s.charAt(0) === "." })
+    var hiddenName = String(name || "").charAt(0) === "."
+    var penalty = segments.length * 150 + (hiddenAncestor ? 1500 : 0) + (hiddenName ? 500 : 0)
+    return Math.min(penalty, root.fileTierStep - 1)
+  }
+
+  // Ranks in place, best first. Deterministic on ties - never the arrival
+  // order `fd`'s parallel walk happened to produce, which is not even
+  // stable between two runs of the identical query.
+  function rankFiles(list, pattern, searchRoot) {
+    var terms = String(pattern || "").split(/\s+/).filter(function(s) { return s.length > 0 })
+    var browsing = terms.length === 0 || (terms.length === 1 && terms[0] === ".")
+    var scored = list.map(function(f) {
+      var tier = browsing ? root.fileTierExact : root.fileMatchTier(f.name, terms)
+      var penalty = browsing ? 0 : root.filePathPenalty(f.dir, f.name, searchRoot)
+      return { f: f, score: tier * root.fileTierStep - penalty }
+    })
+    scored.sort(function(a, b) {
+      if (b.score !== a.score) return b.score - a.score
+      var an = (a.f.path || "").toLowerCase()
+      var bn = (b.f.path || "").toLowerCase()
+      if (an < bn) return -1
+      if (an > bn) return 1
+      return 0
+    })
+    return scored.map(function(s) { return s.f })
+  }
+
   function loadFiles(raw, forQuery) {
     if (forQuery !== String(root.query || "").trim()) return
     var reply = root.helperReply(raw)
     var list = (reply && Array.isArray(reply.files)) ? reply.files : []
-    var out = []
-    for (var i = 0; i < list.length && out.length < root.maxFileRows; i++) {
+    var target = root.fileSearchTarget(forQuery)
+    var candidates = []
+    for (var i = 0; i < list.length; i++) {
       var f = list[i]
       if (!f || !f.path) continue
-      out.push({
+      candidates.push({
         path: String(f.path),
         name: String(f.name || ""),
         dir: String(f.dir || "/"),
         isDir: f.isDir === true
       })
     }
+    var ranked = target ? root.rankFiles(candidates, target.pattern, target.dir) : candidates
+    var out = ranked.slice(0, root.maxFileRows)
     root.fileRows = out
     root.fileFor = forQuery
     root.rebuild()
