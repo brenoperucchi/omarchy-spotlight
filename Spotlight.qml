@@ -711,7 +711,9 @@ Item {
   }
 
   function fileResultRows(q) {
-    if (root.fileRows.length === 0) return []
+    // Results arrive asynchronously. Do not show the previous file query while
+    // the helper is still answering the current one.
+    if (root.fileFor !== String(q || "").trim() || root.fileRows.length === 0) return []
     var out = []
     for (var i = 0; i < root.fileRows.length && i < root.maxFileRows; i++) {
       var f = root.fileRows[i]
@@ -770,16 +772,23 @@ Item {
     var next = []
     function push(list) { for (var i = 0; i < list.length; i++) next.push(list[i]) }
 
-    push(root.intentRows(q))
-    push(root.clipboardResultRows(q))
-    push(root.reminderListRows(q))
-    push(root.appRows(q))
-    push(root.windowRows(q))
-    push(root.bangRows(q))
-    push(root.commandRows(q))
-    push(root.fileResultRows(q))
-    push(root.suggestionResultRows(q))
-    push(root.webFallbackRows(q))
+    var fileTarget = root.settings.fileSearch ? root.fileSearchTarget(q) : null
+    if (fileTarget && fileTarget.explicit) {
+      // A file keyword is an explicit provider choice, just like the clipboard
+      // prefix. Keep unrelated matches from burying the result it requested.
+      push(root.fileResultRows(q))
+    } else {
+      push(root.intentRows(q))
+      push(root.clipboardResultRows(q))
+      push(root.reminderListRows(q))
+      push(root.appRows(q))
+      push(root.windowRows(q))
+      push(root.bangRows(q))
+      push(root.commandRows(q))
+      push(root.fileResultRows(q))
+      push(root.suggestionResultRows(q))
+      push(root.webFallbackRows(q))
+    }
 
     root.rows = next
 
@@ -1048,12 +1057,12 @@ Item {
   function fileSearchTarget(q) {
     var s = String(q || "").trim()
     var m = s.match(/^(?:f|file|files)\s+(\S.*)$/i)
-    if (m) return { pattern: m[1].trim(), dir: root.home }
+    if (m) return { pattern: m[1].trim(), dir: root.home, explicit: true }
     if (/^~\//.test(s) || /^\//.test(s)) {
       var slash = s.lastIndexOf("/")
       var dir = s.slice(0, slash + 1).replace(/^~/, root.home)
       var pattern = s.slice(slash + 1)
-      return { pattern: pattern || ".", dir: dir }
+      return { pattern: pattern || ".", dir: dir, explicit: false }
     }
     return null
   }

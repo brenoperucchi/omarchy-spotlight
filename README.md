@@ -23,19 +23,23 @@ The two optional steps below are manual changes to your Hyprland configuration.
 
 ### 1. A key to open it
 
-In `~/.config/hypr/bindings.lua`. `CTRL + SPACE` is unbound on stock Omarchy;
+In `~/.config/hypr/bindings.lua`. `ALT + SPACE` is unbound on stock Omarchy;
 pick anything you like:
 
 ```lua
-o.bind("CTRL + SPACE", "Spotlight", "omarchy-shell shell toggle io.github.maajix.spotlight '{}'")
+o.bind("ALT + SPACE", "Spotlight", "omarchy-shell shell toggle io.github.maajix.spotlight '{}'")
 ```
 
 The payload may carry a query, so a second key can open it already primed:
 
 ```lua
-o.bind("CTRL + SHIFT + SPACE", "Spotlight reminder",
+o.bind("ALT + SHIFT + SPACE", "Spotlight reminder",
   "omarchy-shell shell toggle io.github.maajix.spotlight '{\"query\":\"remind me \"}'")
 ```
+
+> As of version 1.1.3, the recommended keybind uses `ALT + SPACE`. Earlier
+> versions suggested `CTRL + SPACE`, which conflicts with fcitx5 on fresh
+> Omarchy installations.
 
 ### 2. Frosted glass (optional)
 
