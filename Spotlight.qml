@@ -1386,16 +1386,33 @@ Item {
     // Anything that moves focus elsewhere - the compositor's own focus
     // bind, alt-tab, a click on another output - must dismiss the launcher,
     // the way losing focus dismisses Spotlight on macOS. Exclusive used to
-    // make this unreachable by construction; OnDemand makes it possible, and
-    // Hyprland's focus-grab protocol is what tells us it happened: a plain
-    // layer-shell surface has no activeChanged of its own to watch, and
-    // `cleared` fires exactly when something outside `windows` takes focus
-    // (a click included, so this also subsumes the MouseArea dismiss below
-    // for clicks on another output the MouseArea itself can't cover).
+    // make this unreachable by construction; OnDemand makes it possible, but
+    // needs two different watchers, because Hyprland tracks "who has
+    // keyboard input" and "which window is active" separately and neither
+    // alone covers every way focus moves:
+    //
+    // - HyprlandFocusGrab.cleared fires on a click outside `windows`, or
+    //   another grab starting (e.g. opening a different Omarchy panel) - per
+    //   the hyprland-focus-grab-v1 protocol, that's the whole list. It does
+    //   NOT fire for a pure keyboard movefocus (SUPER+arrow): movefocus only
+    //   updates Hyprland's *active window* bookkeeping, it does not revoke
+    //   keyboard input from an on_demand layer surface, so nothing a grab
+    //   watches actually happens (confirmed against Hyprland's own
+    //   Actions::moveFocus, and hyprwm/Hyprland#8293/discussion #12663).
+    // - Hyprland.activeToplevelChanged is what movefocus *does* touch, so it
+    //   is the second watcher below, catching exactly the gap the grab
+    //   leaves open.
     HyprlandFocusGrab {
       active: root.opened
       windows: [panel]
       onCleared: if (root.opened) root.dismiss()
+    }
+
+    Connections {
+      target: Hyprland
+      function onActiveToplevelChanged() {
+        if (root.opened) root.dismiss()
+      }
     }
 
     Rectangle {
