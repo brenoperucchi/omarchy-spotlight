@@ -417,6 +417,7 @@ def normalize_settings(parsed):
         "webSuggestions": False,
         "searchEngine": "g",
         "fileSearch": True,
+        "fileSearchAlways": False,
         "maxApps": 8,
         "maxSuggestions": 4,
     }
@@ -424,6 +425,7 @@ def normalize_settings(parsed):
         return out
     out["webSuggestions"] = clamp_bool(parsed.get("webSuggestions"), False)
     out["fileSearch"] = clamp_bool(parsed.get("fileSearch"), True)
+    out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), False)
     out["maxApps"] = clamp_int(parsed.get("maxApps"), 3, 24, 8)
     out["maxSuggestions"] = clamp_int(parsed.get("maxSuggestions"), 0, SUGGEST_COUNT, 4)
     engine = parsed.get("searchEngine")

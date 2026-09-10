@@ -145,6 +145,7 @@ Item {
     webSuggestions: false,
     searchEngine: "g",
     fileSearch: true,
+    fileSearchAlways: false,
     maxApps: 8,
     maxSuggestions: 4
   })
@@ -363,6 +364,7 @@ Item {
       webSuggestions: parsed.webSuggestions === true,
       searchEngine: Web.hasEngine(parsed.searchEngine) ? parsed.searchEngine : "g",
       fileSearch: parsed.fileSearch !== false,
+      fileSearchAlways: parsed.fileSearchAlways === true,
       maxApps: isFinite(parsed.maxApps)
         ? Util.clamp(parsed.maxApps, 3, root.maxAppRows) : 8,
       maxSuggestions: isFinite(parsed.maxSuggestions)
@@ -1079,6 +1081,14 @@ Item {
       var pattern = s.slice(slash + 1)
       return { pattern: pattern || ".", dir: dir, explicit: false }
     }
+    // With no keyword and no path, files are still one provider among many —
+    // that is the whole point of fileSearchAlways — so this match is neither
+    // explicit (it does not scope the results to files only) nor treated like
+    // one for the web-suggestions guard below (it did not ask for files, it
+    // just also got them).
+    if (root.settings.fileSearchAlways && s.length >= 1) {
+      return { pattern: s, dir: root.home, explicit: false, implicit: true }
+    }
     return null
   }
 
@@ -1164,10 +1174,14 @@ Item {
       if (root.fileRows.length > 0) { root.fileRows = []; root.fileFor = "" }
     }
 
+    // A fileSearchAlways match is passive — the query never asked for files,
+    // it just also got them — so unlike an explicit "f " prefix or a typed
+    // path, it must not be the thing that silences web suggestions too.
+    var fileSuggestGuard = root.fileSearchTarget(q)
     var wantSuggestions = root.settings.webSuggestions && q.length >= 2
       && !Web.detectUrl(q) && !Web.bang(q) && !Calc.evaluate(q)
       && !NaturalTime.isReminderQuery(q) && !NaturalTime.isEventQuery(q)
-      && !root.clipboardQuery(q) && !root.fileSearchTarget(q)
+      && !root.clipboardQuery(q) && !(fileSuggestGuard && !fileSuggestGuard.implicit)
     if (wantSuggestions) {
       suggestDebounce.forQuery = q
       suggestDebounce.restart()
