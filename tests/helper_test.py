@@ -1,4 +1,7 @@
+import contextlib
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -51,6 +54,54 @@ class HelperTests(unittest.TestCase):
                     HELPER.read_file(fd, "large", 8)
             finally:
                 os.close(fd)
+
+    def test_files_json_stays_under_the_qml_payload_ceiling_on_long_paths(self):
+        # Spotlight.qml's maxHelperPayloadChars is 524288. Each row repeats
+        # its path across path/name/dir, so a pool of long real-world paths
+        # can clear that ceiling well before FILES_COUNT does - this is what
+        # used to make loadFiles silently fall back to an empty list.
+        long_lines = "\n".join(
+            "/home/user/" + "x" * 580 + "-Downloads-%04d" % i for i in range(400)
+        ).encode("utf-8") + b"\n"
+
+        original = HELPER.run_bounded
+        HELPER.run_bounded = lambda argv, cap, deadline: (long_lines, False)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    HELPER.cmd_files([directory, "Downloads"])
+        finally:
+            HELPER.run_bounded = original
+
+        payload = buf.getvalue()
+        self.assertLess(len(payload), 524288)
+        parsed = json.loads(payload)
+        self.assertTrue(parsed["ok"])
+        self.assertGreater(len(parsed["files"]), 0)
+        self.assertLess(len(parsed["files"]), 400)
+
+    def test_files_truncated_output_drops_the_last_line(self):
+        original = HELPER.run_bounded
+        # A path that would otherwise parse as a perfectly normal hit - the
+        # point is that `truncated=True` alone is enough to drop it, since a
+        # cut mid-path is indistinguishable from a clean one from here.
+        HELPER.run_bounded = lambda argv, cap, deadline: (
+            b"/home/user/real-hit\n/home/user/maybe-cut-off",
+            True,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    HELPER.cmd_files([directory, "hit"])
+        finally:
+            HELPER.run_bounded = original
+
+        parsed = json.loads(buf.getvalue())
+        paths = [f["path"] for f in parsed["files"]]
+        self.assertIn("/home/user/real-hit", paths)
+        self.assertNotIn("/home/user/maybe-cut-off", paths)
 
     def test_deadline_reaps_the_process_group(self):
         with tempfile.TemporaryDirectory() as directory:

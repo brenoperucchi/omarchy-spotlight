@@ -70,6 +70,14 @@ FILES_COUNT = 400
 FILES_PATH_CHARS = 1024
 FILES_PATTERN_CHARS = 256
 FILES_MAX_TERMS = 8
+# Each row repeats its path across path/name/dir plus JSON structure, so 400
+# short real-world hits (35-50 KB raw from `fd`) can still project into a
+# payload several times that size — measured able to clear Spotlight.qml's
+# maxHelperPayloadChars (524288) well before hitting FILES_COUNT, on long
+# real paths. This stops row-building on estimated JSON size directly,
+# comfortably under that ceiling, rather than hoping FILES_COUNT alone keeps
+# the payload small enough.
+FILES_JSON_BUDGET_CHARS = 200000
 
 REMINDER_BYTES = 256 * 1024
 REMINDER_DEADLINE = 3.0
@@ -700,14 +708,16 @@ def cmd_files(argv):
 
     lines = raw.decode("utf-8", "replace").split("\n")
     if truncated:
-        # The byte cap can land mid-path. Whether that clean-looking last
-        # line is really complete or was just cut on a lucky boundary is not
-        # knowable from here, so it is dropped rather than risk emitting a
-        # path that was never real - one fewer candidate costs nothing this
-        # deep in the pool.
+        # run_bounded truncates two ways - the byte cap, or the deadline
+        # tearing the process group down mid-write - and either can land
+        # mid-path. Whether that clean-looking last line is really complete
+        # or was just cut on a lucky boundary is not knowable from here, so
+        # it is dropped rather than risk emitting a path that was never
+        # real - one fewer candidate costs nothing this deep in the pool.
         lines = lines[:-1]
 
     rows = []
+    json_chars = 0
     for line in lines:
         if len(rows) >= FILES_COUNT:
             break
@@ -718,10 +728,18 @@ def cmd_files(argv):
         if not path:
             continue
         slash = path.rfind("/")
+        name = path[slash + 1:] if slash >= 0 else path
+        dirname = path[:slash] if slash > 0 else "/"
+        # +60 covers the field names, quotes, braces and the isDir literal -
+        # a deliberate overestimate, not a measured constant.
+        row_chars = len(path) + len(name) + len(dirname) + 60
+        if rows and json_chars + row_chars > FILES_JSON_BUDGET_CHARS:
+            break
+        json_chars += row_chars
         rows.append({
             "path": path,
-            "name": path[slash + 1:] if slash >= 0 else path,
-            "dir": path[:slash] if slash > 0 else "/",
+            "name": name,
+            "dir": dirname,
             "isDir": is_dir,
         })
     emit({"files": rows})
