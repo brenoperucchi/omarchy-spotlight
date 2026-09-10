@@ -417,7 +417,11 @@ def normalize_settings(parsed):
         "webSuggestions": False,
         "searchEngine": "g",
         "fileSearch": True,
-        "fileSearchAlways": False,
+        # Fork-local default: upstream's own PR for this ships fileSearchAlways
+        # off (one more per-keystroke `fd` run is a cost every user should opt
+        # into), but this fork exists to actually use the fix, not just offer
+        # it, so our own default is on. Not part of that PR.
+        "fileSearchAlways": True,
         "maxApps": 8,
         "maxSuggestions": 4,
     }
@@ -425,7 +429,7 @@ def normalize_settings(parsed):
         return out
     out["webSuggestions"] = clamp_bool(parsed.get("webSuggestions"), False)
     out["fileSearch"] = clamp_bool(parsed.get("fileSearch"), True)
-    out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), False)
+    out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), True)
     out["maxApps"] = clamp_int(parsed.get("maxApps"), 3, 24, 8)
     out["maxSuggestions"] = clamp_int(parsed.get("maxSuggestions"), 0, SUGGEST_COUNT, 4)
     engine = parsed.get("searchEngine")

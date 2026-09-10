@@ -145,7 +145,8 @@ Item {
     webSuggestions: false,
     searchEngine: "g",
     fileSearch: true,
-    fileSearchAlways: false,
+    // Fork-local default: on. See the matching note in loadSettings() below.
+    fileSearchAlways: true,
     maxApps: 8,
     maxSuggestions: 4
   })
@@ -364,7 +365,11 @@ Item {
       webSuggestions: parsed.webSuggestions === true,
       searchEngine: Web.hasEngine(parsed.searchEngine) ? parsed.searchEngine : "g",
       fileSearch: parsed.fileSearch !== false,
-      fileSearchAlways: parsed.fileSearchAlways === true,
+      // Fork-local default: on, unlike the off-by-default this ships with in
+      // the PR to upstream. Mirrors fileSearch's own !== false fallback so a
+      // failed settings read (reply null, parsed = {}) still lands on our
+      // default rather than silently reverting to upstream's.
+      fileSearchAlways: parsed.fileSearchAlways !== false,
       maxApps: isFinite(parsed.maxApps)
         ? Util.clamp(parsed.maxApps, 3, root.maxAppRows) : 8,
       maxSuggestions: isFinite(parsed.maxSuggestions)
