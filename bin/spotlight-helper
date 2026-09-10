@@ -64,6 +64,7 @@ FILES_DEADLINE = 3.0
 FILES_COUNT = 40
 FILES_PATH_CHARS = 1024
 FILES_PATTERN_CHARS = 256
+FILES_MAX_TERMS = 8
 
 REMINDER_BYTES = 256 * 1024
 REMINDER_DEADLINE = 3.0
@@ -660,7 +661,7 @@ def cmd_files(argv):
         raise Denied("files takes a directory and a pattern")
     directory = argv[0]
     pattern = clamp_text(argv[1], FILES_PATTERN_CHARS)
-    if not directory.startswith("/") or len(directory) > FILES_PATH_CHARS or not pattern:
+    if not directory.startswith("/") or len(directory) > FILES_PATH_CHARS or not pattern.strip():
         raise Denied("bad file search target")
     try:
         probe = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -669,12 +670,26 @@ def cmd_files(argv):
         return
     os.close(probe)
 
-    raw, _ = run_bounded(
-        ["fd", "--hidden", "--follow", "--one-file-system",
-         "--exclude", ".git", "--exclude", "node_modules", "--exclude", ".cache",
-         "--max-results", str(FILES_COUNT),
-         "--", pattern, directory],
-        FILES_BYTES, FILES_DEADLINE)
+    # A query like "PMJ XLS" is two terms a user expects ANDed together (one
+    # for the name, one for the extension), not one literal substring — `fd`
+    # takes the first positional pattern plus any number of --and patterns,
+    # so the split lands directly on its own multi-pattern support (fd >= 9.0).
+    #
+    # --ignore-case overrides fd's own smart-case, under which a term typed
+    # in caps (an extension, an acronym) would otherwise force case-sensitive
+    # matching on that one term and silently drop real hits — "XLS" not
+    # matching ".xlsx" is what a user actually typing this feature hits.
+    # Spotlight, the target this plugin models itself on, is not case
+    # sensitive either.
+    terms = pattern.split()[:FILES_MAX_TERMS]
+    fd_argv = ["fd", "--hidden", "--follow", "--one-file-system", "--ignore-case",
+               "--exclude", ".git", "--exclude", "node_modules", "--exclude", ".cache",
+               "--max-results", str(FILES_COUNT)]
+    for term in terms[1:]:
+        fd_argv += ["--and", term]
+    fd_argv += ["--", terms[0], directory]
+
+    raw, _ = run_bounded(fd_argv, FILES_BYTES, FILES_DEADLINE)
 
     rows = []
     for line in raw.decode("utf-8", "replace").split("\n"):
