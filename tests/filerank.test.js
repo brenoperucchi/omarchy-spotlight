@@ -99,3 +99,51 @@ test("ties are broken by path, never by fd's arrival order", () => {
   const reversed = FileRank.rank([b, a], "downloads", "/home/x", 8)
   assert.deepEqual(forward.map(f => f.path), reversed.map(f => f.path))
 })
+
+test("a shallow near-complete prefix outranks an exact match buried in cache/toolchain noise", () => {
+  // Reproduces the production case: typing "Download" toward "Downloads"
+  // used to drop the real folder to third behind a Go module cache
+  // directory that happened to be named exactly "download", four levels
+  // below $HOME (4 * 150 = 600 penalty) - a full FILE_TIER_STEP gap between
+  // EXACT and PREFIX meant no depth penalty could ever close it.
+  const target = file("/home/x/Downloads", true)
+  const cache = file("/home/x/go/pkg/mod/cache/download", true)
+  const ranked = FileRank.rank([cache, target], "Download", "/home/x", 8)
+  assert.equal(ranked[0].path, target.path)
+})
+
+test("the prefix gap is narrow: a merely-deep exact match still beats a shallow prefix", () => {
+  // The fix narrows one specific boundary, it does not flatten tiers in
+  // general - an exact match only one level deep (150 penalty, comfortably
+  // more than FILE_PREFIX_GAP=200 away from mattering here) still loses to
+  // nothing: it should still outrank a same-depth prefix match.
+  const exactOneLevelDeep = file("/home/x/sub/download", true)
+  const prefixShallow = file("/home/x/downloads", true)
+  const ranked = FileRank.rank([prefixShallow, exactOneLevelDeep], "download", "/home/x", 8)
+  assert.equal(ranked[0].path, exactOneLevelDeep.path)
+})
+
+test("an exact match noise directory only two levels deep already loses to a shallow prefix", () => {
+  // Sanity check on the calibration: FILE_PREFIX_GAP (200) is well under
+  // two levels of depth penalty (2 * 150 = 300), so even fairly shallow
+  // noise no longer wins once it stops being exactly at the search root.
+  const noiseTwoLevelsDeep = file("/home/x/a/b/download", true)
+  const target = file("/home/x/Downloads", true)
+  const ranked = FileRank.rank([noiseTwoLevelsDeep, target], "Download", "/home/x", 8)
+  assert.equal(ranked[0].path, target.path)
+})
+
+test("the prefix gap does not distort ordering between two same-tier candidates", () => {
+  // FILE_PREFIX_GAP is a constant offset applied identically to every
+  // PREFIX-tier candidate, so two candidates that are both merely prefixes
+  // (a one-letter query never produces an EXACT match against a longer
+  // real name) still rank purely by depth/hidden penalty and the path
+  // tiebreak, exactly as before the gap was introduced - a naive
+  // alternative that priced the "leftover" characters of a match was found
+  // to regress exactly this case (a short query re-sorting by name length
+  // instead of depth).
+  const shallow = file("/home/x/docs", true)
+  const deeper = file("/home/x/sub/downloads", true)
+  const ranked = FileRank.rank([deeper, shallow], "D", "/home/x", 8)
+  assert.equal(ranked[0].path, shallow.path)
+})
