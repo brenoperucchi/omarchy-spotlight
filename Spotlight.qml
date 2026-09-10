@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
@@ -1371,8 +1372,31 @@ Item {
     // namespace. Renaming it silently turns the glass off.
     WlrLayershell.namespace: "omarchy-spotlight"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    // Exclusive grabs the compositor's own keyboard input wholesale, so a
+    // bind like SUPER+arrow to move focus between windows goes dead while
+    // this is open and the overlay never yields. OnDemand still gets typing
+    // and Hyprland still focuses it the moment it maps (this window is only
+    // ever mapped fresh - `visible` follows `opened` directly, never staying
+    // mapped through a fade-out - which is the case Hyprland does grant
+    // OnDemand focus for), so nothing here needs the Exclusive-then-OnDemand
+    // prime a surface that stays mapped across a close would.
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
     exclusionMode: ExclusionMode.Ignore
+
+    // Anything that moves focus elsewhere - the compositor's own focus
+    // bind, alt-tab, a click on another output - must dismiss the launcher,
+    // the way losing focus dismisses Spotlight on macOS. Exclusive used to
+    // make this unreachable by construction; OnDemand makes it possible, and
+    // Hyprland's focus-grab protocol is what tells us it happened: a plain
+    // layer-shell surface has no activeChanged of its own to watch, and
+    // `cleared` fires exactly when something outside `windows` takes focus
+    // (a click included, so this also subsumes the MouseArea dismiss below
+    // for clicks on another output the MouseArea itself can't cover).
+    HyprlandFocusGrab {
+      active: root.opened
+      windows: [panel]
+      onCleared: if (root.opened) root.dismiss()
+    }
 
     Rectangle {
       anchors.fill: parent
