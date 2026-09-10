@@ -74,9 +74,18 @@ FILES_MAX_TERMS = 8
 # short real-world hits (35-50 KB raw from `fd`) can still project into a
 # payload several times that size — measured able to clear Spotlight.qml's
 # maxHelperPayloadChars (524288) well before hitting FILES_COUNT, on long
-# real paths. This stops row-building on estimated JSON size directly,
+# real paths. This stops row-building on real (not estimated) JSON size,
 # comfortably under that ceiling, rather than hoping FILES_COUNT alone keeps
 # the payload small enough.
+#
+# "Comfortably" has to mean at least 2x, not just "under": this is counted
+# in Python `len()` (code points), but the ceiling it protects is JS
+# `String.length` (UTF-16 code units) on the other side of the JSON — any
+# character outside the BMP counts double there and not here. Measured
+# break-even against a real emit() of a payload that is nearly all
+# non-BMP: ~265000. 200000 keeps that difference from ever mattering —
+# raising this constant without re-deriving that margin reintroduces the
+# empty-results bug this budget exists to prevent.
 FILES_JSON_BUDGET_CHARS = 200000
 
 REMINDER_BYTES = 256 * 1024
@@ -734,18 +743,18 @@ def cmd_files(argv):
         slash = path.rfind("/")
         name = path[slash + 1:] if slash >= 0 else path
         dirname = path[:slash] if slash > 0 else "/"
-        # +60 covers the field names, quotes, braces and the isDir literal -
-        # a deliberate overestimate, not a measured constant.
-        row_chars = len(path) + len(name) + len(dirname) + 60
+        row = {"path": path, "name": name, "dir": dirname, "isDir": is_dir}
+        # The real serialized size, not an estimate from raw string lengths:
+        # a control character (legal in a Linux filename, not rejected
+        # above) expands to a 6-char \uXXXX escape in JSON regardless of
+        # ensure_ascii, which a flat "len(path) + overhead" guess does not
+        # see coming - confirmed able to blow past FILES_JSON_BUDGET_CHARS
+        # on an ASCII-length estimate alone.
+        row_chars = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
         if rows and json_chars + row_chars > FILES_JSON_BUDGET_CHARS:
             break
         json_chars += row_chars
-        rows.append({
-            "path": path,
-            "name": name,
-            "dir": dirname,
-            "isDir": is_dir,
-        })
+        rows.append(row)
     emit({"files": rows})
 
 
