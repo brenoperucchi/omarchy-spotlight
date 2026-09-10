@@ -1122,13 +1122,11 @@ Item {
         isDir: f.isDir === true
       })
     }
-    // No maxTerms here: this helper still filters on the whole pattern as
-    // one fd argument, with no per-term cap of its own to match - that only
-    // exists once multi-term AND splitting lands. Omitting it degrades to
-    // "no cap" (rank()'s own default), never to "reject everything", so a
-    // query with many terms just gets scored on all of them - safe on its
-    // own, but worth re-checking once this and a multi-term change coexist,
-    // since the helper would then cap terms this call does not know about.
+    // fileMaxTerms mirrors bin/spotlight-helper's own FILES_MAX_TERMS (see
+    // rank()'s doc comment in FileRank.js for why this has to match rather
+    // than being omitted): this helper does split a query into multiple
+    // --and patterns, capped at 8, so rank() has to be capped the same way
+    // or it would score terms fd never filtered on.
     var ranked = target
       ? FileRank.rank(candidates, target.pattern, target.dir, root.fileMaxTerms)
       : candidates
