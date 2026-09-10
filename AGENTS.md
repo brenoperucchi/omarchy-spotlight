@@ -31,9 +31,21 @@ and receptive (issues #1 and #2 accepted and fixed within hours), so treat
 ## Testing a change (the part that wastes hours if you guess)
 
 The plugin that actually runs is the copy installed at
-`~/.config/omarchy/plugins/io.github.maajix.spotlight`, not this checkout.
-That copy is git-managed by `omarchy plugin update` and tracks **upstream**, so
-anything you paste into it is temporary by design.
+`~/.config/omarchy/plugins/io.github.maajix.spotlight`, not this checkout. It
+is a real git checkout, and as of 2026-09-10 its `origin` points at **our
+fork**, not upstream — this machine's daily-driver Spotlight runs our `main`,
+fixes included, rather than waiting on upstream to accept each PR. Anything
+you paste into it for a quick check is still temporary by design; the durable
+way to update it is landing the fix in this checkout's `main` (see below) and
+pulling that into the installed copy.
+
+Our fork's `main` is not upstream's `main`: every fix that gets its own
+branch/PR (per the one-branch-one-PR rule above) also gets merged into this
+checkout's `main` right away, whether or not upstream has accepted the PR
+yet. That is what makes `main` here the thing worth installing — the fork is
+the bench *and* the thing we actually run. When upstream accepts a PR and
+this fork rebases past it, nothing here changes; the fix was already in
+`main` before that happened.
 
 - **QML does not hot-reload here.** After changing a `.qml` you must run
   `omarchy-restart-shell`, or you are testing the old code and will conclude
