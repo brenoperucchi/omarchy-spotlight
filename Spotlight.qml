@@ -1402,6 +1402,13 @@ Item {
     // - Hyprland.activeToplevelChanged is what movefocus *does* touch, so it
     //   is the second watcher below, catching exactly the gap the grab
     //   leaves open.
+    // - Switching to a workspace with no windows on it is a third gap on its
+    //   own: activeToplevel simply goes to null, and that transition does
+    //   not reliably fire activeToplevelChanged (confirmed live - switching
+    //   to an empty workspace left the overlay open). Hyprland's own
+    //   focused-workspace tracking changes unconditionally on any workspace
+    //   switch, windows or not, so it is the third watcher, for exactly the
+    //   case the other two both miss.
     HyprlandFocusGrab {
       active: root.opened
       windows: [panel]
@@ -1411,6 +1418,9 @@ Item {
     Connections {
       target: Hyprland
       function onActiveToplevelChanged() {
+        if (root.opened) root.dismiss()
+      }
+      function onFocusedWorkspaceChanged() {
         if (root.opened) root.dismiss()
       }
     }
