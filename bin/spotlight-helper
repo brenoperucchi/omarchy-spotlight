@@ -157,7 +157,7 @@ MENU_JSON_BUDGET_CHARS = 200000
 # outright - the point here is never to guess at shell semantics, so an
 # unquoted occurrence of any of them is treated as "this needs a real
 # shell" rather than parsed further.
-MENU_UNQUOTED_REJECT_CHARS = frozenset("|&;<>`\\*?{}[]#\n")
+MENU_UNQUOTED_REJECT_CHARS = frozenset("|&;()<>`\\*?{}[]#\n")
 # Bash's own default word separators (IFS), not Python's broader isspace() -
 # found by review, isspace() is also true for \r/\v/\f, which Bash treats as
 # ordinary characters *inside* a word, not separators; using it here split
@@ -840,21 +840,29 @@ def _menu_tokenize(action):
             at_token_start = False
             i += 1
             continue
-        if c == "~" and at_token_start:
-            # Only the two forms this module actually implements: `~` alone
-            # (the whole word) or a `~/...` path. `~user` (another user's
-            # home), `~+` ($PWD) and `~-` ($OLDPWD) are real Bash tilde
-            # forms too - found by review, expanding any leading ~
-            # unconditionally fabricated a path for these instead (`~+`
-            # became literally "$HOME+"). Reject rather than guess, the
-            # same policy already applied to every other unsupported
-            # construct in this function.
-            nxt = action[i + 1:i + 2]
-            if nxt == "" or nxt in MENU_WORD_SEP or nxt == "/":
-                chars.append(home)
-                at_token_start = False
-                i += 1
-                continue
+        if c == "~":
+            if at_token_start:
+                # Only the two forms this module actually implements: `~`
+                # alone (the whole word) or a `~/...` path. `~user`
+                # (another user's home), `~+` ($PWD) and `~-` ($OLDPWD) are
+                # real Bash tilde forms too - found by review, expanding any
+                # leading ~ unconditionally fabricated a path for these
+                # instead (`~+` became literally "$HOME+"). Reject rather
+                # than guess, the same policy already applied to every other
+                # unsupported construct in this function.
+                nxt = action[i + 1:i + 2]
+                if nxt == "" or nxt in MENU_WORD_SEP or nxt == "/":
+                    chars.append(home)
+                    at_token_start = False
+                    i += 1
+                    continue
+                return None
+            # Bash also expands a tilde after the `=` (and `:`) of some
+            # assignment-shaped words: `x=~/a` becomes `x=$HOME/a`. This
+            # lexer does not track the full assignment grammar, so keeping
+            # such a tilde literal can silently change an argument. Reject
+            # every non-leading unquoted tilde rather than guessing whether
+            # Bash would expand it; quoted tildes remain ordinary literals.
             return None
         if c == "$":
             # $'...' (ANSI-C quoting) and $"..." (locale quoting) are real
