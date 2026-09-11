@@ -27,7 +27,10 @@ Item {
   // ------------------------------------------------------------- injected
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
-  onShellChanged: root.refreshHides()
+  onShellChanged: {
+    root.refreshHides()
+    root.refreshMenuCommands()
+  }
   property var manifest: null
 
   readonly property string pluginId: (manifest && manifest.id) || "majix.spotlight"
@@ -107,6 +110,12 @@ Item {
   // list itself, so it is read only when the fallback source is the one
   // building the list.
   property var appHides: Apps.hiddenMap([])
+
+  // The real Omarchy root-menu tree, projected by the helper into rows
+  // shaped exactly like Commands.js's own entries - commandRows() below
+  // merges the two without needing to know one came from a different
+  // source.
+  property var menuCommands: []
 
   // Decayed launch counts, keyed by row key. See lib/Frecency.js.
   property var usage: Frecency.emptyMap()
@@ -293,6 +302,46 @@ Item {
   function loadHides(raw) {
     var reply = root.helperReply(raw)
     root.appHides = Apps.hiddenMap(reply ? reply.hides : null)
+  }
+
+  // Read once, when the host injects its shell: the tree is either packaged
+  // (an Omarchy update restarts the shell anyway) or the user's own
+  // extension file, which changes rarely enough that re-reading on every
+  // open - the way settings does - would be evaluating dozens of `when`
+  // conditions for no reason most of the time.
+  function refreshMenuCommands() {
+    if (!root.shell) return
+    menuCommandsProc.running = false
+    menuCommandsProc.command = root.helperArgv(["read-menu-commands"])
+    menuCommandsProc.running = true
+  }
+
+  function loadMenuCommands(raw) {
+    var reply = root.helperReply(raw)
+    var list = (reply && Array.isArray(reply.commands)) ? reply.commands : []
+    var out = []
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i]
+      if (!c || !Array.isArray(c.argv) || c.argv.length === 0) continue
+      var argv = []
+      for (var j = 0; j < c.argv.length; j++) argv.push(String(c.argv[j]))
+      out.push({
+        key: String(c.key || ""),
+        title: String(c.title || "").slice(0, root.maxTitleChars),
+        subtitle: String(c.subtitle || "").slice(0, root.maxSubtitleChars),
+        icon: String(c.icon || "󰣇"),
+        kind: "shell",
+        // Dispatch is still plain "shell" (activate()'s switch never sees
+        // this), but commandRows() reads it to label these distinctly from
+        // the hand-curated catalogue - these are real Omarchy menu tree
+        // entries, not entries this project wrote, and looking identical
+        // to a curated command made that distinction invisible.
+        source: "menu",
+        argv: argv,
+        keywords: String(c.keywords || "")
+      })
+    }
+    root.menuCommands = out
   }
 
   function refreshReminders() {
@@ -627,7 +676,7 @@ Item {
 
   function commandRows(q) {
     if (!q) return []
-    var catalogue = Commands.commands().concat(Commands.quicklinks())
+    var catalogue = Commands.commands().concat(Commands.quicklinks()).concat(root.menuCommands)
     var ranked = Fuzzy.rank(catalogue, q, 40)
 
     // Usage reorders within the matched set without overriding a strong
@@ -650,12 +699,17 @@ Item {
     var out = []
     for (var j = 0; j < scored.length && j < 7; j++) {
       var c = scored[j].cmd
+      var fromMenu = c.source === "menu"
       out.push(root.row({
         key: "cmd:" + c.key,
-        section: c.kind === "url" ? "Quicklinks" : "Commands",
+        // Real Omarchy menu tree entries get their own section/badge -
+        // "Command" implied this project wrote and curated every one of
+        // them, which stopped being true once the actual menu tree (275+
+        // entries) got pulled in alongside the ~50 hand-curated ones.
+        section: c.kind === "url" ? "Quicklinks" : (fromMenu ? "Omarchy Menu" : "Commands"),
         kind: c.kind,
         title: c.title, subtitle: c.subtitle,
-        accessory: c.kind === "url" ? "Link" : "Command",
+        accessory: c.kind === "url" ? "Link" : (fromMenu ? "Menu" : "Command"),
         icon: c.icon,
         primaryLabel: c.kind === "url" ? "Open in browser" : "Run",
         confirm: c.confirm === true,
@@ -1325,6 +1379,14 @@ Item {
   }
 
   Process {
+    id: menuCommandsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadMenuCommands(text)
+    }
+  }
+
+  Process {
     id: usageReadProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -1372,6 +1434,7 @@ Item {
     remindersProc.running = false
     settingsProc.running = false
     hidesProc.running = false
+    menuCommandsProc.running = false
     usageReadProc.running = false
     usageWriteProc.running = false
     icsProc.running = false
