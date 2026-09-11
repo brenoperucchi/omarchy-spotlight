@@ -1,6 +1,10 @@
 const assert = require("node:assert/strict")
+const fs = require("node:fs")
+const path = require("node:path")
 const test = require("node:test")
 const FileRank = require("../lib/FileRank.js")
+
+const ROOT = path.join(__dirname, "..")
 
 function file(path, isDir) {
   var slash = path.lastIndexOf("/")
@@ -146,4 +150,36 @@ test("the prefix gap does not distort ordering between two same-tier candidates"
   const deeper = file("/home/x/sub/downloads", true)
   const ranked = FileRank.rank([deeper, shallow], "D", "/home/x", 8)
   assert.equal(ranked[0].path, shallow.path)
+})
+
+test("the production call site passes fileMaxTerms, matching the helper's own cutoff", () => {
+  // Flagged in maintainer review on the PR: main's multi-term change AND-filters bin/spotlight-
+  // helper's `fd` call on the first FILES_MAX_TERMS (8) terms, but this
+  // branch's production loadFiles() call to FileRank.rank() had no
+  // corresponding argument at all - an omitted maxTerms silently degrades
+  // to rank()'s no-cap default rather than failing loudly, so nothing here
+  // short of reading the actual call site (the unit tests above only
+  // exercise the scorer API, never this file) would have caught it. This
+  // is a text check, not a QML runtime one - there is no QML test harness
+  // in this repo - but it pins both the constant and the call shape so a
+  // stale comment or a dropped argument fails a test instead of shipping.
+  const qml = fs.readFileSync(path.join(ROOT, "Spotlight.qml"), "utf8")
+  const helper = fs.readFileSync(path.join(ROOT, "bin", "spotlight-helper"), "utf8")
+
+  const qmlMatch = qml.match(/readonly property int fileMaxTerms:\s*(\d+)/)
+  assert.ok(qmlMatch, "Spotlight.qml must declare a fileMaxTerms property")
+
+  const helperMatch = helper.match(/^FILES_MAX_TERMS = (\d+)/m)
+  assert.ok(helperMatch, "bin/spotlight-helper must declare FILES_MAX_TERMS")
+
+  assert.equal(
+    qmlMatch[1],
+    helperMatch[1],
+    "Spotlight.qml's fileMaxTerms must match the helper's FILES_MAX_TERMS"
+  )
+  assert.match(
+    qml,
+    /FileRank\.rank\(candidates, target\.pattern, target\.dir, root\.fileMaxTerms\)/,
+    "the production loadFiles() call must pass root.fileMaxTerms to FileRank.rank()"
+  )
 })

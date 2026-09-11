@@ -134,6 +134,14 @@ Item {
   // The helper returns at most 400 hits (a scan pool, ranked below); the
   // list shows the best 10 of them.
   readonly property int maxFileRows: 10
+  // Must match bin/spotlight-helper's FILES_MAX_TERMS: the helper only
+  // AND-filters on the first 8 terms of a multi-term query, so a 9th+ term
+  // is absent from every candidate it returns. Scoring against terms past
+  // that point (rank()'s own no-cap default) treats an ignored term as
+  // "not found" in every candidate equally, which can still separate them
+  // on it - passing the same limit here is what keeps FileRank scoring the
+  // same terms the helper actually filtered on.
+  readonly property int fileMaxTerms: 8
   readonly property int maxClipboardRows: 8
   readonly property int maxReminderRows: 50
   readonly property int maxQueryChars: 512
@@ -1111,15 +1119,14 @@ Item {
         isDir: f.isDir === true
       })
     }
-    // No maxTerms here: this helper still filters on the whole pattern as
-    // one fd argument, with no per-term cap of its own to match - that only
-    // exists once multi-term AND splitting lands. Omitting it degrades to
-    // "no cap" (rank()'s own default), never to "reject everything", so a
-    // query with many terms just gets scored on all of them - safe on its
-    // own, but worth re-checking once this and a multi-term change coexist,
-    // since the helper would then cap terms this call does not know about.
+    // fileMaxTerms must match the helper's own FILES_MAX_TERMS - flagged in
+    // maintainer review: main already AND-filters on the first 8 terms of
+    // a multi-term query, so scoring past that point (an omitted maxTerms
+    // degrades to rank()'s no-cap default, not to "reject everything")
+    // could still separate otherwise-identical candidates on a term fd
+    // never filtered on.
     var ranked = target
-      ? FileRank.rank(candidates, target.pattern, target.dir)
+      ? FileRank.rank(candidates, target.pattern, target.dir, root.fileMaxTerms)
       : candidates
     var out = ranked.slice(0, root.maxFileRows)
     root.fileRows = out
