@@ -118,6 +118,51 @@ class MenuCommandsTests(unittest.TestCase):
         # does not understand, not something to pass through literally.
         self.assertIsNone(HELPER._menu_resolve_argv("omarchy-dns $CUSTOM_DNS"))
 
+    def test_action_does_not_expand_a_variable_that_merely_starts_with_home(self):
+        # $HOMEDIR is a different variable that happens to start with the
+        # same four letters - a substring replace turned it into a
+        # fabricated path instead of leaving it as the unresolved variable
+        # it is, which the token-with-a-$-left-in-it check rejects.
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = "/home/test-user"
+        try:
+            self.assertIsNone(HELPER._menu_resolve_argv("omarchy-launch-config-editor $HOMEDIR/a"))
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_action_with_a_single_quoted_home_is_rejected_not_expanded(self):
+        # Single quotes in real shell mean literal - $HOME under them must
+        # not be resolved. shlex.split strips the quoting before this ever
+        # sees it, so the only correct outcome here is rejection, not a
+        # silently wrong expansion.
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = "/home/test-user"
+        try:
+            self.assertIsNone(HELPER._menu_resolve_argv("omarchy-launch-config-editor '$HOME/a'"))
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_action_rejects_redirection_background_and_glob_operators(self):
+        # Real evidence from the review: shlex tokenises these into
+        # syntactically valid-looking argv (">"/"&" as literal tokens)
+        # instead of raising, so the operator blacklist - not shlex itself -
+        # is what has to catch them.
+        for action in (
+            "omarchy-dns DHCP > /tmp/dns.log",
+            "omarchy-dns DHCP 2> /tmp/dns.log",
+            "omarchy-dns DHCP < /tmp/in",
+            "omarchy-dns DHCP &",
+            "omarchy-launch-webapp *.desktop",
+            "omarchy-launch-webapp {a,b}",
+        ):
+            self.assertIsNone(HELPER._menu_resolve_argv(action), action)
+
     def test_systemctl_action_is_rejected_regardless_of_shape(self):
         # The exact case Commands.js already refuses by hand (its own
         # comment: a bare systemctl call costs the marketplace listing its
@@ -137,6 +182,7 @@ class MenuCommandsTests(unittest.TestCase):
         self.assertTrue(HELPER._menu_when_allows(None))
 
     def test_when_pkg_present_reads_the_cached_package_list(self):
+        original = HELPER._INSTALLED_PACKAGES
         HELPER._INSTALLED_PACKAGES = frozenset({"git", "python"})
         try:
             self.assertTrue(HELPER._menu_when_allows("omarchy-pkg-present git"))
@@ -144,7 +190,20 @@ class MenuCommandsTests(unittest.TestCase):
             self.assertFalse(HELPER._menu_when_allows("! omarchy-pkg-present git"))
             self.assertTrue(HELPER._menu_when_allows("! omarchy-pkg-present nonexistent-pkg"))
         finally:
-            HELPER._INSTALLED_PACKAGES = None
+            HELPER._INSTALLED_PACKAGES = original
+
+    def test_when_pkg_present_shows_rather_than_hides_on_a_truncated_listing(self):
+        # None now distinctly means "truncated/unknown", not "not yet read"
+        # (that is the "unread" sentinel) - a truncated pacman -Qq listing
+        # must not read as "package absent" for a plain check, nor as
+        # "package present" for a negated one; both must default to shown.
+        original = HELPER._INSTALLED_PACKAGES
+        HELPER._INSTALLED_PACKAGES = None
+        try:
+            self.assertTrue(HELPER._menu_when_allows("omarchy-pkg-present git"))
+            self.assertTrue(HELPER._menu_when_allows("! omarchy-pkg-present git"))
+        finally:
+            HELPER._INSTALLED_PACKAGES = original
 
     def test_when_cmd_present_checks_path(self):
         self.assertTrue(HELPER._menu_when_allows("omarchy-cmd-present sh"))
@@ -159,6 +218,18 @@ class MenuCommandsTests(unittest.TestCase):
             self.assertFalse(HELPER._menu_when_allows("[[ ! -d %s ]]" % directory))
             self.assertTrue(HELPER._menu_when_allows("[[ -f %s ]]" % file_path))
             self.assertFalse(HELPER._menu_when_allows("[[ -f %s/missing ]]" % directory))
+
+    def test_when_path_exists_handles_quoted_paths_with_spaces(self):
+        # A quoted path is the normal, equivalent Bash form - the previous
+        # regex captured the quotes themselves as part of the filename, so
+        # `[[ -d "/" ]]` came back False even though `/` plainly exists.
+        self.assertTrue(HELPER._menu_when_allows('[[ -d "/" ]]'))
+        self.assertTrue(HELPER._menu_when_allows("[[ -d '/' ]]"))
+        with tempfile.TemporaryDirectory() as directory:
+            spaced = Path(directory) / "Xbox Cloud Gaming"
+            spaced.mkdir()
+            self.assertTrue(HELPER._menu_when_allows('[[ -d "%s" ]]' % spaced))
+            self.assertFalse(HELPER._menu_when_allows('[[ -d "%s missing" ]]' % spaced))
 
     def test_when_unrecognised_condition_shows_rather_than_hides(self):
         # A false negative (a row silently disappears) is worse in a
@@ -177,21 +248,47 @@ class MenuCommandsTests(unittest.TestCase):
         self.assertEqual(merged["personal"]["icon"], "A")
         self.assertEqual(merged["personal"]["action"], "omarchy-x")
 
+    def test_merge_does_not_leave_a_stale_action_when_an_extension_turns_it_into_a_link(self):
+        # The review's main finding: merging raw dicts (rather than
+        # normalizing each source first, as the real MenuModel.js does)
+        # let a default action survive under an extension's replacement
+        # label even though the extension itself no longer sets `action`
+        # at all - the exact case where the real menu runs nothing and
+        # Spotlight would otherwise have kept running the old command.
+        default_items = HELPER._menu_parse_items(
+            json.dumps({"custom": {"label": "Original", "action": "omarchy-x"}}).encode()
+        )
+        user_items = HELPER._menu_parse_items(
+            json.dumps({"custom": {"label": "Submenu", "target": "style"}}).encode()
+        )
+        merged, order = HELPER._menu_merge(default_items, user_items)
+        self.assertEqual(merged["custom"]["kind"], "link")
+        self.assertEqual(merged["custom"]["action"], "")
+        self.assertEqual(merged["custom"]["target"], "style")
+
     def test_breadcrumb_walks_labelled_ancestors_and_tolerates_cycles(self):
         merged = {
-            "a": {"label": "Top", "_parent": "root"},
-            "a.b": {"label": "Mid", "_parent": "a"},
-            "a.b.c": {"label": "Leaf", "_parent": "a.b"},
+            "a": {"label": "Top", "parent": "root"},
+            "a.b": {"label": "Mid", "parent": "a"},
+            "a.b.c": {"label": "Leaf", "parent": "a.b"},
         }
         self.assertEqual(HELPER._menu_breadcrumb("a.b.c", merged), "Top › Mid")
 
         cyclic = {
-            "x": {"label": "X", "_parent": "y"},
-            "y": {"label": "Y", "_parent": "x"},
+            "x": {"label": "X", "parent": "y"},
+            "y": {"label": "Y", "parent": "x"},
         }
         # Must terminate rather than loop forever; the exact crumb does not
         # matter as much as returning at all.
         HELPER._menu_breadcrumb("x", cyclic)
+
+    def test_breadcrumb_clamps_each_ancestor_label(self):
+        merged = {
+            "a": {"label": "x" * (HELPER.MENU_BREADCRUMB_LABEL_CHARS + 50), "parent": "root"},
+            "a.b": {"label": "Leaf", "parent": "a"},
+        }
+        crumb = HELPER._menu_breadcrumb("a.b", merged)
+        self.assertLessEqual(len(crumb), HELPER.MENU_BREADCRUMB_LABEL_CHARS + 3)
 
     def test_menu_commands_never_emit_a_non_omarchy_prefixed_command(self):
         for row in HELPER._menu_commands():
@@ -202,6 +299,61 @@ class MenuCommandsTests(unittest.TestCase):
             item_id = row["key"].split(":", 1)[1]
             self.assertFalse(item_id.startswith(("install.", "remove.", "system.")), item_id)
             self.assertNotIn(item_id, ("install", "remove", "system"))
+
+    def test_menu_commands_exclude_ids_that_collide_with_commands_js(self):
+        # Keybindings and Screensaver already exist by hand in Commands.js
+        # with different (Screensaver: opposite) behaviour - a second,
+        # differently-behaving row under the same title is a worse outcome
+        # than the menu tree's copy being absent from this catalogue.
+        ids = {row["key"].split(":", 1)[1] for row in HELPER._menu_commands()}
+        for skipped in HELPER.MENU_SKIP_IDS:
+            self.assertNotIn(skipped, ids)
+
+    def test_menu_commands_stops_before_exceeding_the_json_budget(self):
+        # Row count and per-label clamps alone do not bound the real
+        # serialized payload; MENU_JSON_BUDGET_CHARS is the defense-in-depth
+        # that actually has to trip. Shrink the budget rather than trying to
+        # organically produce >200000 chars, so the assertion is exact and
+        # not dependent on today's field-length constants.
+        original_default = HELPER._menu_read_default
+        original_user = HELPER._menu_read_user
+        original_budget = HELPER.MENU_JSON_BUDGET_CHARS
+        tree = {}
+        for i in range(60):
+            tree["c%d" % i] = {"label": "Leaf number %d" % i, "action": "omarchy-x"}
+        HELPER._menu_read_default = lambda: json.dumps(tree).encode()
+        HELPER._menu_read_user = lambda: b"{}"
+        HELPER.MENU_JSON_BUDGET_CHARS = 1000
+        try:
+            rows = HELPER._menu_commands()
+            self.assertGreater(len(rows), 0)
+            self.assertLess(len(rows), 60)
+            total = len(json.dumps(rows, ensure_ascii=False, separators=(",", ":")))
+            self.assertLessEqual(total, HELPER.MENU_JSON_BUDGET_CHARS + 200)
+        finally:
+            HELPER._menu_read_default = original_default
+            HELPER._menu_read_user = original_user
+            HELPER.MENU_JSON_BUDGET_CHARS = original_budget
+
+    def test_menu_commands_always_emits_at_least_one_row_even_over_budget(self):
+        # A single row larger than the whole budget must still go out - the
+        # budget check only applies once at least one row has been emitted,
+        # so one oversized entry cannot silently empty the entire catalogue.
+        original_default = HELPER._menu_read_default
+        original_user = HELPER._menu_read_user
+        original_budget = HELPER.MENU_JSON_BUDGET_CHARS
+        HELPER._menu_read_default = lambda: json.dumps(
+            {"only": {"label": "Only Item", "action": "omarchy-x"}}
+        ).encode()
+        HELPER._menu_read_user = lambda: b"{}"
+        HELPER.MENU_JSON_BUDGET_CHARS = 1
+        try:
+            rows = HELPER._menu_commands()
+            self.assertEqual(len(rows), 1)
+        finally:
+            HELPER._menu_read_default = original_default
+            HELPER._menu_read_user = original_user
+            HELPER.MENU_JSON_BUDGET_CHARS = original_budget
 
     def test_menu_commands_row_shape_matches_commands_js(self):
         rows = HELPER._menu_commands()

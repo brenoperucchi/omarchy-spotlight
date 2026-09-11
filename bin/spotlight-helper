@@ -96,6 +96,16 @@ MENU_USER_PARTS = (".config", "omarchy", "extensions")
 MENU_JSONC_BYTES = 256 * 1024
 MENU_MAX_ITEMS = 400
 MENU_SKIP_PREFIXES = ("install.", "remove.", "system.")
+# Known collisions with lib/Commands.js's own curated entries, found by
+# review, not by construction (no general dedup pass exists - a title match
+# alone cannot tell "same command, different label" from "different command,
+# same label"). learn.keybindings duplicates the curated `keys` row exactly;
+# trigger.screensaver is worse than a duplicate - it *toggles* an active
+# screensaver off, while the curated row *starts* one, so the same title
+# would mean opposite things depending on which row a user happened to
+# click. Extend this list as more surface; it is not a promise of
+# completeness.
+MENU_SKIP_IDS = ("learn.keybindings", "trigger.screensaver")
 # Only omarchy's own wrapped commands - the same posture Commands.js already
 # committed to (its own comment: no Suspend row, because a bare `systemctl
 # suspend` would cost the marketplace listing its automatic Verified status).
@@ -109,16 +119,61 @@ MENU_ARGV_TOKENS = 12
 MENU_ARGV_CHARS = 512
 MENU_LABEL_CHARS = 200
 MENU_BREADCRUMB_DEPTH = 6
+# Each ancestor label is clamped before joining into a subtitle - a leaf's
+# own label is bounded by MENU_LABEL_CHARS, but an *ancestor* label, shared
+# by every one of its descendants, was not bounded at all: found by review,
+# a single oversized ancestor label (real risk only via the user's own
+# extension file, but still real) multiplies across every child under it and
+# can blow well past the JSON budget below on its own.
+MENU_BREADCRUMB_LABEL_CHARS = 60
 MENU_PKG_LIST_DEADLINE = 2.0
 MENU_PKG_LIST_BYTES = 512 * 1024
-# A real shell operator in the action string - not a leftover $VAR, which is
-# handled separately (only $HOME/~ are expanded, as plain substitution, never
-# through a shell). Conservative on purpose: unrecognised syntax is excluded,
-# never guessed at.
-MENU_SHELL_OPERATOR_RE = re.compile(r"(\|\||&&|;|\$\(|`|\bif\b|\bthen\b|\belif\b|\bfi\b|>>|<<|(?<!\|)\|(?!\|))")
+# Same reasoning as bin/spotlight-helper's file-search budget (see
+# FILES_JSON_BUDGET_CHARS): row count alone does not bound serialized JSON
+# size, and Spotlight.qml rejects the whole reply above maxHelperPayloadChars
+# (524288) - found by review, a single very long ancestor label (see
+# MENU_BREADCRUMB_LABEL_CHARS above) was enough to build a 400-item reply
+# past that ceiling from a 22 KB source file. This stops row-building on
+# real (not estimated) JSON size directly; margin reasoning matches
+# FILES_JSON_BUDGET_CHARS's comment (Python len() vs JS String.length).
+MENU_JSON_BUDGET_CHARS = 200000
+# A real shell operator or metacharacter in the action string - not a
+# leftover $VAR, which is handled separately (only $HOME/~ are expanded, as
+# plain substitution, never through a shell). Conservative on purpose:
+# unrecognised syntax is excluded, never guessed at - found by review, the
+# original version of this list missed enough real shell syntax (a bare `>`
+# or `<`, `&` backgrounding, a newline joining two separate commands, globs)
+# that those actions were silently accepted and then executed wrong (the
+# operator landing as a literal, useless argv token) rather than rejected.
+# Checked against every action in the shipped default tree: none of the ones
+# already accepted contain any of these characters, so this does not narrow
+# what works today - it only closes what should never have been accepted.
+MENU_SHELL_OPERATOR_RE = re.compile(
+    r"(\|\||&&|;|\$\(|`|\bif\b|\bthen\b|\belif\b|\bfi\b|[<>&*?{}\n\\]|(?<!\|)\|(?!\|))"
+)
 MENU_WHEN_PKG_RE = re.compile(r"^(!\s*)?omarchy-pkg-present\s+(\S+)$")
 MENU_WHEN_CMD_RE = re.compile(r"^(!\s*)?omarchy-cmd-present\s+(\S+)$")
-MENU_WHEN_PATH_RE = re.compile(r"^\[\[\s*(!\s*)?-([df])\s+(\S+)\s*\]\]$")
+# The path may be quoted the normal Bash way (`[[ -d "$HOME/foo" ]]`, or,
+# for a path containing a space, has to be) - found by review, treating the
+# quotes as part of the path made every quoted condition evaluate as though
+# the path did not exist; matched as two alternatives (quoted allows spaces,
+# unquoted does not) rather than one pattern, since a real entry in the
+# shipped tree quotes a path with a space in it.
+MENU_WHEN_PATH_RE = re.compile(r'^\[\[\s*(!\s*)?-([df])\s+(?:(["\'])(.*?)\3|(\S+))\s*\]\]$')
+# $HOME must end at a word boundary - found by review, a plain substring
+# replace turned $HOMEDIR (a different, unrelated variable name that merely
+# starts with the same four letters) into a fabricated path instead of
+# being left as an unresolved $ and rejected.
+MENU_HOME_VAR_RE = re.compile(r"\$HOME\b")
+# shlex.split discards which quote style (if any) wrapped each token, but
+# quote style changes what real Bash would do: $HOME stays literal under
+# single quotes (found by review - resolving it there is a silent wrong
+# expansion, not a convenience), and a leading ~ is never expanded under
+# either quote style. Checked against the raw, still-quoted action string,
+# before tokenising - a token this manual expansion would get wrong is
+# rejected rather than resolved incorrectly.
+MENU_QUOTED_HOME_RE = re.compile(r"'[^']*\$HOME\b[^']*'")
+MENU_QUOTED_TILDE_RE = re.compile(r"""(['"])[^'"]*~[^'"]*\1""")
 
 
 class Denied(Exception):
@@ -503,8 +558,10 @@ def normalize_usage(parsed):
 def _menu_strip_jsonc(raw):
     """JSONC -> JSON: line comments and trailing commas, nothing else.
 
-    Matches MenuModel.js's own stripJsonc exactly (same two regexes), so a
-    file the real menu accepts parses here the same way.
+    Same two transformations as MenuModel.js's own stripJsonc, so a file the
+    real menu accepts parses here the same way - not the identical regexes
+    (this one keeps the trailing newline the JS version consumes), just the
+    same net effect on any real menu file.
     """
     text = raw.decode("utf-8", "replace") if raw is not None else ""
     text = re.sub(r"^[ \t]*//[^\n]*$", "", text, flags=re.M)
@@ -512,8 +569,60 @@ def _menu_strip_jsonc(raw):
     return text
 
 
+def _menu_normalize_item(item_id, entry):
+    """Same normalization MenuModel.js's own normalizeItem does, applied per
+    source, before merging with the other one - not after.
+
+    Every recognised field is always present here (empty string/list when
+    the source did not set it), which is what makes the merge in
+    _menu_merge correct: an extension entry that reuses an id to turn an
+    action into a link (sets `target`, does not repeat `action`) has to
+    actually clear the inherited action, not just add `target` next to it.
+    Found by review: merging un-normalized dicts kept the old action alive
+    under the new label, because a field simply absent from the override
+    never overwrote the default's value for that field. `kind` is computed
+    here, per source, for the same reason `action`/`target` are - it is
+    itself just another field that the later source's own normalization
+    overwrites on merge, exactly matching what the real menu does.
+    """
+    aliases = entry.get("aliases")
+    if isinstance(aliases, list):
+        aliases = [a for a in aliases if isinstance(a, str) and a]
+    elif isinstance(aliases, str) and aliases:
+        aliases = [aliases]
+    else:
+        aliases = []
+    parent = entry.get("parent")
+    if not isinstance(parent, str):
+        if item_id == "root":
+            parent = ""
+        elif "." in item_id:
+            parent = item_id.rsplit(".", 1)[0]
+        else:
+            parent = "root"
+    action = entry.get("action")
+    action = action if isinstance(action, str) else ""
+    target = entry.get("target")
+    target = target if isinstance(target, str) else ""
+    label = entry.get("label")
+    label = label if isinstance(label, str) and label else item_id
+    return {
+        "parent": parent,
+        "kind": "action" if action else ("link" if target else "menu"),
+        "icon": entry.get("icon") if isinstance(entry.get("icon"), str) else "",
+        "label": label,
+        "target": target,
+        "action": action,
+        "provider": entry.get("provider") if isinstance(entry.get("provider"), str) else "",
+        "aliases": aliases,
+        "when": entry.get("when") if isinstance(entry.get("when"), str) else "",
+    }
+
+
 def _menu_parse_items(raw):
-    """Raw JSONC bytes -> {id: entry-dict}. Never raises; bad input is empty."""
+    """Raw JSONC bytes -> {id: normalized-entry-dict}. Never raises; bad
+    input is empty.
+    """
     text = _menu_strip_jsonc(raw)
     if not text.strip():
         return {}
@@ -528,7 +637,7 @@ def _menu_parse_items(raw):
     for item_id, entry in source.items():
         if not isinstance(item_id, str) or not isinstance(entry, dict):
             continue
-        out[item_id] = entry
+        out[item_id] = _menu_normalize_item(item_id, entry)
     return out
 
 
@@ -573,26 +682,18 @@ def _menu_merge(default_items, user_items):
     return merged, order
 
 
-def _menu_parent(item_id, entry):
-    parent = entry.get("parent")
-    if isinstance(parent, str):
-        return parent
-    if item_id == "root":
-        return ""
-    if "." in item_id:
-        return item_id.rsplit(".", 1)[0]
-    return "root"
-
-
 def _menu_breadcrumb(item_id, merged):
     """Ancestor labels, root-to-parent, joined for a subtitle - `Style ›
     Font` rather than a bare `Font`, since dozens of leaves share generic
     labels (`Default`, `Theme`, `Chrome`) that only their place in the tree
-    disambiguates.
+    disambiguates. Each ancestor label is clamped on its own - unlike a
+    leaf's own label, an ancestor's is shared by every descendant under it,
+    so one oversized label found here multiplies across a whole subtree
+    rather than costing one row.
     """
     parts = []
     seen = set()
-    current = merged.get(item_id, {}).get("_parent", "")
+    current = merged.get(item_id, {}).get("parent", "")
     while current and current != "root" and current not in seen and len(parts) < MENU_BREADCRUMB_DEPTH:
         seen.add(current)
         entry = merged.get(current)
@@ -600,8 +701,8 @@ def _menu_breadcrumb(item_id, merged):
             break
         label = entry.get("label")
         if isinstance(label, str) and label:
-            parts.append(label)
-        current = entry.get("_parent", "")
+            parts.append(clamp_text(label, MENU_BREADCRUMB_LABEL_CHARS))
+        current = entry.get("parent", "")
     parts.reverse()
     return " › ".join(parts)
 
@@ -620,6 +721,8 @@ def _menu_resolve_argv(action):
     action = str(action or "").strip()
     if not action or MENU_SHELL_OPERATOR_RE.search(action):
         return None
+    if MENU_QUOTED_HOME_RE.search(action) or MENU_QUOTED_TILDE_RE.search(action):
+        return None
     try:
         tokens = shlex.split(action)
     except ValueError:
@@ -630,7 +733,11 @@ def _menu_resolve_argv(action):
     resolved = []
     for token in tokens:
         if home:
-            token = token.replace("$HOME", home)
+            # \b, not a plain substring replace: $HOMEDIR is a different,
+            # unrelated variable name that merely starts with the same four
+            # letters, and must be left with its $ intact so the check below
+            # rejects it, not silently rewritten into a fabricated path.
+            token = MENU_HOME_VAR_RE.sub(home, token)
         if token == "~" or token.startswith("~/"):
             token = home + token[1:]
         if "$" in token or "`" in token or len(token) > MENU_ARGV_CHARS:
@@ -641,18 +748,25 @@ def _menu_resolve_argv(action):
     return resolved
 
 
-_INSTALLED_PACKAGES = None
+_INSTALLED_PACKAGES = "unread"
 
 
 def _menu_installed_packages():
     """`pacman -Qq` once per process, cached - answers every `omarchy-pkg-
     present` check in `when` without a subprocess per entry.
+
+    Returns None, not a partial set, if the listing was truncated: a package
+    past the cut would silently read as "not installed" (or "installed", if
+    the condition is negated) with no error and no visible sign the answer
+    is wrong - exactly the false-negative-hides-a-feature failure the rest
+    of this module is written to avoid. 25x headroom on this machine today
+    (~21 KB against a 512 KB cap), but the check costs nothing to keep.
     """
     global _INSTALLED_PACKAGES
-    if _INSTALLED_PACKAGES is not None:
+    if _INSTALLED_PACKAGES != "unread":
         return _INSTALLED_PACKAGES
-    raw, _ = run_bounded(["pacman", "-Qq"], MENU_PKG_LIST_BYTES, MENU_PKG_LIST_DEADLINE)
-    _INSTALLED_PACKAGES = frozenset(raw.decode("utf-8", "replace").split())
+    raw, truncated = run_bounded(["pacman", "-Qq"], MENU_PKG_LIST_BYTES, MENU_PKG_LIST_DEADLINE)
+    _INSTALLED_PACKAGES = None if truncated else frozenset(raw.decode("utf-8", "replace").split())
     return _INSTALLED_PACKAGES
 
 
@@ -671,7 +785,10 @@ def _menu_when_allows(when):
 
     m = MENU_WHEN_PKG_RE.match(when)
     if m:
-        present = m.group(2) in _menu_installed_packages()
+        installed = _menu_installed_packages()
+        if installed is None:
+            return True  # truncated listing: unknown, not "not installed"
+        present = m.group(2) in installed
         return (not present) if m.group(1) else present
 
     m = MENU_WHEN_CMD_RE.match(when)
@@ -681,10 +798,11 @@ def _menu_when_allows(when):
 
     m = MENU_WHEN_PATH_RE.match(when)
     if m:
-        negate, kind, path = m.group(1), m.group(2), m.group(3)
+        negate, kind = m.group(1), m.group(2)
+        path = m.group(4) if m.group(3) else m.group(5)
         home = os.environ.get("HOME", "")
         if home:
-            path = path.replace("$HOME", home)
+            path = MENU_HOME_VAR_RE.sub(home, path)
         if path == "~" or path.startswith("~/"):
             path = home + path[1:]
         exists = os.path.isdir(path) if kind == "d" else os.path.isfile(path)
@@ -700,24 +818,31 @@ def _menu_commands():
     management, not what a launcher's fuzzy search is for, and the single
     largest source of `when` conditions) and system.* (already curated by
     hand in Commands.js, confirmation prompts included) are excluded by
-    subtree; a `provider` entry pulls its rows from a runtime function/
-    command rather than static data and is excluded rather than guessed at;
-    an `action` this cannot turn into a plain argv vector is excluded rather
-    than run through a shell.
+    subtree; MENU_SKIP_IDS excludes specific known collisions with that same
+    curated catalogue; a `provider` entry pulls its rows from a runtime
+    function/command rather than static data and is excluded rather than
+    guessed at; an `action` this cannot turn into a plain argv vector is
+    excluded rather than run through a shell.
     """
     default_items = _menu_parse_items(_menu_read_default())
     user_items = _menu_parse_items(_menu_read_user())
     merged, order = _menu_merge(default_items, user_items)
-    for item_id, entry in merged.items():
-        entry["_parent"] = _menu_parent(item_id, entry)
 
     rows = []
+    json_chars = 0
     for item_id in order:
         if len(rows) >= MENU_MAX_ITEMS:
             break
         if item_id.startswith(MENU_SKIP_PREFIXES) or item_id in ("install", "remove", "system"):
             continue
+        if item_id in MENU_SKIP_IDS:
+            continue
         entry = merged[item_id]
+        # kind, not a bare truthy `action` check: both are set together by
+        # the same source's normalization, so this is the field the merge
+        # above actually promises is in sync with the rest of the entry.
+        if entry.get("kind") != "action":
+            continue
         if entry.get("provider"):
             continue
         argv = _menu_resolve_argv(entry.get("action"))
@@ -730,14 +855,23 @@ def _menu_commands():
             continue
         aliases = entry.get("aliases")
         keywords = " ".join(a for a in aliases if isinstance(a, str)) if isinstance(aliases, list) else ""
-        rows.append({
+        row = {
             "key": "menu:" + item_id,
             "title": label,
             "subtitle": _menu_breadcrumb(item_id, merged),
             "icon": clamp_text(entry.get("icon") or "", 8),
             "argv": argv,
             "keywords": clamp_text(keywords, MENU_LABEL_CHARS),
-        })
+        }
+        # Real serialized size, not a row count, is what actually has to
+        # stay under Spotlight.qml's maxHelperPayloadChars - see
+        # MENU_JSON_BUDGET_CHARS. A single very long ancestor label was
+        # enough to build an oversized reply well under MENU_MAX_ITEMS.
+        row_chars = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+        if rows and json_chars + row_chars > MENU_JSON_BUDGET_CHARS:
+            break
+        json_chars += row_chars
+        rows.append(row)
     return rows
 
 
