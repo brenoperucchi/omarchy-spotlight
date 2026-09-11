@@ -30,6 +30,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import stat
 import subprocess
@@ -105,6 +106,123 @@ HIDES_BYTES = 64 * 1024
 HIDES_COUNT = 400
 HIDES_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 SYSTEM_OWNERS = (0, EUID)
+
+# The real Omarchy root-menu tree (JSONC: default + a user-writable
+# extension, merged the same way Menu.qml's own MenuModel.js does - later
+# entries override earlier fields, not whole entries). Read-only: nothing
+# here is ever written back.
+MENU_PARTS = ("default", "omarchy")
+MENU_NAME = "omarchy-menu.jsonc"
+MENU_USER_PARTS = (".config", "omarchy", "extensions")
+MENU_JSONC_BYTES = 256 * 1024
+MENU_MAX_ITEMS = 400
+MENU_SKIP_PREFIXES = ("install.", "remove.", "system.")
+# Known collisions with lib/Commands.js's own curated entries, found by
+# review, not by construction (no general dedup pass exists - a title match
+# alone cannot tell "same command, different label" from "different command,
+# same label"). learn.keybindings duplicates the curated `keys` row exactly;
+# trigger.screensaver is worse than a duplicate - it *toggles* an active
+# screensaver off, while the curated row *starts* one, so the same title
+# would mean opposite things depending on which row a user happened to
+# click. Extend this list as more surface; it is not a promise of
+# completeness.
+# trigger.toggle.screensaver, not trigger.screensaver - found by review, a
+# typo'd id here means the skip is a no-op (the tautological form of "not
+# in this list" that a test asserting against the list itself cannot catch:
+# it passes for a nonexistent id just as easily as for a real one). Verify
+# skip decisions against the emitted title set, not against this list.
+# setup.keybindings is included for the same collision reason but a
+# different resolution (see its own comment at the callsite) - it survives
+# the curated `keys` row's title but does something different (edits
+# bindings.lua rather than viewing keybindings), so it is dropped rather
+# than mislabeled.
+MENU_SKIP_IDS = ("learn.keybindings", "trigger.toggle.screensaver", "setup.keybindings")
+# Only omarchy's own wrapped commands - the same posture Commands.js already
+# committed to (its own comment: no Suspend row, because a bare `systemctl
+# suspend` would cost the marketplace listing its automatic Verified status).
+# Pulling the menu tree in wholesale would silently reintroduce exactly that
+# without this gate: the tree's own system.suspend/system.hibernate entries
+# call `systemctl` directly. (In practice system.* is excluded above anyway -
+# Commands.js already curates that whole subtree by hand - but the gate holds
+# even if that changes.)
+MENU_ACTION_PREFIX = "omarchy-"
+MENU_ARGV_TOKENS = 12
+MENU_ARGV_CHARS = 512
+MENU_LABEL_CHARS = 200
+MENU_BREADCRUMB_DEPTH = 6
+# Each ancestor label is clamped before joining into a subtitle - a leaf's
+# own label is bounded by MENU_LABEL_CHARS, but an *ancestor* label, shared
+# by every one of its descendants, was not bounded at all: found by review,
+# a single oversized ancestor label (real risk only via the user's own
+# extension file, but still real) multiplies across every child under it and
+# can blow well past the JSON budget below on its own.
+MENU_BREADCRUMB_LABEL_CHARS = 60
+MENU_PKG_LIST_DEADLINE = 2.0
+MENU_PKG_LIST_BYTES = 512 * 1024
+# Same reasoning as bin/spotlight-helper's file-search budget (see
+# FILES_JSON_BUDGET_CHARS): row count alone does not bound serialized JSON
+# size, and Spotlight.qml rejects the whole reply above maxHelperPayloadChars
+# (524288) - found by review, a single very long ancestor label (see
+# MENU_BREADCRUMB_LABEL_CHARS above) was enough to build a 400-item reply
+# past that ceiling from a 22 KB source file. This stops row-building on
+# real (not estimated) JSON size directly; margin reasoning matches
+# FILES_JSON_BUDGET_CHARS's comment (Python len() vs JS String.length).
+MENU_JSON_BUDGET_CHARS = 200000
+# Shell metacharacters that only mean anything when they appear outside of
+# any quoting - found by review (round 2), rejecting them unconditionally
+# (a plain regex over the raw string, run before tokenising) meant a
+# perfectly literal, harmless value inside quotes - a URL query string like
+# 'https://x/?a=1&b=2' - silently vanished from the catalogue too, the same
+# false-negative failure this module otherwise goes out of its way to
+# avoid. ';'/'<'/'>'/newline/backslash/backtick are rejected the same way,
+# even though real Bash would also reject some of these unquoted forms
+# outright - the point here is never to guess at shell semantics, so an
+# unquoted occurrence of any of them is treated as "this needs a real
+# shell" rather than parsed further.
+MENU_UNQUOTED_REJECT_CHARS = frozenset("|&;<>`\\*?{}[]#\n")
+# Bash's own default word separators (IFS), not Python's broader isspace() -
+# found by review, isspace() is also true for \r/\v/\f, which Bash treats as
+# ordinary characters *inside* a word, not separators; using it here split
+# one argument into two on any of those three, the same class of bug as the
+# \n-consumed-by-isspace() regression, just narrower (an escape a real
+# extension author would have to write on purpose, not something a CRLF
+# line ending in the JSON source could ever trigger - the \r there sits
+# outside the parsed string value).
+MENU_WORD_SEP = " \t"
+# Reserved words are only shell syntax in command position, but this module
+# does not track command position - rejecting them as bare, wholly-unquoted
+# tokens (never inside quotes, where they are ordinary literal arguments)
+# is the conservative stand-in used instead.
+MENU_SHELL_KEYWORDS = frozenset({"if", "then", "elif", "fi"})
+# A '$' only starts a real expansion when followed by something that could
+# begin one (a name, `{`, `(`, or a Bash special parameter) - anything else
+# right after it (end of string, a closing quote, punctuation) is a literal
+# dollar sign in real Bash too. Needed to correctly handle the quote-
+# concatenation trick found by review: `'$'HOME/a` is a single-quoted
+# literal `$` immediately followed by unquoted `HOME/a` (no `$` in front of
+# it, so no expansion) - Bash's own word-joining rule glues these into one
+# token, `$HOME/a`, entirely literal. A naive "does the joined token
+# contain $HOME" check (this module's previous approach) cannot tell that
+# apart from a real `$HOME` reference and expanded it wrongly.
+MENU_DOLLAR_EXPANSION_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_{(@*#?$!-0123456789"
+)
+MENU_WHEN_PKG_RE = re.compile(r"^(!\s*)?omarchy-pkg-present\s+(\S+)$")
+MENU_WHEN_CMD_RE = re.compile(r"^(!\s*)?omarchy-cmd-present\s+(\S+)$")
+# The path may be quoted the normal Bash way (`[[ -d "$HOME/foo" ]]`, or,
+# for a path containing a space, has to be) - found by review, treating the
+# quotes as part of the path made every quoted condition evaluate as though
+# the path did not exist; matched as two alternatives (quoted allows spaces,
+# unquoted does not) rather than one pattern, since a real entry in the
+# shipped tree quotes a path with a space in it. Group 3 is the quote
+# character itself (or None if unquoted) - _menu_when_allows uses it to
+# decide whether $HOME/~ inside the path may be expanded at all.
+MENU_WHEN_PATH_RE = re.compile(r'^\[\[\s*(!\s*)?-([df])\s+(?:(["\'])(.*?)\3|(\S+))\s*\]\]$')
+# $HOME must end at a word boundary - found by review, a plain substring
+# replace turned $HOMEDIR (a different, unrelated variable name that merely
+# starts with the same four letters) into a fabricated path instead of
+# being left as an unresolved $ and rejected.
+MENU_HOME_VAR_RE = re.compile(r"\$HOME\b")
 
 
 class Denied(Exception):
@@ -489,6 +607,472 @@ def normalize_usage(parsed):
     return {k: {"count": c, "last": l} for k, c, l in kept[:USAGE_KEEP]}
 
 
+# ------------------------------------------------------------- omarchy menu
+def _menu_strip_jsonc(raw):
+    """JSONC -> JSON: line comments and trailing commas, nothing else.
+
+    Same two transformations as MenuModel.js's own stripJsonc, so a file the
+    real menu accepts parses here the same way - not the identical regexes
+    (this one keeps the trailing newline the JS version consumes), just the
+    same net effect on any real menu file.
+    """
+    text = raw.decode("utf-8", "replace") if raw is not None else ""
+    text = re.sub(r"^[ \t]*//[^\n]*$", "", text, flags=re.M)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+
+def _menu_normalize_item(item_id, entry):
+    """Same normalization MenuModel.js's own normalizeItem does, applied per
+    source, before merging with the other one - not after.
+
+    Every recognised field is always present here (empty string/list when
+    the source did not set it), which is what makes the merge in
+    _menu_merge correct: an extension entry that reuses an id to turn an
+    action into a link (sets `target`, does not repeat `action`) has to
+    actually clear the inherited action, not just add `target` next to it.
+    Found by review: merging un-normalized dicts kept the old action alive
+    under the new label, because a field simply absent from the override
+    never overwrote the default's value for that field. `kind` is computed
+    here, per source, for the same reason `action`/`target` are - it is
+    itself just another field that the later source's own normalization
+    overwrites on merge, exactly matching what the real menu does.
+    """
+    aliases = entry.get("aliases")
+    if isinstance(aliases, list):
+        aliases = [a for a in aliases if isinstance(a, str) and a]
+    elif isinstance(aliases, str) and aliases:
+        aliases = [aliases]
+    else:
+        aliases = []
+    parent = entry.get("parent")
+    if not isinstance(parent, str):
+        if item_id == "root":
+            parent = ""
+        elif "." in item_id:
+            parent = item_id.rsplit(".", 1)[0]
+        else:
+            parent = "root"
+    action = entry.get("action")
+    action = action if isinstance(action, str) else ""
+    target = entry.get("target")
+    target = target if isinstance(target, str) else ""
+    label = entry.get("label")
+    label = label if isinstance(label, str) and label else item_id
+    return {
+        "parent": parent,
+        "kind": "action" if action else ("link" if target else "menu"),
+        "icon": entry.get("icon") if isinstance(entry.get("icon"), str) else "",
+        "label": label,
+        "target": target,
+        "action": action,
+        "provider": entry.get("provider") if isinstance(entry.get("provider"), str) else "",
+        "aliases": aliases,
+        "when": entry.get("when") if isinstance(entry.get("when"), str) else "",
+    }
+
+
+def _menu_parse_items(raw):
+    """Raw JSONC bytes -> {id: normalized-entry-dict}. Never raises; bad
+    input is empty.
+    """
+    text = _menu_strip_jsonc(raw)
+    if not text.strip():
+        return {}
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    source = parsed.get("items") if isinstance(parsed.get("items"), dict) else parsed
+    out = {}
+    for item_id, entry in source.items():
+        if not isinstance(item_id, str) or not isinstance(entry, dict):
+            continue
+        out[item_id] = _menu_normalize_item(item_id, entry)
+    return out
+
+
+def _menu_read_default():
+    base = os.environ.get("OMARCHY_PATH", "").strip() or OMARCHY_FALLBACK_PATH
+    fd = system_dir(base.rstrip("/") + "/" + "/".join(MENU_PARTS))
+    try:
+        return read_file(fd, MENU_NAME, MENU_JSONC_BYTES, SYSTEM_OWNERS)
+    finally:
+        os.close(fd)
+
+
+def _menu_read_user():
+    """The user's own extension file. Its directory is allowed not to exist
+    yet - most users never touch this - which is not the same failure as a
+    directory that exists but fails ownership/permission checks, so only the
+    former is swallowed here.
+    """
+    try:
+        fd = walk(list(MENU_USER_PARTS))
+    except FileNotFoundError:
+        return None
+    try:
+        return read_file(fd, MENU_NAME, MENU_JSONC_BYTES)
+    finally:
+        os.close(fd)
+
+
+def _menu_merge(default_items, user_items):
+    """Field-by-field merge, later source wins - same semantics as
+    MenuModel.js's mergeMenuSources: reusing an id extends/overrides it, it
+    does not replace it outright.
+    """
+    merged = {}
+    order = []
+    for source in (default_items, user_items):
+        for item_id, entry in source.items():
+            if item_id not in merged:
+                order.append(item_id)
+                merged[item_id] = {}
+            merged[item_id].update(entry)
+    return merged, order
+
+
+def _menu_breadcrumb(item_id, merged):
+    """Ancestor labels, root-to-parent, joined for a subtitle - `Style ›
+    Font` rather than a bare `Font`, since dozens of leaves share generic
+    labels (`Default`, `Theme`, `Chrome`) that only their place in the tree
+    disambiguates. Each ancestor label is clamped on its own - unlike a
+    leaf's own label, an ancestor's is shared by every descendant under it,
+    so one oversized label found here multiplies across a whole subtree
+    rather than costing one row.
+    """
+    parts = []
+    seen = set()
+    current = merged.get(item_id, {}).get("parent", "")
+    while current and current != "root" and current not in seen and len(parts) < MENU_BREADCRUMB_DEPTH:
+        seen.add(current)
+        entry = merged.get(current)
+        if not entry:
+            break
+        label = entry.get("label")
+        if isinstance(label, str) and label:
+            parts.append(clamp_text(label, MENU_BREADCRUMB_LABEL_CHARS))
+        current = entry.get("parent", "")
+    parts.reverse()
+    return " › ".join(parts)
+
+
+def _menu_dollar_home(action, i):
+    """True when action[i] starts a word-bounded `$HOME` - the only
+    variable this module ever expands."""
+    if action[i:i + 5] != "$HOME":
+        return False
+    nxt = action[i + 5:i + 6]
+    return not (nxt.isalnum() or nxt == "_")
+
+
+def _menu_dollar_is_literal(action, i):
+    """True when the '$' at action[i] cannot start a real Bash expansion -
+    nothing follows it that could ever begin one - so it is just a literal
+    dollar sign, exactly as real Bash would treat it, quoted or not."""
+    nxt = action[i + 1:i + 2]
+    return not nxt or nxt not in MENU_DOLLAR_EXPANSION_CHARS
+
+
+def _menu_tokenize(action):
+    """A minimal, quote-aware tokeniser standing in for a real shell lexer.
+
+    Found by review across two rounds: neither a regex run over the raw
+    action string before tokenising, nor a per-token check run on shlex's
+    output afterwards, can correctly tell quoted (literal) text apart from
+    unquoted (meaningful) text - shlex.split discards quote type once it
+    hands back plain strings, and Bash's own quote-concatenation rule
+    (`'$'HOME` is one token made of a literal `$` plus unquoted `HOME`,
+    with no expansion) lets a single quoted character disguise the rest of
+    a token as unquoted to any check working from the outside in. This
+    walks the string exactly once, tracking real quote state per character,
+    so every substitution and rejection decision is made with that context
+    instead of a guess: $HOME expands inside double quotes and unquoted
+    text (real Bash's own rule), never inside single quotes; ~ expands only
+    at the true start of an unquoted word; and shell metacharacters/
+    keywords are rejected only where they appear outside of any quoting,
+    since that is the only place a real shell would ever treat them as
+    syntax rather than as literal text.
+
+    Returns a list of argv tokens with $HOME/~ already resolved, or None if
+    the action needs real shell semantics this does not implement.
+    """
+    home = os.environ.get("HOME", "")
+    tokens = []
+    chars = []
+    token_quoted = False
+    at_token_start = True
+    quote = None
+    i, n = 0, len(action)
+    while i < n:
+        c = action[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            else:
+                chars.append(c)
+            i += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = None
+                i += 1
+                continue
+            if c == "$":
+                if _menu_dollar_home(action, i):
+                    chars.append(home)
+                    i += 5
+                    continue
+                if _menu_dollar_is_literal(action, i):
+                    chars.append("$")
+                    i += 1
+                    continue
+                return None
+            if c in ("`", "\\"):
+                return None
+            chars.append(c)
+            i += 1
+            continue
+        # unquoted - the reject-char check runs before the word-separator
+        # check, not after: \n is a real command separator in Bash, not a
+        # word separator, and found by review, checking it as a separator
+        # first let it fall through before the reject check ever ran,
+        # silently turning a two-command action into one command whose
+        # second line became a useless argv token instead of being rejected
+        # - byte-for-byte the same failure that reproved the very first
+        # round of this feature.
+        if c in MENU_UNQUOTED_REJECT_CHARS:
+            return None
+        if c in MENU_WORD_SEP:
+            if chars or token_quoted:
+                tokens.append(("".join(chars), token_quoted))
+                chars = []
+                token_quoted = False
+            at_token_start = True
+            i += 1
+            continue
+        if c == "'":
+            quote = "'"
+            token_quoted = True
+            at_token_start = False
+            i += 1
+            continue
+        if c == '"':
+            quote = '"'
+            token_quoted = True
+            at_token_start = False
+            i += 1
+            continue
+        if c == "~" and at_token_start:
+            # Only the two forms this module actually implements: `~` alone
+            # (the whole word) or a `~/...` path. `~user` (another user's
+            # home), `~+` ($PWD) and `~-` ($OLDPWD) are real Bash tilde
+            # forms too - found by review, expanding any leading ~
+            # unconditionally fabricated a path for these instead (`~+`
+            # became literally "$HOME+"). Reject rather than guess, the
+            # same policy already applied to every other unsupported
+            # construct in this function.
+            nxt = action[i + 1:i + 2]
+            if nxt == "" or nxt in MENU_WORD_SEP or nxt == "/":
+                chars.append(home)
+                at_token_start = False
+                i += 1
+                continue
+            return None
+        if c == "$":
+            # $'...' (ANSI-C quoting) and $"..." (locale quoting) are real
+            # Bash constructs this module does not implement - found by
+            # review, treating the $ as a literal dollar sign here (as it
+            # correctly is inside already-open double quotes, where a `'`
+            # has no special meaning) accepted the action with the wrong
+            # argument instead of rejecting the construct: `$'abc'` means
+            # the single argument "abc" in Bash, not a literal "$" followed
+            # by a separately-quoted "abc".
+            if action[i + 1:i + 2] in ("'", '"'):
+                return None
+            if _menu_dollar_home(action, i):
+                chars.append(home)
+                at_token_start = False
+                i += 5
+                continue
+            if _menu_dollar_is_literal(action, i):
+                chars.append("$")
+                at_token_start = False
+                i += 1
+                continue
+            return None
+        chars.append(c)
+        at_token_start = False
+        i += 1
+    if quote is not None:
+        return None  # unterminated quote
+    if chars or token_quoted:
+        tokens.append(("".join(chars), token_quoted))
+    resolved = []
+    for text, quoted in tokens:
+        if not quoted and text in MENU_SHELL_KEYWORDS:
+            return None
+        resolved.append(text)
+    return resolved
+
+
+def _menu_resolve_argv(action):
+    """A config-supplied command line -> an argv vector, or None if it
+    can't be one without a real shell. Never returns something that was
+    not built by _menu_tokenize - no string is ever handed to a shell
+    here.
+    """
+    action = str(action or "").strip()
+    if not action:
+        return None
+    argv = _menu_tokenize(action)
+    if not argv or len(argv) > MENU_ARGV_TOKENS:
+        return None
+    for token in argv:
+        if len(token) > MENU_ARGV_CHARS:
+            return None
+    if not argv[0].startswith(MENU_ACTION_PREFIX):
+        return None
+    return argv
+
+
+_INSTALLED_PACKAGES = "unread"
+
+
+def _menu_installed_packages():
+    """`pacman -Qq` once per process, cached - answers every `omarchy-pkg-
+    present` check in `when` without a subprocess per entry.
+
+    Returns None, not a partial set, if the listing was truncated: a package
+    past the cut would silently read as "not installed" (or "installed", if
+    the condition is negated) with no error and no visible sign the answer
+    is wrong - exactly the false-negative-hides-a-feature failure the rest
+    of this module is written to avoid. 25x headroom on this machine today
+    (~21 KB against a 512 KB cap), but the check costs nothing to keep.
+    """
+    global _INSTALLED_PACKAGES
+    if _INSTALLED_PACKAGES != "unread":
+        return _INSTALLED_PACKAGES
+    raw, truncated = run_bounded(["pacman", "-Qq"], MENU_PKG_LIST_BYTES, MENU_PKG_LIST_DEADLINE)
+    _INSTALLED_PACKAGES = None if truncated else frozenset(raw.decode("utf-8", "replace").split())
+    return _INSTALLED_PACKAGES
+
+
+def _menu_when_allows(when):
+    """Only a handful of declarative `when` shapes are answered here - a
+    package or command present, a path existing - each resolved without a
+    shell (a package-name lookup, a PATH search, a stat). Every other shape
+    (hardware probes, `compgen`, arbitrary shell) is left showing rather
+    than hidden: a row nobody's hardware can use is a dead click, a row that
+    silently disappeared is a feature the user cannot find and cannot know
+    why - worse in a launcher.
+    """
+    when = str(when or "").strip()
+    if not when:
+        return True
+
+    m = MENU_WHEN_PKG_RE.match(when)
+    if m:
+        installed = _menu_installed_packages()
+        if installed is None:
+            return True  # truncated listing: unknown, not "not installed"
+        present = m.group(2) in installed
+        return (not present) if m.group(1) else present
+
+    m = MENU_WHEN_CMD_RE.match(when)
+    if m:
+        present = shutil.which(m.group(2)) is not None
+        return (not present) if m.group(1) else present
+
+    m = MENU_WHEN_PATH_RE.match(when)
+    if m:
+        negate, kind, quote_char = m.group(1), m.group(2), m.group(3)
+        path = m.group(4) if quote_char else m.group(5)
+        home = os.environ.get("HOME", "")
+        # $HOME expands inside double quotes and unquoted text, never
+        # inside single quotes; ~ never expands under any quoting, only
+        # unquoted - found by review, the previous version expanded both
+        # regardless of which quote (if any) wrapped the path, so
+        # `[[ ! -d '$HOME' ]]` (meant literally) silently tested the real
+        # home directory instead of the string "$HOME".
+        if quote_char != "'":
+            if home:
+                path = MENU_HOME_VAR_RE.sub(home, path)
+            if quote_char is None and (path == "~" or path.startswith("~/")):
+                path = home + path[1:]
+        exists = os.path.isdir(path) if kind == "d" else os.path.isfile(path)
+        return (not exists) if negate else exists
+
+    return True
+
+
+def _menu_commands():
+    """The real Omarchy root-menu tree, projected into the same row shape
+    Commands.js already emits - Spotlight.qml's dispatch does not need to
+    know these came from a different source. install.*/remove.* (package
+    management, not what a launcher's fuzzy search is for, and the single
+    largest source of `when` conditions) and system.* (already curated by
+    hand in Commands.js, confirmation prompts included) are excluded by
+    subtree; MENU_SKIP_IDS excludes specific known collisions with that same
+    curated catalogue; a `provider` entry pulls its rows from a runtime
+    function/command rather than static data and is excluded rather than
+    guessed at; an `action` this cannot turn into a plain argv vector is
+    excluded rather than run through a shell.
+    """
+    default_items = _menu_parse_items(_menu_read_default())
+    user_items = _menu_parse_items(_menu_read_user())
+    merged, order = _menu_merge(default_items, user_items)
+
+    rows = []
+    json_chars = 0
+    for item_id in order:
+        if len(rows) >= MENU_MAX_ITEMS:
+            break
+        if item_id.startswith(MENU_SKIP_PREFIXES) or item_id in ("install", "remove", "system"):
+            continue
+        if item_id in MENU_SKIP_IDS:
+            continue
+        entry = merged[item_id]
+        # kind, not a bare truthy `action` check: both are set together by
+        # the same source's normalization, so this is the field the merge
+        # above actually promises is in sync with the rest of the entry.
+        if entry.get("kind") != "action":
+            continue
+        if entry.get("provider"):
+            continue
+        argv = _menu_resolve_argv(entry.get("action"))
+        if not argv:
+            continue
+        if not _menu_when_allows(entry.get("when")):
+            continue
+        label = clamp_text(entry.get("label") or item_id, MENU_LABEL_CHARS)
+        if not label:
+            continue
+        aliases = entry.get("aliases")
+        keywords = " ".join(a for a in aliases if isinstance(a, str)) if isinstance(aliases, list) else ""
+        row = {
+            "key": "menu:" + item_id,
+            "title": label,
+            "subtitle": _menu_breadcrumb(item_id, merged),
+            "icon": clamp_text(entry.get("icon") or "", 8),
+            "argv": argv,
+            "keywords": clamp_text(keywords, MENU_LABEL_CHARS),
+        }
+        # Real serialized size, not a row count, is what actually has to
+        # stay under Spotlight.qml's maxHelperPayloadChars - see
+        # MENU_JSON_BUDGET_CHARS. A single very long ancestor label was
+        # enough to build an oversized reply well under MENU_MAX_ITEMS.
+        row_chars = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+        if rows and json_chars + row_chars > MENU_JSON_BUDGET_CHARS:
+            break
+        json_chars += row_chars
+        rows.append(row)
+    return rows
+
+
 # ---------------------------------------------------------------- commands
 def cmd_read_settings():
     fd = walk([".config", "omarchy"])
@@ -524,6 +1108,10 @@ def cmd_read_hides():
         if len(hides) >= HIDES_COUNT:
             break
     emit({"hides": hides})
+
+
+def cmd_read_menu_commands():
+    emit({"commands": _menu_commands()})
 
 
 def cmd_read_usage():
@@ -803,6 +1391,7 @@ COMMANDS = {
     "read-settings": (cmd_read_settings, False),
     "read-usage": (cmd_read_usage, False),
     "read-hides": (cmd_read_hides, False),
+    "read-menu-commands": (cmd_read_menu_commands, False),
     "write-usage": (cmd_write_usage, False),
     "read-clipboard": (cmd_read_clipboard, False),
     "clipboard-copy": (cmd_clipboard_copy, True),
