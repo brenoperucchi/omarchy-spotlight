@@ -143,6 +143,14 @@ Item {
   // The helper returns at most 400 hits (a scan pool, ranked below); the
   // list shows the best 10 of them.
   readonly property int maxFileRows: 10
+  // Must match bin/spotlight-helper's FILES_MAX_TERMS: the helper only
+  // AND-filters on the first 8 terms of a multi-term query, so a 9th+ term
+  // is absent from every candidate it returns. Scoring against terms past
+  // that point (rank()'s own no-cap default) treats an ignored term as
+  // "not found" in every candidate equally, which can still separate them
+  // on it - passing the same limit here is what keeps FileRank scoring the
+  // same terms the helper actually filtered on.
+  readonly property int fileMaxTerms: 8
   readonly property int maxClipboardRows: 8
   readonly property int maxReminderRows: 50
   readonly property int maxQueryChars: 512
