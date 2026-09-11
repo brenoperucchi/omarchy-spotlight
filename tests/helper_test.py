@@ -165,6 +165,37 @@ class HelperTests(unittest.TestCase):
 
 
 class MenuCommandsTests(unittest.TestCase):
+    MENU_FIXTURE = {
+        "root": {"label": "Go"},
+        "learn": {"label": "Learn", "parent": "root"},
+        "learn.safe": {
+            "label": "Safe command",
+            "parent": "learn",
+            "aliases": ["safe", "fixture"],
+            "action": "omarchy-safe --flag",
+        },
+        "learn.keybindings": {"label": "Keybindings", "action": "omarchy-menu-keybindings"},
+        "trigger.toggle.screensaver": {"label": "Screensaver", "action": "omarchy-toggle-screensaver"},
+        "setup.keybindings": {"label": "Keybindings", "action": "omarchy-edit-keybindings"},
+        "install.example": {"label": "Install", "action": "omarchy-install-example"},
+        "remove.example": {"label": "Remove", "action": "omarchy-remove-example"},
+        "system.example": {"label": "System", "action": "omarchy-system-example"},
+        "external": {"label": "External", "action": "systemctl reboot"},
+    }
+
+    def _fixture_menu_commands(self, user_raw=b"{}", default_raw=None):
+        original_default = HELPER._menu_read_default
+        original_user = HELPER._menu_read_user
+        if default_raw is None:
+            default_raw = json.dumps({"items": self.MENU_FIXTURE}).encode()
+        HELPER._menu_read_default = lambda: default_raw
+        HELPER._menu_read_user = lambda: user_raw
+        try:
+            return HELPER._menu_commands()
+        finally:
+            HELPER._menu_read_default = original_default
+            HELPER._menu_read_user = original_user
+
     def test_action_resolves_to_argv_for_plain_commands(self):
         self.assertEqual(
             HELPER._menu_resolve_argv("omarchy-launch-webapp 'https://example.com/'"),
@@ -316,8 +347,27 @@ class MenuCommandsTests(unittest.TestCase):
             "omarchy-dns DHCP &",
             "omarchy-launch-webapp *.desktop",
             "omarchy-launch-webapp {a,b}",
+            "omarchy-probe (a)",
+            "omarchy-probe a)",
         ):
             self.assertIsNone(HELPER._menu_resolve_argv(action), action)
+
+    def test_action_rejects_nonleading_unquoted_tilde(self):
+        # Bash expands ~ after the `=`/`:` in assignment-shaped words, but
+        # this lexer deliberately does not implement the complete assignment
+        # grammar. Passing it through literally would execute a different
+        # argv, so ambiguous non-leading unquoted forms fail closed. A quoted
+        # tilde is unambiguously literal and remains supported.
+        for action in (
+            "omarchy-probe x=~/foo",
+            "omarchy-probe x=a:~/foo",
+            "omarchy-probe foo~bar",
+        ):
+            self.assertIsNone(HELPER._menu_resolve_argv(action), action)
+        self.assertEqual(
+            HELPER._menu_resolve_argv("omarchy-probe 'x=~/foo'"),
+            ["omarchy-probe", "x=~/foo"],
+        )
 
     def test_action_rejects_an_unquoted_newline_as_a_command_separator(self):
         # Found by review: \n is whitespace to Python's isspace() but a
@@ -522,11 +572,11 @@ class MenuCommandsTests(unittest.TestCase):
         self.assertLessEqual(len(crumb), HELPER.MENU_BREADCRUMB_LABEL_CHARS + 3)
 
     def test_menu_commands_never_emit_a_non_omarchy_prefixed_command(self):
-        for row in HELPER._menu_commands():
+        for row in self._fixture_menu_commands():
             self.assertTrue(row["argv"][0].startswith("omarchy-"), row)
 
     def test_menu_commands_exclude_install_remove_and_system_subtrees(self):
-        for row in HELPER._menu_commands():
+        for row in self._fixture_menu_commands():
             item_id = row["key"].split(":", 1)[1]
             self.assertFalse(item_id.startswith(("install.", "remove.", "system.")), item_id)
             self.assertNotIn(item_id, ("install", "remove", "system"))
@@ -544,7 +594,7 @@ class MenuCommandsTests(unittest.TestCase):
         # module emits collides with one of Commands.js's curated titles -
         # rather than trusting the skip list to grade its own homework.
         commands_js_titles = {"Keybindings", "Screensaver"}
-        for row in HELPER._menu_commands():
+        for row in self._fixture_menu_commands():
             self.assertNotIn(row["title"], commands_js_titles, row)
 
     def test_menu_commands_stops_before_exceeding_the_json_budget(self):
@@ -594,7 +644,7 @@ class MenuCommandsTests(unittest.TestCase):
             HELPER.MENU_JSON_BUDGET_CHARS = original_budget
 
     def test_menu_commands_row_shape_matches_commands_js(self):
-        rows = HELPER._menu_commands()
+        rows = self._fixture_menu_commands()
         self.assertGreater(len(rows), 0)
         for row in rows[:5]:
             self.assertEqual(
@@ -604,13 +654,29 @@ class MenuCommandsTests(unittest.TestCase):
             self.assertTrue(row["key"].startswith("menu:"))
 
     def test_menu_commands_survives_a_missing_or_malformed_user_extension(self):
-        original = HELPER._menu_read_user
-        HELPER._menu_read_user = lambda: b"{ not json at all"
-        try:
-            rows = HELPER._menu_commands()
-            self.assertGreater(len(rows), 0)
-        finally:
-            HELPER._menu_read_user = original
+        rows = self._fixture_menu_commands(b"{ not json at all")
+        self.assertGreater(len(rows), 0)
+
+    @unittest.skipUnless(
+        Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"), *HELPER.MENU_PARTS, HELPER.MENU_NAME).is_file(),
+        "installed Omarchy menu is unavailable",
+    )
+    def test_installed_menu_matches_projection_safety_invariants(self):
+        # Optional integration coverage for Omarchy hosts. Read the fixture
+        # directly here so filesystem sandbox UID remapping does not turn a
+        # parser/projection test into an ownership-policy test; read_file's
+        # ownership checks have their own focused coverage above.
+        menu_path = Path(
+            os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"),
+            *HELPER.MENU_PARTS,
+            HELPER.MENU_NAME,
+        )
+        rows = self._fixture_menu_commands(default_raw=menu_path.read_bytes())
+        self.assertGreater(len(rows), 0)
+        for row in rows:
+            self.assertTrue(row["argv"][0].startswith("omarchy-"), row)
+            item_id = row["key"].split(":", 1)[1]
+            self.assertFalse(item_id.startswith(HELPER.MENU_SKIP_PREFIXES), item_id)
 
 
 @unittest.skipUnless(shutil.which("bash"), "bash not available")
@@ -735,6 +801,10 @@ class TokenizeVsBashTests(unittest.TestCase):
             "omarchy-probe a; b",
             "omarchy-probe *.desktop",
             "omarchy-probe {a,b}",
+            "omarchy-probe (a)",
+            "omarchy-probe a)",
+            "omarchy-probe x=~/foo",
+            "omarchy-probe x=a:~/foo",
             "omarchy-a\nomarchy-b",
             "if omarchy-probe x; then omarchy-a; fi",
             "omarchy-probe $(omarchy-a)",
