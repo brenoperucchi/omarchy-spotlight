@@ -266,6 +266,28 @@ class MenuCommandsTests(unittest.TestCase):
         self.assertEqual(HELPER._menu_resolve_argv("omarchy-probe '' tail"), ["omarchy-probe", "", "tail"])
         self.assertEqual(HELPER._menu_resolve_argv('omarchy-probe ""'), ["omarchy-probe", ""])
 
+    def test_action_rejects_ansi_c_and_locale_quoting(self):
+        # Found by review: $'...' (ANSI-C quoting) and $"..." (locale
+        # quoting) are real Bash constructs this module does not
+        # implement. Treating the $ as a literal dollar sign here (as it
+        # correctly is inside already-open double quotes, where a lone '
+        # has no special meaning) accepted the action with the wrong
+        # argument - $'abc' means the single argument "abc" in Bash, not a
+        # literal "$" followed by a separately-quoted "abc".
+        self.assertIsNone(HELPER._menu_resolve_argv("omarchy-probe $'abc'"))
+        self.assertIsNone(HELPER._menu_resolve_argv('omarchy-probe $"abc"'))
+
+    def test_action_keeps_carriage_return_vtab_formfeed_literal_in_a_word(self):
+        # Found by review: Python's str.isspace() is true for \r/\v/\f too,
+        # but Bash's default IFS is only space/tab/newline - those three
+        # are ordinary characters *inside* a Bash word, not separators.
+        # Splitting a word on them shifted positional arguments, the same
+        # class of bug as newline being consumed by isspace() before the
+        # reject check could see it, just narrower in practice.
+        self.assertEqual(HELPER._menu_resolve_argv("omarchy-probe a\rb"), ["omarchy-probe", "a\rb"])
+        self.assertEqual(HELPER._menu_resolve_argv("omarchy-probe a\vb"), ["omarchy-probe", "a\vb"])
+        self.assertEqual(HELPER._menu_resolve_argv("omarchy-probe a\fb"), ["omarchy-probe", "a\fb"])
+
     def test_systemctl_action_is_rejected_regardless_of_shape(self):
         # The exact case Commands.js already refuses by hand (its own
         # comment: a bare systemctl call costs the marketplace listing its

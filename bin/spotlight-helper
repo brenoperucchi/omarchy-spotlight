@@ -158,6 +158,15 @@ MENU_JSON_BUDGET_CHARS = 200000
 # unquoted occurrence of any of them is treated as "this needs a real
 # shell" rather than parsed further.
 MENU_UNQUOTED_REJECT_CHARS = frozenset("|&;<>`\\*?{}[]#\n")
+# Bash's own default word separators (IFS), not Python's broader isspace() -
+# found by review, isspace() is also true for \r/\v/\f, which Bash treats as
+# ordinary characters *inside* a word, not separators; using it here split
+# one argument into two on any of those three, the same class of bug as the
+# \n-consumed-by-isspace() regression, just narrower (an escape a real
+# extension author would have to write on purpose, not something a CRLF
+# line ending in the JSON source could ever trigger - the \r there sits
+# outside the parsed string value).
+MENU_WORD_SEP = " \t"
 # Reserved words are only shell syntax in command position, but this module
 # does not track command position - rejecting them as bare, wholly-unquoted
 # tokens (never inside quotes, where they are ordinary literal arguments)
@@ -801,18 +810,17 @@ def _menu_tokenize(action):
             chars.append(c)
             i += 1
             continue
-        # unquoted - the reject-char check runs before isspace(), not after:
-        # \n is a member of both sets (it is whitespace, and it is a real
-        # command separator in Bash, not a word separator), and found by
-        # review, checking isspace() first let it fall through as a plain
-        # word separator, silently turning a two-command action into one
-        # command whose second line became a useless argv token instead of
-        # being rejected - byte-for-byte the same failure that reproved the
-        # very first round of this feature. Space and tab are not in the
-        # reject set, so they still separate words normally here.
+        # unquoted - the reject-char check runs before the word-separator
+        # check, not after: \n is a real command separator in Bash, not a
+        # word separator, and found by review, checking it as a separator
+        # first let it fall through before the reject check ever ran,
+        # silently turning a two-command action into one command whose
+        # second line became a useless argv token instead of being rejected
+        # - byte-for-byte the same failure that reproved the very first
+        # round of this feature.
         if c in MENU_UNQUOTED_REJECT_CHARS:
             return None
-        if c.isspace():
+        if c in MENU_WORD_SEP:
             if chars or token_quoted:
                 tokens.append(("".join(chars), token_quoted))
                 chars = []
@@ -842,13 +850,23 @@ def _menu_tokenize(action):
             # same policy already applied to every other unsupported
             # construct in this function.
             nxt = action[i + 1:i + 2]
-            if nxt == "" or nxt.isspace() or nxt == "/":
+            if nxt == "" or nxt in MENU_WORD_SEP or nxt == "/":
                 chars.append(home)
                 at_token_start = False
                 i += 1
                 continue
             return None
         if c == "$":
+            # $'...' (ANSI-C quoting) and $"..." (locale quoting) are real
+            # Bash constructs this module does not implement - found by
+            # review, treating the $ as a literal dollar sign here (as it
+            # correctly is inside already-open double quotes, where a `'`
+            # has no special meaning) accepted the action with the wrong
+            # argument instead of rejecting the construct: `$'abc'` means
+            # the single argument "abc" in Bash, not a literal "$" followed
+            # by a separately-quoted "abc".
+            if action[i + 1:i + 2] in ("'", '"'):
+                return None
             if _menu_dollar_home(action, i):
                 chars.append(home)
                 at_token_start = False
