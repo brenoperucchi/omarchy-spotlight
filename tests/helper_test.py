@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -522,6 +523,137 @@ class MenuCommandsTests(unittest.TestCase):
             self.assertGreater(len(rows), 0)
         finally:
             HELPER._menu_read_user = original
+
+
+@unittest.skipUnless(shutil.which("bash"), "bash not available")
+class TokenizeVsBashTests(unittest.TestCase):
+    """A compact differential harness against real Bash - not exhaustive,
+    but the shape of check that actually caught every defect found across
+    review rounds 6-8 (a newline regression, ~user/~+/~- fabrication, a
+    dropped empty quoted argument, ANSI-C/locale quoting), none of which an
+    inline unit test asserting one input/output pair at a time had managed
+    to catch before the bug was already reported by a human reviewer.
+
+    Each action runs for real under `bash -c`, with PATH restricted to a
+    directory of shim executables that record their own argv instead of
+    doing anything - so nothing real ever executes, and the check is
+    self-validating rather than needing a hand-maintained expected-output
+    table: if Bash runs the shim exactly once, _menu_resolve_argv must
+    return that exact argv; if Bash runs it zero times (a syntax error) or
+    more than once (e.g. a newline splitting one action into two
+    commands), _menu_resolve_argv must return None, since this module only
+    ever accepts an action that is unambiguously one single simple command.
+    """
+
+    SHIM_NAMES = ("omarchy-probe", "omarchy-a", "omarchy-b")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bash_path = shutil.which("bash")
+        cls.shimdir = tempfile.mkdtemp(prefix="menu-tokenize-shim-")
+        shim_src = (
+            "#!" + sys.executable + "\n"
+            "import json, os, sys\n"
+            "with open(os.environ['MENU_TOKENIZE_LOG'], 'a') as f:\n"
+            "    f.write(json.dumps([os.path.basename(sys.argv[0])] + sys.argv[1:]) + '\\n')\n"
+        )
+        for name in cls.SHIM_NAMES:
+            path = Path(cls.shimdir) / name
+            path.write_text(shim_src)
+            path.chmod(0o755)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.shimdir, ignore_errors=True)
+
+    def _bash_invocations(self, action):
+        with tempfile.NamedTemporaryFile(prefix="menu-tokenize-log-", suffix=".jsonl", delete=False) as f:
+            logfile = f.name
+        try:
+            # cwd is a scratch directory, not the repo: a case like "a > b"
+            # is meant to be *rejected*, precisely because Bash really
+            # would create a file named "b" here - which is exactly what
+            # happens when this harness runs the action for real to find
+            # out, and it must not land in the repo's own working tree.
+            with tempfile.TemporaryDirectory(prefix="menu-tokenize-cwd-") as cwd:
+                env = {
+                    "PATH": self.shimdir,
+                    "HOME": os.environ.get("HOME", "/root"),
+                    "MENU_TOKENIZE_LOG": logfile,
+                }
+                subprocess.run(
+                    [self.bash_path, "-c", action],
+                    env=env, cwd=cwd, timeout=5,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            lines = Path(logfile).read_text().splitlines()
+            return [json.loads(line) for line in lines]
+        finally:
+            os.unlink(logfile)
+
+    def _assert_agrees_with_bash(self, action):
+        # Over-rejecting is always safe here by this module's own explicit
+        # policy (unrecognised syntax is excluded, never guessed at), so
+        # only one direction is actually a bug: this module accepting an
+        # action and resolving it to something other than what Bash itself
+        # would run it as. A None result is never asserted against Bash -
+        # it is deliberately conservative for several real constructs
+        # (~user, for instance) that Bash would run unambiguously.
+        invocations = self._bash_invocations(action)
+        got = HELPER._menu_resolve_argv(action)
+        if got is None:
+            return
+        self.assertEqual(len(invocations), 1, (action, got, invocations))
+        self.assertEqual(got, invocations[0], action)
+
+    def test_agrees_with_bash_across_the_corpus(self):
+        cases = [
+            "omarchy-probe a b c",
+            "omarchy-probe 'a b' c",
+            'omarchy-probe "a b" c',
+            "omarchy-probe a'b'c",
+            "omarchy-probe ~/x",
+            "omarchy-probe ~",
+            "omarchy-probe ~/",
+            "omarchy-probe ~foo",
+            "omarchy-probe ~foo/bar",
+            "omarchy-probe ~+",
+            "omarchy-probe ~-",
+            "omarchy-probe '' tail",
+            'omarchy-probe ""',
+            "omarchy-probe '$'HOME/a",
+            'omarchy-probe "$"HOME/a',
+            'omarchy-probe "$HOME"x',
+            "omarchy-probe 'https://x.com/?a=1&b=2'",
+            "omarchy-probe 'file * name'",
+            "omarchy-probe a\tb",
+            "omarchy-probe a\rb",
+            "omarchy-probe a\vb",
+            "omarchy-probe a\fb",
+            "omarchy-probe $'abc'",
+            'omarchy-probe $"abc"',
+            "omarchy-probe a$'b'",
+            "omarchy-probe $CUSTOM_DNS",
+            "omarchy-probe $HOMEDIR/a",
+            "omarchy-probe a > b",
+            "omarchy-probe a < b",
+            # Not "a & b": backgrounding races bash's own exit against the
+            # shim's file write, since bash -c does not wait on background
+            # jobs before exiting - unreliable to assert here, and the
+            # rejection is already pinned deterministically by the plain
+            # unit tests above.
+            "omarchy-probe a && b",
+            "omarchy-probe a || b",
+            "omarchy-probe a; b",
+            "omarchy-probe *.desktop",
+            "omarchy-probe {a,b}",
+            "omarchy-a\nomarchy-b",
+            "if omarchy-probe x; then omarchy-a; fi",
+            "omarchy-probe $(omarchy-a)",
+            "omarchy-probe `omarchy-a`",
+        ]
+        for action in cases:
+            self._assert_agrees_with_bash(action)
 
 
 if __name__ == "__main__":
