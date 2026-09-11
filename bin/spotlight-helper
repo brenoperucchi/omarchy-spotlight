@@ -30,6 +30,8 @@ import json
 import os
 import re
 import select
+import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -83,6 +85,40 @@ HIDES_BYTES = 64 * 1024
 HIDES_COUNT = 400
 HIDES_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 SYSTEM_OWNERS = (0, EUID)
+
+# The real Omarchy root-menu tree (JSONC: default + a user-writable
+# extension, merged the same way Menu.qml's own MenuModel.js does - later
+# entries override earlier fields, not whole entries). Read-only: nothing
+# here is ever written back.
+MENU_PARTS = ("default", "omarchy")
+MENU_NAME = "omarchy-menu.jsonc"
+MENU_USER_PARTS = (".config", "omarchy", "extensions")
+MENU_JSONC_BYTES = 256 * 1024
+MENU_MAX_ITEMS = 400
+MENU_SKIP_PREFIXES = ("install.", "remove.", "system.")
+# Only omarchy's own wrapped commands - the same posture Commands.js already
+# committed to (its own comment: no Suspend row, because a bare `systemctl
+# suspend` would cost the marketplace listing its automatic Verified status).
+# Pulling the menu tree in wholesale would silently reintroduce exactly that
+# without this gate: the tree's own system.suspend/system.hibernate entries
+# call `systemctl` directly. (In practice system.* is excluded above anyway -
+# Commands.js already curates that whole subtree by hand - but the gate holds
+# even if that changes.)
+MENU_ACTION_PREFIX = "omarchy-"
+MENU_ARGV_TOKENS = 12
+MENU_ARGV_CHARS = 512
+MENU_LABEL_CHARS = 200
+MENU_BREADCRUMB_DEPTH = 6
+MENU_PKG_LIST_DEADLINE = 2.0
+MENU_PKG_LIST_BYTES = 512 * 1024
+# A real shell operator in the action string - not a leftover $VAR, which is
+# handled separately (only $HOME/~ are expanded, as plain substitution, never
+# through a shell). Conservative on purpose: unrecognised syntax is excluded,
+# never guessed at.
+MENU_SHELL_OPERATOR_RE = re.compile(r"(\|\||&&|;|\$\(|`|\bif\b|\bthen\b|\belif\b|\bfi\b|>>|<<|(?<!\|)\|(?!\|))")
+MENU_WHEN_PKG_RE = re.compile(r"^(!\s*)?omarchy-pkg-present\s+(\S+)$")
+MENU_WHEN_CMD_RE = re.compile(r"^(!\s*)?omarchy-cmd-present\s+(\S+)$")
+MENU_WHEN_PATH_RE = re.compile(r"^\[\[\s*(!\s*)?-([df])\s+(\S+)\s*\]\]$")
 
 
 class Denied(Exception):
@@ -463,6 +499,248 @@ def normalize_usage(parsed):
     return {k: {"count": c, "last": l} for k, c, l in kept[:USAGE_KEEP]}
 
 
+# ------------------------------------------------------------- omarchy menu
+def _menu_strip_jsonc(raw):
+    """JSONC -> JSON: line comments and trailing commas, nothing else.
+
+    Matches MenuModel.js's own stripJsonc exactly (same two regexes), so a
+    file the real menu accepts parses here the same way.
+    """
+    text = raw.decode("utf-8", "replace") if raw is not None else ""
+    text = re.sub(r"^[ \t]*//[^\n]*$", "", text, flags=re.M)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+
+def _menu_parse_items(raw):
+    """Raw JSONC bytes -> {id: entry-dict}. Never raises; bad input is empty."""
+    text = _menu_strip_jsonc(raw)
+    if not text.strip():
+        return {}
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    source = parsed.get("items") if isinstance(parsed.get("items"), dict) else parsed
+    out = {}
+    for item_id, entry in source.items():
+        if not isinstance(item_id, str) or not isinstance(entry, dict):
+            continue
+        out[item_id] = entry
+    return out
+
+
+def _menu_read_default():
+    base = os.environ.get("OMARCHY_PATH", "").strip() or OMARCHY_FALLBACK_PATH
+    fd = system_dir(base.rstrip("/") + "/" + "/".join(MENU_PARTS))
+    try:
+        return read_file(fd, MENU_NAME, MENU_JSONC_BYTES, SYSTEM_OWNERS)
+    finally:
+        os.close(fd)
+
+
+def _menu_read_user():
+    """The user's own extension file. Its directory is allowed not to exist
+    yet - most users never touch this - which is not the same failure as a
+    directory that exists but fails ownership/permission checks, so only the
+    former is swallowed here.
+    """
+    try:
+        fd = walk(list(MENU_USER_PARTS))
+    except FileNotFoundError:
+        return None
+    try:
+        return read_file(fd, MENU_NAME, MENU_JSONC_BYTES)
+    finally:
+        os.close(fd)
+
+
+def _menu_merge(default_items, user_items):
+    """Field-by-field merge, later source wins - same semantics as
+    MenuModel.js's mergeMenuSources: reusing an id extends/overrides it, it
+    does not replace it outright.
+    """
+    merged = {}
+    order = []
+    for source in (default_items, user_items):
+        for item_id, entry in source.items():
+            if item_id not in merged:
+                order.append(item_id)
+                merged[item_id] = {}
+            merged[item_id].update(entry)
+    return merged, order
+
+
+def _menu_parent(item_id, entry):
+    parent = entry.get("parent")
+    if isinstance(parent, str):
+        return parent
+    if item_id == "root":
+        return ""
+    if "." in item_id:
+        return item_id.rsplit(".", 1)[0]
+    return "root"
+
+
+def _menu_breadcrumb(item_id, merged):
+    """Ancestor labels, root-to-parent, joined for a subtitle - `Style ›
+    Font` rather than a bare `Font`, since dozens of leaves share generic
+    labels (`Default`, `Theme`, `Chrome`) that only their place in the tree
+    disambiguates.
+    """
+    parts = []
+    seen = set()
+    current = merged.get(item_id, {}).get("_parent", "")
+    while current and current != "root" and current not in seen and len(parts) < MENU_BREADCRUMB_DEPTH:
+        seen.add(current)
+        entry = merged.get(current)
+        if not entry:
+            break
+        label = entry.get("label")
+        if isinstance(label, str) and label:
+            parts.append(label)
+        current = entry.get("_parent", "")
+    parts.reverse()
+    return " › ".join(parts)
+
+
+def _menu_resolve_argv(action):
+    """A config-supplied command line -> an argv vector, or None if it can't
+    be one without a real shell. Never returns something that was not
+    tokenised by shlex - no string is ever handed to a shell here.
+
+    $HOME and a leading ~ are expanded as plain substitution (not shell
+    expansion) because a handful of real entries are otherwise-plain argv
+    that only need that one thing; a token still containing `$` afterwards
+    means some other, unhandled expansion was in play, so it is rejected
+    rather than passed through literally.
+    """
+    action = str(action or "").strip()
+    if not action or MENU_SHELL_OPERATOR_RE.search(action):
+        return None
+    try:
+        tokens = shlex.split(action)
+    except ValueError:
+        return None
+    if not tokens or len(tokens) > MENU_ARGV_TOKENS:
+        return None
+    home = os.environ.get("HOME", "")
+    resolved = []
+    for token in tokens:
+        if home:
+            token = token.replace("$HOME", home)
+        if token == "~" or token.startswith("~/"):
+            token = home + token[1:]
+        if "$" in token or "`" in token or len(token) > MENU_ARGV_CHARS:
+            return None
+        resolved.append(token)
+    if not resolved[0].startswith(MENU_ACTION_PREFIX):
+        return None
+    return resolved
+
+
+_INSTALLED_PACKAGES = None
+
+
+def _menu_installed_packages():
+    """`pacman -Qq` once per process, cached - answers every `omarchy-pkg-
+    present` check in `when` without a subprocess per entry.
+    """
+    global _INSTALLED_PACKAGES
+    if _INSTALLED_PACKAGES is not None:
+        return _INSTALLED_PACKAGES
+    raw, _ = run_bounded(["pacman", "-Qq"], MENU_PKG_LIST_BYTES, MENU_PKG_LIST_DEADLINE)
+    _INSTALLED_PACKAGES = frozenset(raw.decode("utf-8", "replace").split())
+    return _INSTALLED_PACKAGES
+
+
+def _menu_when_allows(when):
+    """Only a handful of declarative `when` shapes are answered here - a
+    package or command present, a path existing - each resolved without a
+    shell (a package-name lookup, a PATH search, a stat). Every other shape
+    (hardware probes, `compgen`, arbitrary shell) is left showing rather
+    than hidden: a row nobody's hardware can use is a dead click, a row that
+    silently disappeared is a feature the user cannot find and cannot know
+    why - worse in a launcher.
+    """
+    when = str(when or "").strip()
+    if not when:
+        return True
+
+    m = MENU_WHEN_PKG_RE.match(when)
+    if m:
+        present = m.group(2) in _menu_installed_packages()
+        return (not present) if m.group(1) else present
+
+    m = MENU_WHEN_CMD_RE.match(when)
+    if m:
+        present = shutil.which(m.group(2)) is not None
+        return (not present) if m.group(1) else present
+
+    m = MENU_WHEN_PATH_RE.match(when)
+    if m:
+        negate, kind, path = m.group(1), m.group(2), m.group(3)
+        home = os.environ.get("HOME", "")
+        if home:
+            path = path.replace("$HOME", home)
+        if path == "~" or path.startswith("~/"):
+            path = home + path[1:]
+        exists = os.path.isdir(path) if kind == "d" else os.path.isfile(path)
+        return (not exists) if negate else exists
+
+    return True
+
+
+def _menu_commands():
+    """The real Omarchy root-menu tree, projected into the same row shape
+    Commands.js already emits - Spotlight.qml's dispatch does not need to
+    know these came from a different source. install.*/remove.* (package
+    management, not what a launcher's fuzzy search is for, and the single
+    largest source of `when` conditions) and system.* (already curated by
+    hand in Commands.js, confirmation prompts included) are excluded by
+    subtree; a `provider` entry pulls its rows from a runtime function/
+    command rather than static data and is excluded rather than guessed at;
+    an `action` this cannot turn into a plain argv vector is excluded rather
+    than run through a shell.
+    """
+    default_items = _menu_parse_items(_menu_read_default())
+    user_items = _menu_parse_items(_menu_read_user())
+    merged, order = _menu_merge(default_items, user_items)
+    for item_id, entry in merged.items():
+        entry["_parent"] = _menu_parent(item_id, entry)
+
+    rows = []
+    for item_id in order:
+        if len(rows) >= MENU_MAX_ITEMS:
+            break
+        if item_id.startswith(MENU_SKIP_PREFIXES) or item_id in ("install", "remove", "system"):
+            continue
+        entry = merged[item_id]
+        if entry.get("provider"):
+            continue
+        argv = _menu_resolve_argv(entry.get("action"))
+        if not argv:
+            continue
+        if not _menu_when_allows(entry.get("when")):
+            continue
+        label = clamp_text(entry.get("label") or item_id, MENU_LABEL_CHARS)
+        if not label:
+            continue
+        aliases = entry.get("aliases")
+        keywords = " ".join(a for a in aliases if isinstance(a, str)) if isinstance(aliases, list) else ""
+        rows.append({
+            "key": "menu:" + item_id,
+            "title": label,
+            "subtitle": _menu_breadcrumb(item_id, merged),
+            "icon": clamp_text(entry.get("icon") or "", 8),
+            "argv": argv,
+            "keywords": clamp_text(keywords, MENU_LABEL_CHARS),
+        })
+    return rows
+
+
 # ---------------------------------------------------------------- commands
 def cmd_read_settings():
     fd = walk([".config", "omarchy"])
@@ -498,6 +776,10 @@ def cmd_read_hides():
         if len(hides) >= HIDES_COUNT:
             break
     emit({"hides": hides})
+
+
+def cmd_read_menu_commands():
+    emit({"commands": _menu_commands()})
 
 
 def cmd_read_usage():
@@ -758,6 +1040,7 @@ COMMANDS = {
     "read-settings": (cmd_read_settings, False),
     "read-usage": (cmd_read_usage, False),
     "read-hides": (cmd_read_hides, False),
+    "read-menu-commands": (cmd_read_menu_commands, False),
     "write-usage": (cmd_write_usage, False),
     "read-clipboard": (cmd_read_clipboard, False),
     "clipboard-copy": (cmd_clipboard_copy, True),
