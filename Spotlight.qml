@@ -143,13 +143,12 @@ Item {
   // The helper returns at most 400 hits (a scan pool, ranked below); the
   // list shows the best 10 of them.
   readonly property int maxFileRows: 10
-  // Must match bin/spotlight-helper's FILES_MAX_TERMS: the helper only
-  // AND-filters on the first 8 terms of a multi-term query, so a 9th+ term
-  // is absent from every candidate it returns. Scoring against terms past
-  // that point (rank()'s own no-cap default) treats an ignored term as
-  // "not found" in every candidate equally, which can still separate them
-  // on it - passing the same limit here is what keeps FileRank scoring the
-  // same terms the helper actually filtered on.
+  // Must match bin/spotlight-helper's file-search limits: the helper first
+  // truncates the pattern to 256 characters, then AND-filters on its first
+  // 8 terms. FileRank must score that same bounded pattern; otherwise text
+  // fd never required can either collapse candidates to the residual tier
+  // or favor an incidental match.
+  readonly property int filePatternChars: 256
   readonly property int fileMaxTerms: 8
   readonly property int maxClipboardRows: 8
   readonly property int maxReminderRows: 50
@@ -1178,13 +1177,10 @@ Item {
         isDir: f.isDir === true
       })
     }
-    // fileMaxTerms mirrors bin/spotlight-helper's own FILES_MAX_TERMS (see
-    // rank()'s doc comment in FileRank.js for why this has to match rather
-    // than being omitted): this helper does split a query into multiple
-    // --and patterns, capped at 8, so rank() has to be capped the same way
-    // or it would score terms fd never filtered on.
+    // Apply the helper's character cutoff before its term cutoff so ranking
+    // uses exactly the portion of the pattern fd filtered on.
     var ranked = target
-      ? FileRank.rank(candidates, target.pattern, target.dir, root.fileMaxTerms)
+      ? FileRank.rank(candidates, target.pattern.slice(0, root.filePatternChars), target.dir, root.fileMaxTerms)
       : candidates
     var out = ranked.slice(0, root.maxFileRows)
     root.fileRows = out

@@ -118,9 +118,9 @@ test("a shallow near-complete prefix outranks an exact match buried in cache/too
 
 test("the prefix gap is narrow: a merely-deep exact match still beats a shallow prefix", () => {
   // The fix narrows one specific boundary, it does not flatten tiers in
-  // general - an exact match only one level deep (150 penalty, comfortably
-  // more than FILE_PREFIX_GAP=200 away from mattering here) still loses to
-  // nothing: it should still outrank a same-depth prefix match.
+  // general - an exact match only one level deep pays a 150-point penalty,
+  // less than FILE_PREFIX_GAP=200, so it remains 50 points ahead of a
+  // shallow prefix match.
   const exactOneLevelDeep = file("/home/x/sub/download", true)
   const prefixShallow = file("/home/x/downloads", true)
   const ranked = FileRank.rank([prefixShallow, exactOneLevelDeep], "download", "/home/x", 8)
@@ -152,34 +152,60 @@ test("the prefix gap does not distort ordering between two same-tier candidates"
   assert.equal(ranked[0].path, shallow.path)
 })
 
-test("the production call site passes fileMaxTerms, matching the helper's own cutoff", () => {
-  // Flagged in maintainer review on the PR: main's multi-term change AND-filters bin/spotlight-
-  // helper's `fd` call on the first FILES_MAX_TERMS (8) terms, but this
-  // branch's production loadFiles() call to FileRank.rank() had no
-  // corresponding argument at all - an omitted maxTerms silently degrades
-  // to rank()'s no-cap default rather than failing loudly, so nothing here
-  // short of reading the actual call site (the unit tests above only
-  // exercise the scorer API, never this file) would have caught it. This
-  // is a text check, not a QML runtime one - there is no QML test harness
-  // in this repo - but it pins both the constant and the call shape so a
-  // stale comment or a dropped argument fails a test instead of shipping.
+test("the production call site matches the helper's pattern and term cutoffs", () => {
+  // The helper truncates the pattern before splitting it into terms. The
+  // production scorer must apply both limits in that order so it never
+  // scores text fd did not require. This is a text check, not a QML runtime
+  // one - there is no QML test harness in this repo - but it pins both
+  // constants and the call shape so a dropped limit fails loudly.
   const qml = fs.readFileSync(path.join(ROOT, "Spotlight.qml"), "utf8")
   const helper = fs.readFileSync(path.join(ROOT, "bin", "spotlight-helper"), "utf8")
 
-  const qmlMatch = qml.match(/readonly property int fileMaxTerms:\s*(\d+)/)
-  assert.ok(qmlMatch, "Spotlight.qml must declare a fileMaxTerms property")
+  const qmlPatternMatch = qml.match(/readonly property int filePatternChars:\s*(\d+)/)
+  assert.ok(qmlPatternMatch, "Spotlight.qml must declare a filePatternChars property")
 
-  const helperMatch = helper.match(/^FILES_MAX_TERMS = (\d+)/m)
-  assert.ok(helperMatch, "bin/spotlight-helper must declare FILES_MAX_TERMS")
+  const helperPatternMatch = helper.match(/^FILES_PATTERN_CHARS = (\d+)/m)
+  assert.ok(helperPatternMatch, "bin/spotlight-helper must declare FILES_PATTERN_CHARS")
 
   assert.equal(
-    qmlMatch[1],
-    helperMatch[1],
+    qmlPatternMatch[1],
+    helperPatternMatch[1],
+    "Spotlight.qml's filePatternChars must match the helper's FILES_PATTERN_CHARS"
+  )
+
+  const qmlTermsMatch = qml.match(/readonly property int fileMaxTerms:\s*(\d+)/)
+  assert.ok(qmlTermsMatch, "Spotlight.qml must declare a fileMaxTerms property")
+
+  const helperTermsMatch = helper.match(/^FILES_MAX_TERMS = (\d+)/m)
+  assert.ok(helperTermsMatch, "bin/spotlight-helper must declare FILES_MAX_TERMS")
+
+  assert.equal(
+    qmlTermsMatch[1],
+    helperTermsMatch[1],
     "Spotlight.qml's fileMaxTerms must match the helper's FILES_MAX_TERMS"
   )
   assert.match(
     qml,
-    /FileRank\.rank\(candidates, target\.pattern, target\.dir, root\.fileMaxTerms\)/,
-    "the production loadFiles() call must pass root.fileMaxTerms to FileRank.rank()"
+    /FileRank\.rank\(candidates, target\.pattern\.slice\(0, root\.filePatternChars\), target\.dir, root\.fileMaxTerms\)/,
+    "the production loadFiles() call must apply both helper-aligned limits"
   )
+})
+
+test("the pattern cutoff is applied before the term cutoff", () => {
+  // Seven 32-character terms plus the separating spaces leave only 25
+  // characters of term eight inside the helper's 256-character pattern.
+  // Both candidates satisfy that helper query; scoring the unbounded term
+  // incorrectly favors the deep candidate that happens to contain all 32
+  // characters, while scoring the helper-bounded pattern keeps the shallow
+  // result first.
+  const first = "a".repeat(32)
+  const eighth = "b".repeat(32)
+  const pattern = Array(7).fill(first).concat(eighth).join(" ")
+  const helperPattern = pattern.slice(0, 256)
+  const shallow = file("/home/x/" + first + eighth.slice(0, 25))
+  const deep = file("/home/x/.cache/a/b/" + first + eighth)
+
+  assert.equal(pattern.length, 263)
+  assert.equal(FileRank.rank([shallow, deep], helperPattern, "/home/x", 8)[0].path, shallow.path)
+  assert.equal(FileRank.rank([shallow, deep], pattern, "/home/x", 8)[0].path, deep.path)
 })
