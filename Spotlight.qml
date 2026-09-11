@@ -333,6 +333,12 @@ Item {
         subtitle: String(c.subtitle || "").slice(0, root.maxSubtitleChars),
         icon: String(c.icon || "󰣇"),
         kind: "shell",
+        // Dispatch is still plain "shell" (activate()'s switch never sees
+        // this), but commandRows() reads it to label these distinctly from
+        // the hand-curated catalogue - these are real Omarchy menu tree
+        // entries, not entries this project wrote, and looking identical
+        // to a curated command made that distinction invisible.
+        source: "menu",
         argv: argv,
         keywords: String(c.keywords || "")
       })
@@ -699,12 +705,17 @@ Item {
     var out = []
     for (var j = 0; j < scored.length && j < 7; j++) {
       var c = scored[j].cmd
+      var fromMenu = c.source === "menu"
       out.push(root.row({
         key: "cmd:" + c.key,
-        section: c.kind === "url" ? "Quicklinks" : "Commands",
+        // Real Omarchy menu tree entries get their own section/badge -
+        // "Command" implied this project wrote and curated every one of
+        // them, which stopped being true once the actual menu tree (275+
+        // entries) got pulled in alongside the ~50 hand-curated ones.
+        section: c.kind === "url" ? "Quicklinks" : (fromMenu ? "Omarchy Menu" : "Commands"),
         kind: c.kind,
         title: c.title, subtitle: c.subtitle,
-        accessory: c.kind === "url" ? "Link" : "Command",
+        accessory: c.kind === "url" ? "Link" : (fromMenu ? "Menu" : "Command"),
         icon: c.icon,
         primaryLabel: c.kind === "url" ? "Open in browser" : "Run",
         confirm: c.confirm === true,
