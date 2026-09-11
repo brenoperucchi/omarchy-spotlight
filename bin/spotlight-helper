@@ -30,7 +30,6 @@ import json
 import os
 import re
 import select
-import shlex
 import shutil
 import signal
 import stat
@@ -105,7 +104,17 @@ MENU_SKIP_PREFIXES = ("install.", "remove.", "system.")
 # would mean opposite things depending on which row a user happened to
 # click. Extend this list as more surface; it is not a promise of
 # completeness.
-MENU_SKIP_IDS = ("learn.keybindings", "trigger.screensaver")
+# trigger.toggle.screensaver, not trigger.screensaver - found by review, a
+# typo'd id here means the skip is a no-op (the tautological form of "not
+# in this list" that a test asserting against the list itself cannot catch:
+# it passes for a nonexistent id just as easily as for a real one). Verify
+# skip decisions against the emitted title set, not against this list.
+# setup.keybindings is included for the same collision reason but a
+# different resolution (see its own comment at the callsite) - it survives
+# the curated `keys` row's title but does something different (edits
+# bindings.lua rather than viewing keybindings), so it is dropped rather
+# than mislabeled.
+MENU_SKIP_IDS = ("learn.keybindings", "trigger.toggle.screensaver", "setup.keybindings")
 # Only omarchy's own wrapped commands - the same posture Commands.js already
 # committed to (its own comment: no Suspend row, because a bare `systemctl
 # suspend` would cost the marketplace listing its automatic Verified status).
@@ -137,19 +146,35 @@ MENU_PKG_LIST_BYTES = 512 * 1024
 # real (not estimated) JSON size directly; margin reasoning matches
 # FILES_JSON_BUDGET_CHARS's comment (Python len() vs JS String.length).
 MENU_JSON_BUDGET_CHARS = 200000
-# A real shell operator or metacharacter in the action string - not a
-# leftover $VAR, which is handled separately (only $HOME/~ are expanded, as
-# plain substitution, never through a shell). Conservative on purpose:
-# unrecognised syntax is excluded, never guessed at - found by review, the
-# original version of this list missed enough real shell syntax (a bare `>`
-# or `<`, `&` backgrounding, a newline joining two separate commands, globs)
-# that those actions were silently accepted and then executed wrong (the
-# operator landing as a literal, useless argv token) rather than rejected.
-# Checked against every action in the shipped default tree: none of the ones
-# already accepted contain any of these characters, so this does not narrow
-# what works today - it only closes what should never have been accepted.
-MENU_SHELL_OPERATOR_RE = re.compile(
-    r"(\|\||&&|;|\$\(|`|\bif\b|\bthen\b|\belif\b|\bfi\b|[<>&*?{}\n\\]|(?<!\|)\|(?!\|))"
+# Shell metacharacters that only mean anything when they appear outside of
+# any quoting - found by review (round 2), rejecting them unconditionally
+# (a plain regex over the raw string, run before tokenising) meant a
+# perfectly literal, harmless value inside quotes - a URL query string like
+# 'https://x/?a=1&b=2' - silently vanished from the catalogue too, the same
+# false-negative failure this module otherwise goes out of its way to
+# avoid. ';'/'<'/'>'/newline/backslash/backtick are rejected the same way,
+# even though real Bash would also reject some of these unquoted forms
+# outright - the point here is never to guess at shell semantics, so an
+# unquoted occurrence of any of them is treated as "this needs a real
+# shell" rather than parsed further.
+MENU_UNQUOTED_REJECT_CHARS = frozenset("|&;<>`\\*?{}[]#\n")
+# Reserved words are only shell syntax in command position, but this module
+# does not track command position - rejecting them as bare, wholly-unquoted
+# tokens (never inside quotes, where they are ordinary literal arguments)
+# is the conservative stand-in used instead.
+MENU_SHELL_KEYWORDS = frozenset({"if", "then", "elif", "fi"})
+# A '$' only starts a real expansion when followed by something that could
+# begin one (a name, `{`, `(`, or a Bash special parameter) - anything else
+# right after it (end of string, a closing quote, punctuation) is a literal
+# dollar sign in real Bash too. Needed to correctly handle the quote-
+# concatenation trick found by review: `'$'HOME/a` is a single-quoted
+# literal `$` immediately followed by unquoted `HOME/a` (no `$` in front of
+# it, so no expansion) - Bash's own word-joining rule glues these into one
+# token, `$HOME/a`, entirely literal. A naive "does the joined token
+# contain $HOME" check (this module's previous approach) cannot tell that
+# apart from a real `$HOME` reference and expanded it wrongly.
+MENU_DOLLAR_EXPANSION_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_{(@*#?$!-0123456789"
 )
 MENU_WHEN_PKG_RE = re.compile(r"^(!\s*)?omarchy-pkg-present\s+(\S+)$")
 MENU_WHEN_CMD_RE = re.compile(r"^(!\s*)?omarchy-cmd-present\s+(\S+)$")
@@ -158,22 +183,15 @@ MENU_WHEN_CMD_RE = re.compile(r"^(!\s*)?omarchy-cmd-present\s+(\S+)$")
 # quotes as part of the path made every quoted condition evaluate as though
 # the path did not exist; matched as two alternatives (quoted allows spaces,
 # unquoted does not) rather than one pattern, since a real entry in the
-# shipped tree quotes a path with a space in it.
+# shipped tree quotes a path with a space in it. Group 3 is the quote
+# character itself (or None if unquoted) - _menu_when_allows uses it to
+# decide whether $HOME/~ inside the path may be expanded at all.
 MENU_WHEN_PATH_RE = re.compile(r'^\[\[\s*(!\s*)?-([df])\s+(?:(["\'])(.*?)\3|(\S+))\s*\]\]$')
 # $HOME must end at a word boundary - found by review, a plain substring
 # replace turned $HOMEDIR (a different, unrelated variable name that merely
 # starts with the same four letters) into a fabricated path instead of
 # being left as an unresolved $ and rejected.
 MENU_HOME_VAR_RE = re.compile(r"\$HOME\b")
-# shlex.split discards which quote style (if any) wrapped each token, but
-# quote style changes what real Bash would do: $HOME stays literal under
-# single quotes (found by review - resolving it there is a silent wrong
-# expansion, not a convenience), and a leading ~ is never expanded under
-# either quote style. Checked against the raw, still-quoted action string,
-# before tokenising - a token this manual expansion would get wrong is
-# rejected rather than resolved incorrectly.
-MENU_QUOTED_HOME_RE = re.compile(r"'[^']*\$HOME\b[^']*'")
-MENU_QUOTED_TILDE_RE = re.compile(r"""(['"])[^'"]*~[^'"]*\1""")
 
 
 class Denied(Exception):
@@ -707,45 +725,155 @@ def _menu_breadcrumb(item_id, merged):
     return " › ".join(parts)
 
 
-def _menu_resolve_argv(action):
-    """A config-supplied command line -> an argv vector, or None if it can't
-    be one without a real shell. Never returns something that was not
-    tokenised by shlex - no string is ever handed to a shell here.
+def _menu_dollar_home(action, i):
+    """True when action[i] starts a word-bounded `$HOME` - the only
+    variable this module ever expands."""
+    if action[i:i + 5] != "$HOME":
+        return False
+    nxt = action[i + 5:i + 6]
+    return not (nxt.isalnum() or nxt == "_")
 
-    $HOME and a leading ~ are expanded as plain substitution (not shell
-    expansion) because a handful of real entries are otherwise-plain argv
-    that only need that one thing; a token still containing `$` afterwards
-    means some other, unhandled expansion was in play, so it is rejected
-    rather than passed through literally.
+
+def _menu_dollar_is_literal(action, i):
+    """True when the '$' at action[i] cannot start a real Bash expansion -
+    nothing follows it that could ever begin one - so it is just a literal
+    dollar sign, exactly as real Bash would treat it, quoted or not."""
+    nxt = action[i + 1:i + 2]
+    return not nxt or nxt not in MENU_DOLLAR_EXPANSION_CHARS
+
+
+def _menu_tokenize(action):
+    """A minimal, quote-aware tokeniser standing in for a real shell lexer.
+
+    Found by review across two rounds: neither a regex run over the raw
+    action string before tokenising, nor a per-token check run on shlex's
+    output afterwards, can correctly tell quoted (literal) text apart from
+    unquoted (meaningful) text - shlex.split discards quote type once it
+    hands back plain strings, and Bash's own quote-concatenation rule
+    (`'$'HOME` is one token made of a literal `$` plus unquoted `HOME`,
+    with no expansion) lets a single quoted character disguise the rest of
+    a token as unquoted to any check working from the outside in. This
+    walks the string exactly once, tracking real quote state per character,
+    so every substitution and rejection decision is made with that context
+    instead of a guess: $HOME expands inside double quotes and unquoted
+    text (real Bash's own rule), never inside single quotes; ~ expands only
+    at the true start of an unquoted word; and shell metacharacters/
+    keywords are rejected only where they appear outside of any quoting,
+    since that is the only place a real shell would ever treat them as
+    syntax rather than as literal text.
+
+    Returns a list of argv tokens with $HOME/~ already resolved, or None if
+    the action needs real shell semantics this does not implement.
+    """
+    home = os.environ.get("HOME", "")
+    tokens = []
+    chars = []
+    token_quoted = False
+    at_token_start = True
+    quote = None
+    i, n = 0, len(action)
+    while i < n:
+        c = action[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            else:
+                chars.append(c)
+            i += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = None
+                i += 1
+                continue
+            if c == "$":
+                if _menu_dollar_home(action, i):
+                    chars.append(home)
+                    i += 5
+                    continue
+                if _menu_dollar_is_literal(action, i):
+                    chars.append("$")
+                    i += 1
+                    continue
+                return None
+            if c in ("`", "\\"):
+                return None
+            chars.append(c)
+            i += 1
+            continue
+        # unquoted
+        if c.isspace():
+            if chars:
+                tokens.append(("".join(chars), token_quoted))
+                chars = []
+                token_quoted = False
+            at_token_start = True
+            i += 1
+            continue
+        if c == "'":
+            quote = "'"
+            token_quoted = True
+            at_token_start = False
+            i += 1
+            continue
+        if c == '"':
+            quote = '"'
+            token_quoted = True
+            at_token_start = False
+            i += 1
+            continue
+        if c == "~" and at_token_start:
+            chars.append(home)
+            at_token_start = False
+            i += 1
+            continue
+        if c == "$":
+            if _menu_dollar_home(action, i):
+                chars.append(home)
+                at_token_start = False
+                i += 5
+                continue
+            if _menu_dollar_is_literal(action, i):
+                chars.append("$")
+                at_token_start = False
+                i += 1
+                continue
+            return None
+        if c in MENU_UNQUOTED_REJECT_CHARS:
+            return None
+        chars.append(c)
+        at_token_start = False
+        i += 1
+    if quote is not None:
+        return None  # unterminated quote
+    if chars:
+        tokens.append(("".join(chars), token_quoted))
+    resolved = []
+    for text, quoted in tokens:
+        if not quoted and text in MENU_SHELL_KEYWORDS:
+            return None
+        resolved.append(text)
+    return resolved
+
+
+def _menu_resolve_argv(action):
+    """A config-supplied command line -> an argv vector, or None if it
+    can't be one without a real shell. Never returns something that was
+    not built by _menu_tokenize - no string is ever handed to a shell
+    here.
     """
     action = str(action or "").strip()
-    if not action or MENU_SHELL_OPERATOR_RE.search(action):
+    if not action:
         return None
-    if MENU_QUOTED_HOME_RE.search(action) or MENU_QUOTED_TILDE_RE.search(action):
+    argv = _menu_tokenize(action)
+    if not argv or len(argv) > MENU_ARGV_TOKENS:
         return None
-    try:
-        tokens = shlex.split(action)
-    except ValueError:
-        return None
-    if not tokens or len(tokens) > MENU_ARGV_TOKENS:
-        return None
-    home = os.environ.get("HOME", "")
-    resolved = []
-    for token in tokens:
-        if home:
-            # \b, not a plain substring replace: $HOMEDIR is a different,
-            # unrelated variable name that merely starts with the same four
-            # letters, and must be left with its $ intact so the check below
-            # rejects it, not silently rewritten into a fabricated path.
-            token = MENU_HOME_VAR_RE.sub(home, token)
-        if token == "~" or token.startswith("~/"):
-            token = home + token[1:]
-        if "$" in token or "`" in token or len(token) > MENU_ARGV_CHARS:
+    for token in argv:
+        if len(token) > MENU_ARGV_CHARS:
             return None
-        resolved.append(token)
-    if not resolved[0].startswith(MENU_ACTION_PREFIX):
+    if not argv[0].startswith(MENU_ACTION_PREFIX):
         return None
-    return resolved
+    return argv
 
 
 _INSTALLED_PACKAGES = "unread"
@@ -798,13 +926,20 @@ def _menu_when_allows(when):
 
     m = MENU_WHEN_PATH_RE.match(when)
     if m:
-        negate, kind = m.group(1), m.group(2)
-        path = m.group(4) if m.group(3) else m.group(5)
+        negate, kind, quote_char = m.group(1), m.group(2), m.group(3)
+        path = m.group(4) if quote_char else m.group(5)
         home = os.environ.get("HOME", "")
-        if home:
-            path = MENU_HOME_VAR_RE.sub(home, path)
-        if path == "~" or path.startswith("~/"):
-            path = home + path[1:]
+        # $HOME expands inside double quotes and unquoted text, never
+        # inside single quotes; ~ never expands under any quoting, only
+        # unquoted - found by review, the previous version expanded both
+        # regardless of which quote (if any) wrapped the path, so
+        # `[[ ! -d '$HOME' ]]` (meant literally) silently tested the real
+        # home directory instead of the string "$HOME".
+        if quote_char != "'":
+            if home:
+                path = MENU_HOME_VAR_RE.sub(home, path)
+            if quote_char is None and (path == "~" or path.startswith("~/")):
+                path = home + path[1:]
         exists = os.path.isdir(path) if kind == "d" else os.path.isfile(path)
         return (not exists) if negate else exists
 

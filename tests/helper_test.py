@@ -133,15 +133,82 @@ class MenuCommandsTests(unittest.TestCase):
             else:
                 os.environ["HOME"] = old_home
 
-    def test_action_with_a_single_quoted_home_is_rejected_not_expanded(self):
-        # Single quotes in real shell mean literal - $HOME under them must
-        # not be resolved. shlex.split strips the quoting before this ever
-        # sees it, so the only correct outcome here is rejection, not a
-        # silently wrong expansion.
+    def test_action_with_a_single_quoted_home_stays_literal_not_expanded(self):
+        # Single quotes in real Bash mean literal - $HOME under them is
+        # never a variable reference, so the correct argv value is the
+        # literal string "$HOME/a", not an expanded path and not a
+        # rejection (this is now resolvable exactly, not just detectable
+        # as wrong - see the quote-aware tokeniser).
         old_home = os.environ.get("HOME")
         os.environ["HOME"] = "/home/test-user"
         try:
-            self.assertIsNone(HELPER._menu_resolve_argv("omarchy-launch-config-editor '$HOME/a'"))
+            self.assertEqual(
+                HELPER._menu_resolve_argv("omarchy-launch-config-editor '$HOME/a'"),
+                ["omarchy-launch-config-editor", "$HOME/a"],
+            )
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_action_with_a_quote_concatenation_trick_stays_literal(self):
+        # Bash joins an adjacent quoted and unquoted span into one token
+        # with no whitespace between them, so `'$'HOME/a` - a single-quoted
+        # literal `$` immediately followed by unquoted `HOME/a` - is the
+        # literal string "$HOME/a", never an expansion of $HOME: only the
+        # `$` itself was ever quoted, and unquoted `HOME/a` has no `$` in
+        # it to expand. Found by review: a check that only asks "is the
+        # whole $HOME substring inside quotes" cannot see this, since no
+        # quote in the source spans all of "$HOME".
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = "/home/test-user"
+        try:
+            for action in (
+                "omarchy-launch-config-editor '$'HOME/a",
+                'omarchy-launch-config-editor "$"HOME/a',
+            ):
+                self.assertEqual(
+                    HELPER._menu_resolve_argv(action),
+                    ["omarchy-launch-config-editor", "$HOME/a"],
+                    action,
+                )
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_action_keeps_shell_metacharacters_literal_inside_quotes(self):
+        # ?, &, *, {}, [] only mean anything to a real shell when they are
+        # not quoted - found by review, rejecting them unconditionally (a
+        # regex over the raw string before tokenising) made a harmless,
+        # already-quoted URL query string vanish from the catalogue, the
+        # same false-negative failure this module otherwise avoids on
+        # purpose. omarchy-launch-webapp with a quoted URL is a real,
+        # common shape in the shipped tree.
+        self.assertEqual(
+            HELPER._menu_resolve_argv("omarchy-launch-webapp 'https://x.com/?a=1&b=2'"),
+            ["omarchy-launch-webapp", "https://x.com/?a=1&b=2"],
+        )
+        self.assertEqual(
+            HELPER._menu_resolve_argv("omarchy-foo 'file * name'"),
+            ["omarchy-foo", "file * name"],
+        )
+
+    def test_action_tilde_expansion_respects_real_token_boundaries(self):
+        # Found by review: a regex checking "is there a ~ somewhere between
+        # a pair of quotes" could match across two separate quoted tokens
+        # rather than within one, falsely treating an unquoted ~ in between
+        # as though it were quoted. A real per-character tokeniser cannot
+        # make that mistake.
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = "/home/test-user"
+        try:
+            self.assertEqual(
+                HELPER._menu_resolve_argv("omarchy-foo 'a' ~/x 'b'"),
+                ["omarchy-foo", "a", "/home/test-user/x", "b"],
+            )
         finally:
             if old_home is None:
                 os.environ.pop("HOME", None)
@@ -218,6 +285,23 @@ class MenuCommandsTests(unittest.TestCase):
             self.assertFalse(HELPER._menu_when_allows("[[ ! -d %s ]]" % directory))
             self.assertTrue(HELPER._menu_when_allows("[[ -f %s ]]" % file_path))
             self.assertFalse(HELPER._menu_when_allows("[[ -f %s/missing ]]" % directory))
+
+    def test_when_path_respects_quote_type_for_home_and_tilde_expansion(self):
+        # Found by review: $HOME expands inside double quotes and unquoted
+        # text (real Bash's rule) but never inside single quotes; ~ never
+        # expands under any quoting. A literal directory named "$HOME" or
+        # "~" almost certainly does not exist, so the un-negated condition
+        # is False and the negated one True - if either got expanded, the
+        # real home directory (which does exist) would flip both results.
+        self.assertFalse(HELPER._menu_when_allows("[[ -d '$HOME' ]]"))
+        self.assertTrue(HELPER._menu_when_allows("[[ ! -d '$HOME' ]]"))
+        self.assertFalse(HELPER._menu_when_allows('[[ -d "~" ]]'))
+        self.assertTrue(HELPER._menu_when_allows('[[ ! -d "~" ]]'))
+        # Unquoted and double-quoted $HOME still expand correctly.
+        home = os.environ.get("HOME", "")
+        if home:
+            self.assertTrue(HELPER._menu_when_allows("[[ -d %s ]]" % home))
+            self.assertTrue(HELPER._menu_when_allows('[[ -d "$HOME" ]]'))
 
     def test_when_path_exists_handles_quoted_paths_with_spaces(self):
         # A quoted path is the normal, equivalent Bash form - the previous
@@ -305,9 +389,16 @@ class MenuCommandsTests(unittest.TestCase):
         # with different (Screensaver: opposite) behaviour - a second,
         # differently-behaving row under the same title is a worse outcome
         # than the menu tree's copy being absent from this catalogue.
-        ids = {row["key"].split(":", 1)[1] for row in HELPER._menu_commands()}
-        for skipped in HELPER.MENU_SKIP_IDS:
-            self.assertNotIn(skipped, ids)
+        #
+        # Found by review: asserting id-not-in-emitted-set against
+        # MENU_SKIP_IDS itself is a tautology for a typo'd id (it can never
+        # appear, whether the skip worked or the id was simply never real),
+        # so this checks the actual property that matters - no title this
+        # module emits collides with one of Commands.js's curated titles -
+        # rather than trusting the skip list to grade its own homework.
+        commands_js_titles = {"Keybindings", "Screensaver"}
+        for row in HELPER._menu_commands():
+            self.assertNotIn(row["title"], commands_js_titles, row)
 
     def test_menu_commands_stops_before_exceeding_the_json_budget(self):
         # Row count and per-label clamps alone do not bound the real
