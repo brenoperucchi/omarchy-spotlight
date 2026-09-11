@@ -161,12 +161,6 @@ Item {
   readonly property int maxTitleChars: 512
   readonly property int maxSubtitleChars: 1024
 
-  // Must match bin/spotlight-helper's FILES_MAX_TERMS: FileRank.rank() has
-  // to score the same terms the helper actually filtered on, or a query
-  // with more terms than the helper used collapses every candidate to the
-  // same residual tier and the name-match signal disappears.
-  readonly property int fileMaxTerms: 8
-
   property var settings: ({
     webSuggestions: false,
     searchEngine: "g",
