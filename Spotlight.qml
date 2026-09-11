@@ -13,6 +13,7 @@ import "lib/Fuzzy.js" as Fuzzy
 import "lib/Frecency.js" as Frecency
 import "lib/Commands.js" as Commands
 import "lib/Apps.js" as Apps
+import "lib/FileRank.js" as FileRank
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -139,8 +140,16 @@ Item {
   // rather than trusted; the rest bound lists that arrive from outside.
   readonly property int maxAppRows: 24
   readonly property int maxIdleAppRows: 60
-  // The helper returns at most 40 hits; the list shows the first 10 of them.
+  // The helper returns at most 400 hits (a scan pool, ranked below); the
+  // list shows the best 10 of them.
   readonly property int maxFileRows: 10
+  // Must match bin/spotlight-helper's file-search limits: the helper first
+  // truncates the pattern to 256 characters, then AND-filters on its first
+  // 8 terms. FileRank must score that same bounded pattern; otherwise text
+  // fd never required can either collapse candidates to the residual tier
+  // or favor an incidental match.
+  readonly property int filePatternChars: 256
+  readonly property int fileMaxTerms: 8
   readonly property int maxClipboardRows: 8
   readonly property int maxReminderRows: 50
   readonly property int maxQueryChars: 512
@@ -1151,17 +1160,24 @@ Item {
     if (forQuery !== String(root.query || "").trim()) return
     var reply = root.helperReply(raw)
     var list = (reply && Array.isArray(reply.files)) ? reply.files : []
-    var out = []
-    for (var i = 0; i < list.length && out.length < root.maxFileRows; i++) {
+    var target = root.fileSearchTarget(forQuery)
+    var candidates = []
+    for (var i = 0; i < list.length; i++) {
       var f = list[i]
       if (!f || !f.path) continue
-      out.push({
+      candidates.push({
         path: String(f.path),
         name: String(f.name || ""),
         dir: String(f.dir || "/"),
         isDir: f.isDir === true
       })
     }
+    // Apply the helper's character cutoff before its term cutoff so ranking
+    // uses exactly the portion of the pattern fd filtered on.
+    var ranked = target
+      ? FileRank.rank(candidates, target.pattern.slice(0, root.filePatternChars), target.dir, root.fileMaxTerms)
+      : candidates
+    var out = ranked.slice(0, root.maxFileRows)
     root.fileRows = out
     root.fileFor = forQuery
     root.rebuild()

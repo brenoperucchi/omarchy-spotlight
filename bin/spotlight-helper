@@ -62,10 +62,32 @@ SUGGEST_QUERY_CHARS = 200
 
 FILES_BYTES = 256 * 1024
 FILES_DEADLINE = 3.0
-FILES_COUNT = 40
+# The shell ranks and shows only the best few of these, so this is a scan
+# pool, not a display count: raising it costs `fd` little (its own walk
+# dominates the latency, not the result cap) but is what lets a real match
+# survive being buried behind everything a bare directory walk happens to
+# find first. 400 short paths sits well under FILES_BYTES.
+FILES_COUNT = 400
 FILES_PATH_CHARS = 1024
 FILES_PATTERN_CHARS = 256
 FILES_MAX_TERMS = 8
+# Each row repeats its path across path/name/dir plus JSON structure, so 400
+# short real-world hits (35-50 KB raw from `fd`) can still project into a
+# payload several times that size — measured able to clear Spotlight.qml's
+# maxHelperPayloadChars (524288) well before hitting FILES_COUNT, on long
+# real paths. This stops row-building on real (not estimated) JSON size,
+# comfortably under that ceiling, rather than hoping FILES_COUNT alone keeps
+# the payload small enough.
+#
+# "Comfortably" has to mean at least 2x, not just "under": this is counted
+# in Python `len()` (code points), but the ceiling it protects is JS
+# `String.length` (UTF-16 code units) on the other side of the JSON — any
+# character outside the BMP counts double there and not here. Measured
+# break-even against a real emit() of a payload that is nearly all
+# non-BMP: ~265000. 200000 keeps that difference from ever mattering —
+# raising this constant without re-deriving that margin reintroduces the
+# empty-results bug this budget exists to prevent.
+FILES_JSON_BUDGET_CHARS = 200000
 
 REMINDER_BYTES = 256 * 1024
 REMINDER_DEADLINE = 3.0
@@ -1287,10 +1309,21 @@ def cmd_files(argv):
         fd_argv += ["--and", term]
     fd_argv += ["--", terms[0], directory]
 
-    raw, _ = run_bounded(fd_argv, FILES_BYTES, FILES_DEADLINE)
+    raw, truncated = run_bounded(fd_argv, FILES_BYTES, FILES_DEADLINE)
+
+    lines = raw.decode("utf-8", "replace").split("\n")
+    if truncated:
+        # run_bounded truncates two ways - the byte cap, or the deadline
+        # tearing the process group down mid-write - and either can land
+        # mid-path. Whether that clean-looking last line is really complete
+        # or was just cut on a lucky boundary is not knowable from here, so
+        # it is dropped rather than risk emitting a path that was never
+        # real - one fewer candidate costs nothing this deep in the pool.
+        lines = lines[:-1]
 
     rows = []
-    for line in raw.decode("utf-8", "replace").split("\n"):
+    json_chars = 0
+    for line in lines:
         if len(rows) >= FILES_COUNT:
             break
         if not line or len(line) > FILES_PATH_CHARS:
@@ -1300,12 +1333,20 @@ def cmd_files(argv):
         if not path:
             continue
         slash = path.rfind("/")
-        rows.append({
-            "path": path,
-            "name": path[slash + 1:] if slash >= 0 else path,
-            "dir": path[:slash] if slash > 0 else "/",
-            "isDir": is_dir,
-        })
+        name = path[slash + 1:] if slash >= 0 else path
+        dirname = path[:slash] if slash > 0 else "/"
+        row = {"path": path, "name": name, "dir": dirname, "isDir": is_dir}
+        # The real serialized size, not an estimate from raw string lengths:
+        # a control character (legal in a Linux filename, not rejected
+        # above) expands to a 6-char \uXXXX escape in JSON regardless of
+        # ensure_ascii, which a flat "len(path) + overhead" guess does not
+        # see coming - confirmed able to blow past FILES_JSON_BUDGET_CHARS
+        # on an ASCII-length estimate alone.
+        row_chars = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+        if rows and json_chars + row_chars > FILES_JSON_BUDGET_CHARS:
+            break
+        json_chars += row_chars
+        rows.append(row)
     emit({"files": rows})
 
 
