@@ -801,9 +801,19 @@ def _menu_tokenize(action):
             chars.append(c)
             i += 1
             continue
-        # unquoted
+        # unquoted - the reject-char check runs before isspace(), not after:
+        # \n is a member of both sets (it is whitespace, and it is a real
+        # command separator in Bash, not a word separator), and found by
+        # review, checking isspace() first let it fall through as a plain
+        # word separator, silently turning a two-command action into one
+        # command whose second line became a useless argv token instead of
+        # being rejected - byte-for-byte the same failure that reproved the
+        # very first round of this feature. Space and tab are not in the
+        # reject set, so they still separate words normally here.
+        if c in MENU_UNQUOTED_REJECT_CHARS:
+            return None
         if c.isspace():
-            if chars:
+            if chars or token_quoted:
                 tokens.append(("".join(chars), token_quoted))
                 chars = []
                 token_quoted = False
@@ -823,10 +833,21 @@ def _menu_tokenize(action):
             i += 1
             continue
         if c == "~" and at_token_start:
-            chars.append(home)
-            at_token_start = False
-            i += 1
-            continue
+            # Only the two forms this module actually implements: `~` alone
+            # (the whole word) or a `~/...` path. `~user` (another user's
+            # home), `~+` ($PWD) and `~-` ($OLDPWD) are real Bash tilde
+            # forms too - found by review, expanding any leading ~
+            # unconditionally fabricated a path for these instead (`~+`
+            # became literally "$HOME+"). Reject rather than guess, the
+            # same policy already applied to every other unsupported
+            # construct in this function.
+            nxt = action[i + 1:i + 2]
+            if nxt == "" or nxt.isspace() or nxt == "/":
+                chars.append(home)
+                at_token_start = False
+                i += 1
+                continue
+            return None
         if c == "$":
             if _menu_dollar_home(action, i):
                 chars.append(home)
@@ -839,14 +860,12 @@ def _menu_tokenize(action):
                 i += 1
                 continue
             return None
-        if c in MENU_UNQUOTED_REJECT_CHARS:
-            return None
         chars.append(c)
         at_token_start = False
         i += 1
     if quote is not None:
         return None  # unterminated quote
-    if chars:
+    if chars or token_quoted:
         tokens.append(("".join(chars), token_quoted))
     resolved = []
     for text, quoted in tokens:

@@ -230,6 +230,42 @@ class MenuCommandsTests(unittest.TestCase):
         ):
             self.assertIsNone(HELPER._menu_resolve_argv(action), action)
 
+    def test_action_rejects_an_unquoted_newline_as_a_command_separator(self):
+        # Found by review: \n is whitespace to Python's isspace() but a
+        # command separator to real Bash, not a word separator - two lines
+        # are two commands, never one command with an extra argument. This
+        # is the exact failure that reproved the very first review round;
+        # a lexer rewrite reintroduced it by checking isspace() before the
+        # reject-char set that already listed \n.
+        self.assertIsNone(HELPER._menu_resolve_argv("omarchy-a\nomarchy-b"))
+
+    def test_action_rejects_named_and_special_tilde_forms(self):
+        # Only `~` alone and `~/...` are ever expanded - found by review,
+        # expanding any leading ~ unconditionally fabricated a path for
+        # `~user` (another user's home directory), `~+` ($PWD) and `~-`
+        # ($OLDPWD), none of which this module can resolve correctly
+        # without guessing.
+        for action in ("omarchy-probe ~foo", "omarchy-probe ~foo/bar", "omarchy-probe ~+", "omarchy-probe ~-"):
+            self.assertIsNone(HELPER._menu_resolve_argv(action), action)
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = "/home/test-user"
+        try:
+            self.assertEqual(HELPER._menu_resolve_argv("omarchy-probe ~"), ["omarchy-probe", "/home/test-user"])
+            self.assertEqual(HELPER._menu_resolve_argv("omarchy-probe ~/x"), ["omarchy-probe", "/home/test-user/x"])
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_action_keeps_an_explicit_empty_quoted_argument(self):
+        # Found by review: '' and "" are legitimate empty arguments in real
+        # Bash, not nothing - dropping them shifts every positional
+        # argument after it, silently calling the command with the wrong
+        # arity.
+        self.assertEqual(HELPER._menu_resolve_argv("omarchy-probe '' tail"), ["omarchy-probe", "", "tail"])
+        self.assertEqual(HELPER._menu_resolve_argv('omarchy-probe ""'), ["omarchy-probe", ""])
+
     def test_systemctl_action_is_rejected_regardless_of_shape(self):
         # The exact case Commands.js already refuses by hand (its own
         # comment: a bare systemctl call costs the marketplace listing its
