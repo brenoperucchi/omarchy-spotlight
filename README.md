@@ -1,56 +1,68 @@
 # Spotlight
 
-A command palette for [Omarchy](https://omarchy.org/), in the shape of macOS
-Spotlight and Raycast. It runs inside the existing `omarchy-shell` process, so
-opening it is an IPC call into something already running rather than a cold
-start.
+**A fast, local-first command palette for Omarchy, inspired by macOS Spotlight and Raycast.**
+
+Launch apps. Jump to open windows. Find files. Search your clipboard. Run Omarchy commands. Calculate, convert units, create reminders and calendar events, or search the web — all from the same input.
 
 ![Spotlight](preview.png)
 
-Apps, open windows, Omarchy commands, a calculator, offline unit conversion,
-natural-language reminders, calendar events, file search, clipboard history and
-web search — one input, ranked so the top row is the one you meant.
+Spotlight runs directly inside the existing `omarchy-shell` process. Opening it is just an IPC call into something that is already running, so there is no separate launcher to start and no cold-start delay.
+
+The idea is simple: press one shortcut, type what you want, press Enter.
+
+---
 
 ## Install
+
+Install and enable Spotlight with:
 
 ```bash
 omarchy plugin add https://github.com/maajix/omarchy-spotlight.git --enable
 ```
 
-Omit `--enable` if you want to inspect the code before enabling the plugin.
+If you would rather inspect the code before enabling it:
 
-The two optional steps below are manual changes to your Hyprland configuration.
+```bash
+omarchy plugin add https://github.com/maajix/omarchy-spotlight.git
+```
 
-### 1. A key to open it
+### Add a shortcut
 
-In `~/.config/hypr/bindings.lua`. `ALT + SPACE` is unbound on stock Omarchy;
-pick anything you like:
+Add this to `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("ALT + SPACE", "Spotlight", "omarchy-shell shell toggle io.github.maajix.spotlight '{}'")
 ```
 
-The payload may carry a query, so a second key can open it already primed:
+`ALT + SPACE` is unbound on stock Omarchy, but you can use any key combination you prefer.
+
+> Since Spotlight 1.1.3, `ALT + SPACE` is the recommended default. Older versions used `CTRL + SPACE`, which conflicts with fcitx5 on fresh Omarchy installations.
+
+The IPC payload can also contain a query. That means you can create shortcuts that open Spotlight already prepared for a specific task:
 
 ```lua
 o.bind("ALT + SHIFT + SPACE", "Spotlight reminder",
   "omarchy-shell shell toggle io.github.maajix.spotlight '{\"query\":\"remind me \"}'")
 ```
 
-> As of version 1.1.3, the recommended keybind uses `ALT + SPACE`. Earlier
-> versions suggested `CTRL + SPACE`, which conflicts with fcitx5 on fresh
-> Omarchy installations.
+### Optional: frosted glass
 
-### 2. Frosted glass (optional)
+Spotlight works without any extra visual configuration. By default, the panel is simply translucent.
 
-Without this the panel is simply translucent, which works fine. For the frosted
-look, in `~/.config/hypr/looknfeel.lua`:
+If you want the frosted-glass look, enable Hyprland blur and apply it to Spotlight in `~/.config/hypr/looknfeel.lua`:
 
 ```lua
--- Blur has to be on globally before any layer rule can use it.
+-- Blur has to be enabled globally before a layer rule can use it.
 hl.config({
   decoration = {
-    blur = { enabled = true, size = 8, passes = 3, brightness = 0.8, contrast = 0.9, new_optimizations = true },
+    blur = {
+      enabled = true,
+      size = 8,
+      passes = 3,
+      brightness = 0.8,
+      contrast = 0.9,
+      new_optimizations = true
+    },
   },
 })
 
@@ -61,120 +73,343 @@ hl.layer_rule({
 })
 ```
 
-Keep `ignore_alpha`: the surface is fullscreen, and the threshold limits blur
-to the card. Then run `hyprctl reload`.
+Keep `ignore_alpha`: Spotlight's surface is fullscreen, and the threshold makes sure only the card gets blurred.
 
-## Update
-
-```bash
-omarchy plugin update io.github.maajix.spotlight
-```
-
-## Uninstall
+Then reload Hyprland:
 
 ```bash
-omarchy plugin remove io.github.maajix.spotlight
+hyprctl reload
 ```
 
-Then delete what you pasted in by hand:
+---
 
-- the `o.bind(...)` line in `~/.config/hypr/bindings.lua`
-- the `hl.layer_rule` block for `omarchy-spotlight` in `~/.config/hypr/looknfeel.lua`
-  (leave the `hl.config` blur block if anything else uses it), then `hyprctl reload`
+## One search box, a lot less friction
 
-The plugin may also leave its optional settings and local ranking history:
+You do not have to decide which kind of search you are doing before you start typing.
 
-```bash
-rm -f ~/.config/omarchy/spotlight.json            # your settings, if you wrote one
-rm -f ~/.local/state/omarchy/spotlight-usage.json # local ranking data
-```
+From two characters onward, Spotlight can search local providers together, merge their results, rank them globally, and put the most likely result at the top.
 
-## What it answers
+So the same input can find an application, an already-open window, a file, a command, or something from your clipboard.
 
-Local providers run together from two characters, then their rows are globally
-ranked and capped. The top row is preselected, so Enter does the obvious thing:
+Press Enter and the selected result performs its primary action.
 
-| Type this | You get |
+| Try this | Spotlight does this |
 |---|---|
-| `chrom` | Matching applications alongside other local result types |
-| `disc` | …plus any open window whose title or app id matches |
-| `screenshot`, `lock`, `theme` | Omarchy and system commands |
-| `12*7+3`, `sqrt(144)`, `20% of 250`, `15 mod 4` | Calculator — Enter copies the result |
-| `10 km to miles`, `72f in c`, `5 GiB to MB` | Offline unit conversion |
-| `remind me in 20m to check the oven` | Sets an `omarchy reminder` |
-| `remind me tomorrow at 9 to call the dentist` | Natural times: `in 1h30`, `at 15:30`, `friday 9am`, `24.12. 10:00` |
-| `reminders` | Lists what is pending, with a row to clear them |
-| `meeting with sarah tomorrow at 14:00 for 90min` | Calendar event → Google Calendar, or ⇧↵ for an `.ics` file |
-| `f invoice`, `f: invoice`, `~/Downloads/`, `/etc/` | File and folder search; a prefix scopes results to files only |
-| `cb ssh`, `cb: ssh` | Clipboard history search — Enter copies |
-| `gh quickshell`, `yt lofi`, `aw hyprland` | Bang searches, below any application that also matched |
-| `example.com`, `localhost:3000` | Opens the URL |
-| anything else | A web-search row; optional live suggestions appear when enabled |
+| `chrom` | Finds matching applications alongside other local results |
+| `disc` | Finds the app and matching open windows |
+| `screenshot` | Finds Omarchy and system actions |
+| `lock` | Locks the session |
+| `theme` | Finds theme-related actions |
+| `12*7+3` | Calculates the result; Enter copies it |
+| `sqrt(144)` | Handles common mathematical expressions |
+| `20% of 250` | Calculates percentages |
+| `15 mod 4` | Handles modulo expressions |
+| `10 km to miles` | Converts units offline |
+| `72f in c` | Converts temperatures |
+| `5 GiB to MB` | Converts data sizes |
+| `remind me in 20m to check the oven` | Creates an `omarchy reminder` |
+| `remind me tomorrow at 9 to call the dentist` | Understands natural dates and times |
+| `reminders` | Shows pending reminders and lets you clear them |
+| `meeting with sarah tomorrow at 14:00 for 90min` | Creates a calendar event |
+| `f invoice` | Searches files and folders |
+| `~/Downloads/` | Searches within a path |
+| `/etc/` | Searches an absolute path |
+| `cb ssh` | Searches clipboard history; Enter copies the result |
+| `gh quickshell` | Searches GitHub |
+| `yt lofi` | Searches YouTube |
+| `aw hyprland` | Searches ArchWiki |
+| `example.com` | Opens the URL directly |
+| `localhost:3000` | Opens the local URL |
+| anything else | Offers a web search |
 
-Bang prefixes: `g` `ddg` `yt` `gh` `w` `wde` `aw` `aur` `pkg` `so` `mdn` `npm`
-`crates` `docker` `maps` `tr` `img` `hn` `omarchy`.
+The goal is not to turn Spotlight into a collection of separate mini-tools. It should still feel like one search box.
 
-Colon filters run one provider exclusively: `a:`/`app:`, `w:`/`window:`,
-`f:`/`file:`, `action:`/`cmd:`, `cb:`/`clipboard:`,
-`web:`/`search:`/`url:`, `calc:`, `unit:`/`convert:`, `reminder:`, and
-`calendar:`/`event:`. A filter without text shows a hint and does not launch a
-broad search. The space-separated `w query` remains the Wikipedia bang.
+---
 
-## Ranking
+## Search the way you want
 
-Every provider uses the same match stages: exact, prefix, word, substring,
-metadata/acronym, then residual. The single list orders matching types as
-Intent, App, Window, Action, File, Clipboard and Web. Within each type the
-score is:
+Most of the time, just type.
+
+When you do want to be explicit, Spotlight also supports bang searches and provider filters.
+
+### Bang searches
+
+Bang prefixes send your query directly to a specific search destination:
+
+```text
+g       Google
+ddg     DuckDuckGo
+yt      YouTube
+gh      GitHub
+w       Wikipedia
+wde     German Wikipedia
+aw      ArchWiki
+aur     AUR
+pkg     Arch packages
+so      Stack Overflow
+mdn     MDN
+npm     npm
+crates  crates.io
+docker  Docker Hub
+maps    Maps
+tr      Translate
+img     Images
+hn      Hacker News
+omarchy Omarchy
+```
+
+For example:
+
+```text
+gh quickshell
+yt lofi
+aw hyprland
+mdn array map
+```
+
+These results can appear alongside local matches, so `gh something` can still surface a matching local application if one exists.
+
+### Search only one provider
+
+Colon filters tell Spotlight to search one provider exclusively:
+
+```text
+a:          app:
+w:          window:
+f:          file:
+action:     cmd:
+cb:         clipboard:
+web:        search:       url:
+calc:
+unit:       convert:
+reminder:
+calendar:   event:
+```
+
+Examples:
+
+```text
+app: firefox
+window: github
+file: invoice
+clipboard: ssh
+calc: 125 * 1.19
+```
+
+A filter without a query shows a hint instead of launching an unnecessarily broad search.
+
+The space-separated `w query` syntax remains the Wikipedia bang; `w:` is the window filter.
+
+---
+
+## Enter should do what you expect
+
+Search results do not all arrive at the same time.
+
+Applications and actions are usually available immediately. File hits or web suggestions may arrive a few hundred milliseconds later.
+
+Spotlight deliberately prevents those late results from stealing your selection.
+
+If you type an application name quickly and press Enter, you get the application you intended — not the web suggestion or file result that happened to appear underneath the highlight a moment later.
+
+The cursor only moves when you move it:
+
+```text
+↑ / ↓
+Ctrl+P / Ctrl+N
+PageUp / PageDown
+```
+
+Pointer movement can also change the selection, but a mouse simply resting above the panel does not. Hover is briefly ignored after each keystroke because the result card can resize while new rows appear.
+
+It is a small detail, but it makes fast keyboard use much more predictable.
+
+---
+
+## Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `↑` `↓` | Move through results |
+| `Ctrl+P` `Ctrl+N` | Move through results |
+| `PageUp` `PageDown` | Move one screen |
+| `↵` | Run the primary action shown in the footer |
+| `⇧↵` / `Ctrl+↵` | Run the secondary action, when available |
+| `Tab` | Complete the query with the selected application's name |
+| `Esc` | Clear the query; close Spotlight if the query is already empty |
+
+The search field is a real text input, so normal selection, caret movement, and shortcuts such as `Ctrl+V` work as expected.
+
+Destructive system actions are harder to trigger accidentally: logout, restart, and shutdown require a second `Enter` before Spotlight performs them.
+
+---
+
+## Spotlight gets better at finding *your* result
+
+Spotlight can learn from what you actually choose.
+
+Applications, windows, files, and actions that you use are given a limited ranking bonus based on recency, frequency, and the current query.
+
+That means typing the same few characters repeatedly can gradually favor the result you normally choose, without letting personalization overpower a clearly better text match.
+
+Clipboard results and secondary actions are not learned.
+
+When the search box is empty, Spotlight uses this history to surface useful applications and actions, plus still-present learned files and matching open windows. With no history yet, it simply falls back to applications.
+
+You can disable learning completely:
+
+```json
+{
+  "learningEnabled": false
+}
+```
+
+This stops both recording new selections and applying ranking bonuses. Existing learning data is left untouched until you explicitly reset it.
+
+<details>
+<summary><strong>How ranking works</strong></summary>
+
+Every provider uses the same text-match stages:
+
+```text
+exact
+prefix
+word
+substring
+metadata / acronym
+residual
+```
+
+Matching types are ordered as Intent, App, Window, Action, File, Clipboard, then Web. Within each type, results are ranked using:
 
 ```text
 textMatch × typeWeight + recency + frequency + queryContext
 ```
 
-Type weights are Intent 1.05, App 1.00, Window 0.98, File 0.96, Action 0.94,
-Clipboard 0.92 and Web 0.80. Learning contributes at most 200 points: 40 for
-recency, 50 for frequency and 110 for the current query context. That is enough
-to swap adjacent match stages within a type, but an exact result still beats a
-substantially weaker fully personalized match there. Equal scores use
-deterministic title and stable-id tie breaks.
+Current type weights are:
 
-Primary app, window, file and action activations learn. Clipboard rows and
-secondary actions do not. Empty search mixes learned apps and actions with
-still-present learned files and matching open windows; without history it falls
-back to applications.
+```text
+Intent      1.05
+App         1.00
+Window      0.98
+File        0.96
+Action      0.94
+Clipboard   0.92
+Web         0.80
+```
 
-## The cursor
+Learning can contribute at most 200 points:
 
-The top row is selected, and it stays selected as the list changes underneath
-it. Async rows — web suggestions, file hits — land a few hundred milliseconds
-after the keystroke that asked for them, and none of them may take the cursor:
-type an app name at speed and press Enter and you get the app, never the web
-search that happened to be under the highlight.
+```text
+Recency          40
+Frequency        50
+Query context   110
+```
 
-The cursor only moves where you put it — `↑` `↓`, `PageUp` `PageDown`, or a
-pointer that actually travelled. A pointer resting over the panel does not
-count, and hover is ignored for a moment after each keystroke, because the card
-resizes as results arrive and rows slide under a still mouse.
+That is intentionally enough to rearrange close results within a type, but not enough for a weak personalized result to beat a substantially better exact match there.
 
-## Keys
+Equal scores use deterministic title and stable-ID tie breakers.
 
-| Key | Action |
-|---|---|
-| `↑` `↓`, `Ctrl+P` `Ctrl+N` | Move |
-| `PageUp` `PageDown` | Move a screen |
-| `↵` | Primary action, named in the footer |
-| `⇧↵` / `Ctrl+↵` | Secondary action, where one exists |
-| `Tab` | Complete the query with the selected app's name |
-| `Esc` | Clear the query; on an empty query, close |
+Primary app, window, file, and action activations are learned. Clipboard rows and secondary actions are not.
 
-Log out, restart and shut down ask for a second `↵` before they act. The text
-field is a real input, so `Ctrl+V`, selection and caret movement work normally.
+</details>
+
+---
+
+## Reminders without leaving the keyboard
+
+Spotlight understands common natural-language reminder formats:
+
+```text
+remind me in 20m to check the oven
+remind me in 1h30 to take a break
+remind me at 15:30 to call john
+remind me friday 9am to send the report
+remind me 24.12. 10:00 to buy flowers
+```
+
+They are created through `omarchy reminder`.
+
+To see what is pending, search:
+
+```text
+reminders
+```
+
+Spotlight also provides an action to clear pending reminders.
+
+---
+
+## Calendar events
+
+You can create calendar events with the same natural input:
+
+```text
+meeting with sarah tomorrow at 14:00 for 90min
+```
+
+The primary action opens the event in Google Calendar.
+
+Use `Shift+Enter` to generate an `.ics` file instead.
+
+---
+
+## File search
+
+Search for files naturally:
+
+```text
+invoice
+```
+
+Or explicitly restrict the query to files:
+
+```text
+f invoice
+f: invoice
+file: invoice
+```
+
+Paths work too:
+
+```text
+~/Downloads/
+/etc/
+```
+
+File results participate in the same global ranking as applications, windows, actions, and other providers unless you use a file-only filter.
+
+---
+
+## Clipboard search
+
+Spotlight can search your local clipboard history:
+
+```text
+cb ssh
+cb: ssh
+clipboard: ssh
+```
+
+Press Enter to copy the selected result back to the clipboard.
+
+Only bounded one-line previews are passed to the shell. The full selected clipboard body is sent directly from the helper to `wl-copy`.
+
+---
 
 ## Settings
 
-Optional, at `~/.config/omarchy/spotlight.json`. It is re-read every time you
-open Spotlight. **Edit Spotlight Settings** creates the default file only when
-it is missing and never overwrites an existing one.
+Spotlight works without a configuration file.
+
+If you want to customize it, settings live at:
+
+```text
+~/.config/omarchy/spotlight.json
+```
+
+The file is re-read every time Spotlight opens, so changes do not require restarting the shell.
+
+A complete configuration looks like this:
 
 ```json
 {
@@ -191,78 +426,218 @@ it is missing and never overwrites an existing one.
 }
 ```
 
-`webSuggestions` is off by default. Enabling it sends the query to Google's
-public autocomplete endpoint as you type. The regular web-search row only opens
-a URL after activation. `searchEngine` accepts any bang key above and controls
-that row's destination; live suggestions still come from Google.
+Search for:
 
-`fileSearchAlways` and `clipboardSearchAlways` are on by default, so both local
-providers join every query of at least two characters. Their corresponding
-`fileSearch` and `clipboardSearch` switches disable the provider completely.
-One-character searches run them only through an explicit file or clipboard
-prefix. To keep mixed searches mixed, passive file search contributes at most
-four rows and half the configured list; `f:` and path searches retain the full
-file result cap. `maxResults` caps the combined list and accepts 8–50.
+```text
+spotlight settings
+```
 
-`learningEnabled: false` stops both recording and ranking bonuses without
-deleting existing data.
+to access Spotlight's own maintenance actions. From there you can create or edit the settings file, open the plugin or data directory, or reset learning.
 
-Every value is range-checked on the way in and a bad one falls back to its
-default rather than being used: `maxApps` is clamped to 3–24, `maxSuggestions`
-to 0–8, `maxResults` to 8–50, `searchEngine` has to name an engine in the bang
-table, and booleans have to be real JSON `true`/`false`.
+**Edit Spotlight Settings** only creates the default file when it is missing. It never overwrites an existing configuration.
 
-Search `spotlight settings` to create and edit this file, open the plugin or
-data folder, or reset Spotlight learning. Reset requires a second Enter and
-deletes only `spotlight-usage.json`.
+### Web suggestions
 
-Learning data lives in `~/.local/state/omarchy/spotlight-usage.json`. V1 launch
-counts migrate automatically to V2 stable IDs. The store is capped at 400
-items, including at most 100 files, plus 128 query contexts with eight results
-each and a fixed serialized-byte budget. File IDs are SHA-256 fingerprints of
-their paths; missing files are discarded when the store is read.
+Live web suggestions are disabled by default:
 
-## What it talks to
+```json
+{
+  "webSuggestions": false
+}
+```
 
-| Goes out | When | Turn it off with |
-|---|---|---|
-| `suggestqueries.google.com` | Each query, debounced, while `webSuggestions` is on | `"webSuggestions": false` |
-| Your browser, to a search or calendar URL | Only when you press Enter on such a row | — |
+When enabled, the current query is sent to Google's public autocomplete endpoint while you type.
 
-Everything else is local. No telemetry, no analytics, no background network.
+The normal web-search result behaves differently: no query is sent anywhere until you activate the row.
 
-## Requirements
+`searchEngine` controls where that regular web-search result goes:
 
-Omarchy 4 (Quattro) with the Quickshell-based `omarchy-shell`. Spotlight uses
-only components present in stock Omarchy:
+```json
+{
+  "searchEngine": "g"
+}
+```
 
-| Package | Used for |
+It accepts any of the supported bang keys. Live autocomplete suggestions still come from Google.
+
+### Files and clipboard
+
+These providers are enabled by default:
+
+```json
+{
+  "fileSearch": true,
+  "fileSearchAlways": true,
+  "clipboardSearch": true,
+  "clipboardSearchAlways": true
+}
+```
+
+With the `Always` options enabled, file and clipboard results join normal searches once the query reaches two characters.
+
+To keep mixed searches mixed, passive file search contributes at most four rows and at most half the configured list. Explicit `f:` and path searches retain the full file result cap.
+
+One-character searches only run them when you explicitly use a file or clipboard prefix.
+
+Set the corresponding provider option to `false` to disable that provider completely.
+
+### Result limits
+
+```json
+{
+  "maxResults": 20,
+  "maxApps": 8,
+  "maxSuggestions": 4
+}
+```
+
+`maxResults` controls the size of the combined result list.
+
+Configuration values are validated before Spotlight uses them:
+
+```text
+maxApps          3–24
+maxSuggestions   0–8
+maxResults        8–50
+```
+
+`searchEngine` must match a supported bang key, and boolean settings must be actual JSON `true` or `false` values.
+
+Invalid values fall back to their defaults instead of being used.
+
+---
+
+## Local by default
+
+Spotlight does not have telemetry, analytics, or a background network service.
+
+Almost everything happens locally.
+
+| Network access | When it happens |
 |---|---|
-| `python3` | `bin/spotlight-helper`, which brokers every file read and subprocess |
-| `fd` | File search |
-| `wl-clipboard` | The copy actions |
+| `suggestqueries.google.com` | While typing, only if `webSuggestions` is enabled |
+| Your browser | When you explicitly activate a web-search, URL, or calendar result |
+
+With the default configuration, live web suggestions are disabled.
+
+The normal search result does not send your query to a search engine in the background. It opens the destination only after you press Enter.
+
+---
 
 ## Privacy and security
 
-The plugin has no telemetry or background service. Its helper bounds file and
-subprocess output, validates persistent files through directory descriptors,
-refuses symlinks and unsafe ownership or permissions, and uses atomic private
-writes. Subprocesses have deadlines and their process groups are cleaned up.
-Clipboard search sends only bounded one-line previews to the shell; the full
-selected body goes directly from the helper to `wl-copy`.
+Spotlight's helper is intentionally narrow.
 
-When learning is enabled, selected stable IDs, counts, timestamps, file paths,
-and the normalized search text and its prefixes from two characters are stored
-locally. Colon filters use separate context namespaces. Set `learningEnabled`
-to `false` to stop using or adding this data, or run **Reset Spotlight
-Learning** to delete it.
+File and subprocess output is bounded. Persistent files are validated through directory descriptors, unsafe ownership and permissions are rejected, symlinks are refused, and writes are atomic and private.
+
+Subprocesses have deadlines, and their process groups are cleaned up.
+
+Clipboard search exposes only bounded one-line previews to the shell. The complete selected clipboard value goes directly from the helper to `wl-copy`.
+
+When learning is enabled, Spotlight stores the following locally:
+
+```text
+selected stable IDs
+selection counts
+timestamps
+file paths
+normalized search text
+query prefixes starting at two characters
+```
+
+Colon filters use separate query-context namespaces.
+
+Learning data lives at:
+
+```text
+~/.local/state/omarchy/spotlight-usage.json
+```
+
+The store is bounded to 400 items, including at most 100 files, plus 128 query contexts with eight results each and a fixed serialized-byte budget.
+
+File IDs are SHA-256 fingerprints of their paths. Missing files are discarded when the store is read.
+
+V1 launch counts are migrated automatically to V2 stable IDs.
+
+To stop recording and using this data:
+
+```json
+{
+  "learningEnabled": false
+}
+```
+
+To remove it, search for **Reset Spotlight Learning**. The action requires a second Enter and deletes only `spotlight-usage.json`.
+
+---
+
+## Requirements
+
+Spotlight targets **Omarchy 4 (Quattro)** with the Quickshell-based `omarchy-shell`.
+
+It only relies on components already present in stock Omarchy:
+
+| Package | Used for |
+|---|---|
+| `python3` | `bin/spotlight-helper`, which brokers file reads and subprocesses |
+| `fd` | File search |
+| `wl-clipboard` | Copy actions |
+
+---
+
+## Update
+
+Update Spotlight through Omarchy:
+
+```bash
+omarchy plugin update io.github.maajix.spotlight
+```
+
+---
+
+## Uninstall
+
+Remove the plugin:
+
+```bash
+omarchy plugin remove io.github.maajix.spotlight
+```
+
+Then remove any Hyprland configuration you added manually:
+
+- the `o.bind(...)` entry from `~/.config/hypr/bindings.lua`
+- the `hl.layer_rule` for `omarchy-spotlight` from `~/.config/hypr/looknfeel.lua`
+
+You can leave the global `hl.config` blur configuration in place if something else uses it.
+
+After changing Hyprland configuration:
+
+```bash
+hyprctl reload
+```
+
+Spotlight may also leave its optional settings and local ranking history behind. Remove them if you want a completely clean uninstall:
+
+```bash
+rm -f ~/.config/omarchy/spotlight.json
+rm -f ~/.local/state/omarchy/spotlight-usage.json
+```
+
+---
 
 ## Development
 
-`Spotlight.qml` contains the UI and actions. `lib/` contains the JavaScript
-parsers and ranking logic. `bin/spotlight-helper` is the bounded interface to
-files and subprocesses. Restart the shell after QML changes because the plugin
-is kept loaded.
+The project is split into three main pieces:
+
+```text
+Spotlight.qml          UI and actions
+lib/                   JavaScript parsers and ranking logic
+bin/spotlight-helper   Bounded interface to files and subprocesses
+```
+
+Because the plugin stays loaded inside `omarchy-shell`, restart the shell after changing QML.
+
+Useful checks before committing:
 
 ```bash
 omarchy plugin validate .
@@ -271,8 +646,10 @@ python3 -m py_compile bin/spotlight-helper
 for file in lib/*.js; do node --check "$file"; done
 ```
 
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
-Not affiliated with Apple or Raycast.
+Spotlight is not affiliated with Apple or Raycast.
