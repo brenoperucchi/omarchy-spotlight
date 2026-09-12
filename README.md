@@ -123,7 +123,9 @@ broad search. The space-separated `w query` remains the Wikipedia bang.
 ## Ranking
 
 Every provider uses the same match stages: exact, prefix, word, substring,
-metadata/acronym, then residual. The global score is:
+metadata/acronym, then residual. The single list orders matching types as
+Intent, App, Window, Action, File, Clipboard and Web. Within each type the
+score is:
 
 ```text
 textMatch × typeWeight + recency + frequency + queryContext
@@ -132,9 +134,9 @@ textMatch × typeWeight + recency + frequency + queryContext
 Type weights are Intent 1.05, App 1.00, Window 0.98, File 0.96, Action 0.94,
 Clipboard 0.92 and Web 0.80. Learning contributes at most 200 points: 40 for
 recency, 50 for frequency and 110 for the current query context. That is enough
-to swap adjacent match stages, but an exact result still beats a substantially
-weaker fully personalized match. Equal scores use deterministic title and
-stable-id tie breaks.
+to swap adjacent match stages within a type, but an exact result still beats a
+substantially weaker fully personalized match there. Equal scores use
+deterministic title and stable-id tie breaks.
 
 Primary app, window, file and action activations learn. Clipboard rows and
 secondary actions do not. Empty search mixes learned apps and actions with
@@ -198,7 +200,9 @@ that row's destination; live suggestions still come from Google.
 providers join every query of at least two characters. Their corresponding
 `fileSearch` and `clipboardSearch` switches disable the provider completely.
 One-character searches run them only through an explicit file or clipboard
-prefix. `maxResults` caps the combined list and accepts 8–50.
+prefix. To keep mixed searches mixed, passive file search contributes at most
+four rows and half the configured list; `f:` and path searches retain the full
+file result cap. `maxResults` caps the combined list and accepts 8–50.
 
 `learningEnabled: false` stops both recording and ranking bonuses without
 deleting existing data.
