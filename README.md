@@ -89,6 +89,8 @@ You do not have to decide which kind of search you are doing before you start ty
 
 From two characters onward, Spotlight can search local providers together, merge their results, rank them globally, and put the most likely result at the top.
 
+Compact section labels keep applications, windows, commands, files, clipboard entries, and web results visually distinct without splitting the combined result list.
+
 So the same input can find an application, an already-open window, a file, a command, or something from your clipboard.
 
 Press Enter and the selected result performs its primary action.
