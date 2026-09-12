@@ -7,11 +7,14 @@ const Fuzzy = require("../lib/Fuzzy.js")
 
 const qml = fs.readFileSync(path.join(__dirname, "..", "Spotlight.qml"), "utf8")
 
-test("the displayed model is one globally ranked, globally capped list", () => {
+test("the displayed model is one globally ranked, capped list with provider sections", () => {
   assert.match(qml, /next = root\.globallyRank\(next, parsed\.text\)/)
   assert.match(qml, /Util\.clamp\(root\.settings\.maxResults, 8, root\.maxGlobalResults\)/)
   assert.match(qml, /var limit = target\.implicit\s*\? Math\.min\(root\.maxUnifiedFileRows/)
-  assert.doesNotMatch(qml, /section\.delegate/)
+  assert.match(qml, /rowSection: root\.resultSection\(r\)/)
+  assert.match(qml, /section\.property: "rowSection"/)
+  for (const label of ["Applications", "Windows", "Commands", "Files", "Clipboard", "Web"])
+    assert.ok(qml.includes(`return "${label}"`))
 })
 
 test("empty input keeps an application fallback and empty filters show only a hint", () => {
