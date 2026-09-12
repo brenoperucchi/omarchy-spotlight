@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,16 +30,22 @@ class HelperTests(unittest.TestCase):
     def test_settings_are_private_by_default_and_bounded(self):
         defaults = HELPER.normalize_settings({})
         self.assertFalse(defaults["webSuggestions"])
+        self.assertTrue(defaults["fileSearchAlways"])
+        self.assertTrue(defaults["clipboardSearch"])
+        self.assertTrue(defaults["clipboardSearchAlways"])
+        self.assertEqual(defaults["maxResults"], 20)
 
         settings = HELPER.normalize_settings({
             "webSuggestions": "yes",
             "maxApps": 999,
             "maxSuggestions": -5,
+            "maxResults": 999,
             "searchEngine": "invalid-value",
         })
         self.assertFalse(settings["webSuggestions"])
         self.assertEqual(settings["maxApps"], 24)
         self.assertEqual(settings["maxSuggestions"], 0)
+        self.assertEqual(settings["maxResults"], 50)
         self.assertEqual(settings["searchEngine"], "g")
 
     def test_file_reader_rejects_symlinks_and_oversized_files(self):
@@ -162,6 +169,67 @@ class HelperTests(unittest.TestCase):
                     break
                 time.sleep(0.02)
             self.assertFalse(Path("/proc").joinpath(str(child_pid)).exists())
+
+    def test_clean_home_reads_stock_defaults_and_empty_clipboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = directory
+            try:
+                for command, key in ((HELPER.cmd_read_settings, "settings"),
+                                     (HELPER.cmd_read_clipboard, "items")):
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        command()
+                    reply = json.loads(buf.getvalue())
+                    self.assertTrue(reply["ok"])
+                    self.assertTrue(reply[key] == [] if key == "items" else reply[key]["fileSearchAlways"])
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+    def test_settings_creation_is_private_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = directory
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    HELPER.cmd_ensure_settings()
+                settings = Path(directory) / ".config" / "omarchy" / "spotlight.json"
+                self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
+                parsed = json.loads(settings.read_text())
+                self.assertEqual(parsed["maxResults"], 20)
+                settings.write_text('{"custom":true}\n')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    HELPER.cmd_ensure_settings()
+                self.assertEqual(settings.read_text(), '{"custom":true}\n')
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+    def test_reset_deletes_only_spotlight_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = directory
+            try:
+                state = Path(directory) / ".local" / "state" / "omarchy"
+                state.mkdir(parents=True)
+                usage = state / "spotlight-usage.json"
+                other = state / "clipboard-history.json"
+                usage.write_text("{}")
+                other.write_text("[]")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    HELPER.cmd_reset_usage()
+                self.assertFalse(usage.exists())
+                self.assertTrue(other.exists())
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
 
 
 class MenuCommandsTests(unittest.TestCase):

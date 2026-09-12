@@ -398,13 +398,33 @@ def write_atomic(dirfd, name, payload):
     os.fsync(dirfd)
 
 
+def write_new(dirfd, name, payload):
+    """Create one private regular file without replacing an existing name."""
+    try:
+        fd = os.open(name,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=dirfd)
+    except FileExistsError:
+        read_file(dirfd, name, SETTINGS_BYTES)
+        return False
+    try:
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(dirfd)
+    return True
+
+
 # ------------------------------------------------------------ subprocesses
 def run_bounded(argv, cap, deadline, stdin_bytes=None):
     """Run `argv`, returning at most `cap` bytes of stdout within `deadline`.
 
     The child gets its own session, so the deadline tears down the whole
-    process group rather than just the leader — `fd` spawning threads or curl
-    hanging on a socket cannot outlive the call. Reaching either bound is not
+    process group rather than just the leader — an `fd` descendant cannot
+    outlive the call. Reaching either bound is not
     an error: the caller works with the bounded prefix.
     """
     global ACTIVE_PROC
@@ -557,7 +577,10 @@ def normalize_settings(parsed):
         "webSuggestions": False,
         "searchEngine": "g",
         "fileSearch": True,
-        "fileSearchAlways": False,
+        "fileSearchAlways": True,
+        "clipboardSearch": True,
+        "clipboardSearchAlways": True,
+        "maxResults": 20,
         "maxApps": 8,
         "maxSuggestions": 4,
     }
@@ -565,7 +588,10 @@ def normalize_settings(parsed):
         return out
     out["webSuggestions"] = clamp_bool(parsed.get("webSuggestions"), False)
     out["fileSearch"] = clamp_bool(parsed.get("fileSearch"), True)
-    out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), False)
+    out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), True)
+    out["clipboardSearch"] = clamp_bool(parsed.get("clipboardSearch"), True)
+    out["clipboardSearchAlways"] = clamp_bool(parsed.get("clipboardSearchAlways"), True)
+    out["maxResults"] = clamp_int(parsed.get("maxResults"), 8, 50, 20)
     out["maxApps"] = clamp_int(parsed.get("maxApps"), 3, 24, 8)
     out["maxSuggestions"] = clamp_int(parsed.get("maxSuggestions"), 0, SUGGEST_COUNT, 4)
     engine = parsed.get("searchEngine")
@@ -1079,12 +1105,48 @@ def _menu_commands():
 
 # ---------------------------------------------------------------- commands
 def cmd_read_settings():
-    fd = walk([".config", "omarchy"])
+    try:
+        fd = walk([".config", "omarchy"])
+    except FileNotFoundError:
+        emit({"settings": normalize_settings({})})
+        return
     try:
         parsed = read_json(fd, "spotlight.json", SETTINGS_BYTES, {})
     finally:
         os.close(fd)
     emit({"settings": normalize_settings(parsed)})
+
+
+def cmd_ensure_settings():
+    settings = normalize_settings({})
+    payload = (json.dumps(settings, indent=2) + "\n").encode("utf-8")
+    fd = walk([".config", "omarchy"], create=True)
+    try:
+        write_new(fd, "spotlight.json", payload)
+    finally:
+        os.close(fd)
+    emit({"path": os.path.join(os.environ["HOME"], ".config", "omarchy", "spotlight.json")})
+
+
+def cmd_ensure_data():
+    fd = walk([".local", "state", "omarchy"], create=True)
+    os.close(fd)
+    emit({"path": os.path.join(os.environ["HOME"], ".local", "state", "omarchy")})
+
+
+def cmd_reset_usage():
+    try:
+        fd = walk([".local", "state", "omarchy"])
+    except FileNotFoundError:
+        emit({"reset": True})
+        return
+    try:
+        if read_file(fd, "spotlight-usage.json", USAGE_BYTES) is not None:
+            os.unlink("spotlight-usage.json", dir_fd=fd)
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+    emit({"reset": True})
 
 
 def cmd_read_hides():
@@ -1149,7 +1211,10 @@ def cmd_write_usage():
 
 
 def _clipboard_entries():
-    fd = walk([".local", "state", "omarchy"], create=True)
+    try:
+        fd = walk([".local", "state", "omarchy"])
+    except FileNotFoundError:
+        return []
     try:
         parsed = read_json(fd, "clipboard-history.json", CLIPBOARD_BYTES, [])
     finally:
@@ -1247,15 +1312,25 @@ def cmd_suggest(argv):
         emit({"suggestions": []})
         return
     # The endpoint is built here rather than passed in, so nothing upstream can
-    # steer the request at a different host.
+    # steer the request at a different host. urllib keeps this feature inside
+    # Python's standard library; a stock install does not need curl.
+    from urllib.error import URLError
     from urllib.parse import quote
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
     url = ("https://suggestqueries.google.com/complete/search"
            "?client=firefox&hl=en&q=" + quote(query, safe=""))
-    raw, truncated = run_bounded(
-        ["curl", "-sf", "--proto", "=https", "--max-time", "2", "--connect-timeout", "2",
-         "--max-filesize", str(SUGGEST_BYTES), "--compressed", "--", url],
-        SUGGEST_BYTES, SUGGEST_DEADLINE)
-    if truncated:
+    try:
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": "Spotlight"})
+        with build_opener(NoRedirect).open(request, timeout=SUGGEST_DEADLINE) as response:
+            raw = response.read(SUGGEST_BYTES + 1)
+    except (OSError, URLError, ValueError):
+        raw = b""
+    if len(raw) > SUGGEST_BYTES:
         emit({"suggestions": []})
         return
     try:
@@ -1393,6 +1468,9 @@ def cmd_write_ics(argv):
 # name -> (handler, whether it reads positional arguments)
 COMMANDS = {
     "read-settings": (cmd_read_settings, False),
+    "ensure-settings": (cmd_ensure_settings, False),
+    "ensure-data": (cmd_ensure_data, False),
+    "reset-usage": (cmd_reset_usage, False),
     "read-usage": (cmd_read_usage, False),
     "read-hides": (cmd_read_hides, False),
     "read-menu-commands": (cmd_read_menu_commands, False),
