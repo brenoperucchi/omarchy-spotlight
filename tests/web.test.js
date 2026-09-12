@@ -8,6 +8,10 @@ test("a named target rewrites the DeepL language pair and drops the tail", () =>
     "https://www.deepl.com/translator#en/de/what%20is%20this"
   )
   assert.equal(
+    Web.searchUrl("what is this in german", "tr"),
+    "https://www.deepl.com/translator#en/de/what%20is%20this"
+  )
+  assert.equal(
     Web.searchUrl("qux into japanese", "tr"),
     "https://www.deepl.com/translator#en/ja/qux"
   )
