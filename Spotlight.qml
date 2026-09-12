@@ -1908,7 +1908,7 @@ Item {
               color: resultRow.hasCursor ? root.selectedText : root.foreground
               opacity: resultRow.hasCursor ? 1 : 0.75
               font.family: root.fontFamily
-              font.pixelSize: Style.font.icon
+              font.pixelSize: Style.font.iconLarge
               width: Style.space(20)
               horizontalAlignment: Text.AlignHCenter
               anchors.left: rowSurface.left
