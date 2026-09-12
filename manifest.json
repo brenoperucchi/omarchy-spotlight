@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.maajix.spotlight",
   "name": "Spotlight",
-  "version": "1.1.7",
+  "version": "1.2.0",
   "author": "Max Randhahn",
   "description": "Unified Spotlight search for apps, windows, files, actions, clipboard, natural-language tools and the web",
   "kinds": [
