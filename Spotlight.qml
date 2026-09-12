@@ -328,6 +328,14 @@ Item {
         subtitle: String(c.subtitle || "").slice(0, root.maxSubtitleChars),
         icon: String(c.icon || "󰣇"),
         kind: "shell",
+        // Dispatch is still plain "shell" (activate()'s switch never sees
+        // this), but commandRows() reads it to badge these distinctly from
+        // the hand-curated catalogue - these are real Omarchy menu tree
+        // entries, not entries this project wrote, and looking identical
+        // to a curated command made that distinction invisible. Re-applied
+        // after the 1.2.0 unified-search rewrite dropped section headers
+        // (the mechanism this originally used) - see commandRows() below.
+        source: "menu",
         argv: argv,
         keywords: String(c.keywords || "")
       })
@@ -679,11 +687,16 @@ Item {
     for (var j = 0; j < ranked.length && j < root.maxAppCandidates; j++) {
       var c = ranked[j]
       var isWeb = c.kind === "url"
+      var fromMenu = c.source === "menu"
       out.push(root.row({
         key: "cmd:" + c.key,
         kind: c.kind,
         title: c.title, subtitle: c.subtitle,
-        accessory: isWeb ? "Web" : "Action",
+        // Real Omarchy menu tree entries get their own badge - "Action"
+        // implied this project wrote and curated every one of them, which
+        // stopped being true once the actual menu tree (275+ entries) got
+        // pulled in alongside the ~50 hand-curated ones.
+        accessory: isWeb ? "Web" : (fromMenu ? "Menu" : "Action"),
         icon: c.icon,
         primaryLabel: isWeb ? "Open in browser" : "Run",
         confirm: c.confirm === true,
