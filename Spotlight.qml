@@ -559,16 +559,24 @@ Item {
     })]
   }
 
-  // Both sources answer with the same [{entry, score}] shape, so nothing below
-  // has to know which one produced the list.
+  // Matching always runs through Apps.js, with or without an AppLibrary -
+  // AppLibrary.sortedEntries() folds a desktop entry's raw, unsanitised id
+  // into its own search text (services/AppSearch.js, upstream Omarchy), and
+  // a browser-installed web app's id is a generated, meaningless string
+  // that leaked into unrelated results (see lib/Apps.js's header for the
+  // real bug this traces back to). AppLibrary is still the sole authority
+  // on which entries are hidden, though - isHiddenEntry combines two
+  // separate hiding rules Spotlight has no other way to read, so it is
+  // passed through as a callback rather than re-derived here. Without an
+  // AppLibrary, root.appHides (this plugin's own packaged-hides read) is
+  // the only hiding source there is.
   function appEntries(q) {
-    if (root.appLibrary) {
-      var ranked = root.appLibrary.sortedEntries(q) || []
-      return ranked.slice(0, root.maxAppCandidates)
-    }
     var values = []
     try { values = DesktopEntries.applications.values || [] } catch (e) { return [] }
-    return Apps.sortedEntries(values, q, root.appHides,
+    var hidden = root.appLibrary
+      ? function(entry) { return root.appLibrary.isHiddenEntry(entry) }
+      : root.appHides
+    return Apps.sortedEntries(values, q, hidden,
       root.maxAppCandidates, root.maxAppCandidates * 8)
   }
 
