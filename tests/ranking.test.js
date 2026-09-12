@@ -34,6 +34,30 @@ test("ties are deterministic and independent of provider arrival order", () => {
   assert.deepEqual(Ranking.rank([a, b], 2).map(row => row.key), ["a", "b"])
 })
 
+test("provider priority keeps actions ahead of a flood of file results", () => {
+  const action = { key: "shutdown", title: "Shut Down", resultType: "action" }
+  const files = Array.from({ length: 20 }, (_, i) => ({
+    key: `file:${i}`, title: "shutdown.rs", resultType: "file"
+  }))
+  const rows = [action, ...files]
+  for (const row of rows) row.textMatch = Fuzzy.score(row, "shut")
+
+  assert.equal(Ranking.rank(rows, 20)[0].key, "shutdown")
+})
+
+test("mixed results order apps, actions, files, then web", () => {
+  const rows = [
+    { key: "web", title: "Search", resultType: "web", textMatch: Fuzzy.MATCH_EXACT },
+    { key: "file", title: "sleep", resultType: "file", textMatch: Fuzzy.MATCH_EXACT },
+    { key: "action", title: "Stay Awake", resultType: "action", textMatch: Fuzzy.MATCH_METADATA },
+    { key: "app", title: "Sleep Timer", resultType: "app", textMatch: Fuzzy.MATCH_METADATA }
+  ]
+
+  assert.deepEqual(Ranking.rank(rows, 4).map(row => row.key), [
+    "app", "action", "file", "web"
+  ])
+})
+
 test("repeated Firefox selection for fi moves it ahead of Figma", () => {
   const now = 1000000000
   const parsed = Query.parse("fi")
@@ -54,10 +78,10 @@ test("repeated Firefox selection for fi moves it ahead of Figma", () => {
   assert.equal(Ranking.rank(rows, 2)[0].key, "firefox")
 })
 
-test("maximum personalization cannot beat an exact hit with a substring hit", () => {
-  const exact = { key: "exact", title: "Exact", resultType: "web", textMatch: Fuzzy.MATCH_EXACT }
+test("maximum personalization cannot beat an exact hit with a substring hit of the same type", () => {
+  const exact = { key: "exact", title: "Exact", resultType: "app", textMatch: Fuzzy.MATCH_EXACT }
   const weak = {
-    key: "weak", title: "Weak", resultType: "intent", textMatch: Fuzzy.MATCH_SUBSTRING,
+    key: "weak", title: "Weak", resultType: "app", textMatch: Fuzzy.MATCH_SUBSTRING,
     recencyBonus: 40, frequencyBonus: 50, contextBonus: 110
   }
   assert.equal(Ranking.rank([weak, exact], 2)[0].key, "exact")

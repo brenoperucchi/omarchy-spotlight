@@ -133,6 +133,7 @@ Item {
   // The helper returns at most 400 hits; the shared global cap shows at most
   // 50 after ranking.
   readonly property int maxFileRows: 50
+  readonly property int maxUnifiedFileRows: 4
   // Must match bin/spotlight-helper's file-search limits: the helper first
   // truncates the pattern to 256 characters, then AND-filters on its first
   // 8 terms. FileRank must score that same bounded pattern; otherwise text
@@ -775,8 +776,11 @@ Item {
     if (root.fileFor !== String(q || "").trim() || root.fileRows.length === 0) return []
     var target = root.fileSearchTarget(q)
     if (!target) return []
+    var limit = target.implicit
+      ? Math.min(root.maxUnifiedFileRows, Math.max(1, Math.floor(root.settings.maxResults / 2)))
+      : root.maxFileRows
     var out = []
-    for (var i = 0; i < root.fileRows.length && i < root.maxFileRows; i++) {
+    for (var i = 0; i < root.fileRows.length && i < limit; i++) {
       var f = root.fileRows[i]
       out.push(root.row({
         key: "file:" + f.path,
