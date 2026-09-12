@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,7 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(defaults["fileSearchAlways"])
         self.assertTrue(defaults["clipboardSearch"])
         self.assertTrue(defaults["clipboardSearchAlways"])
+        self.assertTrue(defaults["learningEnabled"])
         self.assertEqual(defaults["maxResults"], 20)
 
         settings = HELPER.normalize_settings({
@@ -40,12 +43,14 @@ class HelperTests(unittest.TestCase):
             "maxApps": 999,
             "maxSuggestions": -5,
             "maxResults": 999,
+            "learningEnabled": False,
             "searchEngine": "invalid-value",
         })
         self.assertFalse(settings["webSuggestions"])
         self.assertEqual(settings["maxApps"], 24)
         self.assertEqual(settings["maxSuggestions"], 0)
         self.assertEqual(settings["maxResults"], 50)
+        self.assertFalse(settings["learningEnabled"])
         self.assertEqual(settings["searchEngine"], "g")
 
     def test_file_reader_rejects_symlinks_and_oversized_files(self):
@@ -149,6 +154,13 @@ class HelperTests(unittest.TestCase):
         self.assertIn("/home/user/real-hit", paths)
         self.assertNotIn("/home/user/maybe-cut-off", paths)
 
+    def test_file_results_carry_sha256_path_fingerprints(self):
+        parsed = json.loads(self._run_cmd_files(b"/home/user/report.txt\n"))
+        self.assertEqual(
+            parsed["files"][0]["id"],
+            hashlib.sha256(b"/home/user/report.txt").hexdigest(),
+        )
+
     def test_deadline_reaps_the_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             pid_file = Path(directory) / "child.pid"
@@ -189,6 +201,13 @@ class HelperTests(unittest.TestCase):
                 else:
                     os.environ["HOME"] = old_home
 
+    def test_unavailable_web_suggestions_return_an_empty_result(self):
+        buf = io.StringIO()
+        with mock.patch("urllib.request.build_opener", side_effect=OSError("offline")):
+            with contextlib.redirect_stdout(buf):
+                HELPER.cmd_suggest(["firefox"])
+        self.assertEqual(json.loads(buf.getvalue())["suggestions"], [])
+
     def test_settings_creation_is_private_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as directory:
             old_home = os.environ.get("HOME")
@@ -225,6 +244,116 @@ class HelperTests(unittest.TestCase):
                     HELPER.cmd_reset_usage()
                 self.assertFalse(usage.exists())
                 self.assertTrue(other.exists())
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+    def test_v1_usage_migrates_to_versioned_v2_ids(self):
+        usage = HELPER.normalize_usage({
+            "app:firefox": {"count": 2, "last": 10},
+            "cmd:theme.pick": {"count": 3, "last": 20},
+            "bang.gh": {"count": 4, "last": 30},
+        })
+        self.assertEqual(usage["version"], 2)
+        self.assertEqual(usage["items"]["app:firefox"]["count"], 2)
+        self.assertEqual(usage["items"]["action:theme.pick"]["count"], 3)
+        self.assertNotIn("bang.gh", usage["items"])
+        self.assertEqual(usage["contexts"], {})
+
+    def test_path_fingerprints_are_stable_and_file_metadata_is_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.txt"
+            path.write_text("report")
+            fingerprint = HELPER.path_fingerprint(str(path))
+            self.assertEqual(fingerprint, HELPER.path_fingerprint(str(path)))
+            self.assertEqual(fingerprint, hashlib.sha256(str(path).encode()).hexdigest())
+            self.assertEqual(len(fingerprint), 64)
+
+            usage = HELPER.normalize_usage({
+                "version": 2,
+                "items": {
+                    "file:" + fingerprint: {
+                        "count": 1, "last": 1, "meta": {"path": str(path)}
+                    },
+                    "file:" + "0" * 64: {
+                        "count": 1, "last": 1, "meta": {"path": str(path)}
+                    },
+                },
+                "contexts": {},
+            })
+            self.assertIn("file:" + fingerprint, usage["items"])
+            self.assertNotIn("file:" + "0" * 64, usage["items"])
+
+    def test_v2_usage_enforces_all_count_and_byte_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            items = {
+                "app:%d" % i: {"count": 1, "last": i}
+                for i in range(320)
+            }
+            file_ids = []
+            for i in range(105):
+                path = base / ("file-%03d" % i)
+                path.touch()
+                item_id = "file:" + HELPER.path_fingerprint(str(path))
+                file_ids.append(item_id)
+                items[item_id] = {
+                    "count": 1, "last": i, "meta": {"path": str(path)}
+                }
+            contexts = {}
+            for i in range(140):
+                contexts["query:q%d" % i] = {
+                    "app:%d" % hit: {"count": 1, "last": i}
+                    for hit in range(10)
+                }
+
+            usage = HELPER.normalize_usage({
+                "version": 2, "items": items, "contexts": contexts
+            })
+            self.assertLessEqual(len(usage["items"]), 400)
+            self.assertLessEqual(
+                sum(item_id.startswith("file:") for item_id in usage["items"]), 100
+            )
+            self.assertLessEqual(len(usage["contexts"]), 128)
+            self.assertTrue(all(len(hits) <= 8 for hits in usage["contexts"].values()))
+            payload = json.dumps(usage, ensure_ascii=False, separators=(",", ":")).encode()
+            self.assertLessEqual(len(payload), HELPER.USAGE_JSON_BUDGET_BYTES)
+
+    def test_missing_usage_file_returns_an_empty_v2_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = directory
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    HELPER.cmd_read_usage()
+                usage = json.loads(buf.getvalue())["usage"]
+                self.assertEqual(usage, {"version": 2, "items": {}, "contexts": {}})
+                self.assertFalse(
+                    (Path(directory) / ".local" / "state" / "omarchy" / "spotlight-usage.json").exists()
+                )
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+    def test_read_usage_persists_v1_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = directory
+            try:
+                state = Path(directory) / ".local" / "state" / "omarchy"
+                state.mkdir(parents=True)
+                path = state / "spotlight-usage.json"
+                path.write_text(json.dumps({"app:firefox": {"count": 2, "last": 10}}))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    HELPER.cmd_read_usage()
+                persisted = json.loads(path.read_text())
+                self.assertEqual(persisted["version"], 2)
+                self.assertEqual(persisted["items"]["app:firefox"]["count"], 2)
             finally:
                 if old_home is None:
                     os.environ.pop("HOME", None)

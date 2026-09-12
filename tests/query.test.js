@@ -46,3 +46,14 @@ test("window colon filter does not steal the Wikipedia bang", () => {
   assert.equal(Query.parse("w firefox").filter, "")
   assert.equal(Query.parse("gh quickshell").filter, "")
 })
+
+test("query prefixes and colon filters use separate context namespaces", () => {
+  assert.deepEqual(Query.contextKeys(Query.parse("Fire")), [
+    "query:fi", "query:fir", "query:fire"
+  ])
+  assert.deepEqual(Query.contextKeys(Query.parse("app: Fire")), [
+    "filter:app:fi", "filter:app:fir", "filter:app:fire"
+  ])
+  assert.equal(Query.contextKey(Query.parse("f report")), "filter:file:report")
+  assert.deepEqual(Query.contextKeys(Query.parse("x")), [])
+})

@@ -15,6 +15,7 @@ import "lib/Commands.js" as Commands
 import "lib/Apps.js" as Apps
 import "lib/FileRank.js" as FileRank
 import "lib/Query.js" as Query
+import "lib/Ranking.js" as Ranking
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -121,31 +122,16 @@ Item {
   // source.
   property var menuCommands: []
 
-  // Decayed launch counts, keyed by row key. See lib/Frecency.js.
-  property var usage: Frecency.emptyMap()
-
-  // Frecency is a bonus on top of the match score, never a replacement for it.
-  // Both caps sit under the smallest gap between two match tiers (500 in the
-  // shell's AppSearch, 500 in Fuzzy), so usage reorders rows that matched
-  // equally well and can never lift a weak match over a name that starts with
-  // what was typed.
-  readonly property int appFrecencyBoost: 450
-  readonly property int commandFrecencyBoost: 400
-  // With no query there is no match score to respect, so frecency owns the
-  // order outright and the alphabetical fallback only breaks its ties.
-  readonly property int idleFrecencyBoost: 100000
-  // Cap on remembered keys. Everything past it is the tail nothing ranks by.
-  // The helper enforces the same number on the way in and on the way out, so
-  // the store cannot grow past it by being edited by hand either.
-  readonly property int usageKeepCount: 400
+  // Versioned learning store: stable items plus query-local contexts. The
+  // helper validates and bounds it before it reaches this long-lived process.
+  property var usage: Frecency.emptyStore()
 
   // Hard ceilings on everything the model will hold, applied where the rows
   // are built rather than after. maxApps is a user setting, so it is clamped
   // rather than trusted; the rest bound lists that arrive from outside.
   readonly property int maxAppRows: 24
-  readonly property int maxIdleAppRows: 60
-  // The helper returns at most 400 hits (a scan pool, ranked below); the
-  // list shows the best 10 of them.
+  // The helper returns at most 400 hits; the shared global cap shows at most
+  // 50 after ranking.
   readonly property int maxFileRows: 50
   // Must match bin/spotlight-helper's file-search limits: the helper first
   // truncates the pattern to 256 characters, then AND-filters on its first
@@ -172,6 +158,7 @@ Item {
     fileSearchAlways: true,
     clipboardSearch: true,
     clipboardSearchAlways: true,
+    learningEnabled: true,
     maxResults: 20,
     maxApps: 8,
     maxSuggestions: 4
@@ -195,8 +182,8 @@ Item {
   readonly property color dividerColor: Util.alpha(Color.foreground, 0.10)
   readonly property string fontFamily: Style.font.menuFamily
 
-  // One left rail at `gutter`. The search glyph, every row icon and every
-  // row icon aligns to it; a row is inset by `listPadding` and carries
+  // One left rail at `gutter`. The search glyph and every row icon align to
+  // it; a row is inset by `listPadding` and carries
   // the remainder internally, so the rail survives the inset.
   readonly property int gutter: Style.space(24)
   readonly property int listPadding: Style.space(10)
@@ -369,19 +356,13 @@ Item {
   }
 
   // ------------------------------------------------------------- usage
-  // Only keys that still mean the same thing next week are worth remembering.
-  // A web suggestion, a file hit or a window is spelled out of the query that
-  // produced it and is never looked up again, so counting one only grows the
-  // file.
-  function trackable(key) {
-    var k = String(key || "")
-    return k.indexOf("app:") === 0 || k.indexOf("cmd:") === 0 || k.indexOf("bang.") === 0
-  }
-
-  function bumpUsage(key) {
-    if (!root.trackable(key)) return
+  function bumpUsage(row) {
+    if (!root.settings.learningEnabled || !row || !row.stableId) return
+    if (row.resultType !== "app" && row.resultType !== "window"
+        && row.resultType !== "file" && row.resultType !== "action") return
     var now = Date.now()
-    var next = Frecency.prune(Frecency.bump(root.usage, key, now), root.usageKeepCount, now)
+    var contexts = Query.contextKeys(Query.parse(root.query))
+    var next = Frecency.bump(root.usage, row.stableId, contexts, row.learningMeta, now)
     root.usage = next
     root.persistUsage(JSON.stringify(next))
   }
@@ -393,7 +374,7 @@ Item {
     // the second half of the same guarantee: on an ordinary object a key of
     // `__proto__` is an assignment to the prototype rather than an entry, so
     // one such line in the file would quietly reshape every lookup after it.
-    root.usage = Frecency.adopt(reply ? reply.usage : null)
+    root.usage = Frecency.adopt(reply ? reply.usage : null, Date.now())
   }
 
   // Writes go through the helper too: a locked, atomic 0600 replacement inside
@@ -430,6 +411,7 @@ Item {
       fileSearchAlways: parsed.fileSearchAlways !== false,
       clipboardSearch: parsed.clipboardSearch !== false,
       clipboardSearchAlways: parsed.clipboardSearchAlways !== false,
+      learningEnabled: parsed.learningEnabled !== false,
       maxResults: isFinite(parsed.maxResults)
         ? Util.clamp(parsed.maxResults, 8, root.maxGlobalResults) : 20,
       maxApps: isFinite(parsed.maxApps)
@@ -455,7 +437,14 @@ Item {
       confirm: spec.confirm === true,
       keywords: String(spec.keywords || "").slice(0, 2048),
       matchText: String(spec.matchText || ""),
-      rankBoost: Number(spec.rankBoost) || 0,
+      resultType: String(spec.resultType || "intent"),
+      stableId: String(spec.stableId || "").slice(0, 512),
+      textMatch: isFinite(spec.textMatch) ? Number(spec.textMatch) : -1,
+      recencyBonus: 0,
+      frequencyBonus: 0,
+      contextBonus: 0,
+      tieRank: isFinite(spec.tieRank) ? Number(spec.tieRank) : NaN,
+      learningMeta: spec.learningMeta || null,
       payload: spec.payload || ({})
     }
   }
@@ -538,7 +527,7 @@ Item {
       }))
     }
 
-    for (var i = 0; i < out.length; i++) out[i].rankBoost = 20000 - i
+    for (var i = 0; i < out.length; i++) out[i].textMatch = Fuzzy.MATCH_EXACT
     return out
   }
 
@@ -556,6 +545,7 @@ Item {
       accessory: "Web", icon: bang.engine.icon,
       primaryLabel: "Search " + bang.engine.name,
       matchText: bang.query,
+      resultType: "web",
       payload: { url: Web.searchUrl(bang.query, bang.key) }
     })]
   }
@@ -609,53 +599,34 @@ Item {
     Util.execArgv(["uwsm-app", "--", "gtk-launch", id + ".desktop"])
   }
 
-  function appRows(q) {
+  function appRows(q, learnedOnly) {
     var entries = root.appEntries(q)
-    var now = Date.now()
-    var candidates = []
+    var limit = q ? Util.clamp(root.settings.maxApps, 3, root.maxAppRows) : root.maxAppCandidates
+    var out = []
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i].entry
       var key = "app:" + String(entry.id || "")
-      // sortedEntries scored the match as well as ordering it, and keeping
-      // that number instead of the position is what lets frecency stay a
-      // bounded bonus. Flattened to a rank position, "the name starts with the
-      // query" and "one letter of the acronym matched" sit a single point
-      // apart, so any usage at all was enough to swap them.
-      candidates.push({
-        key: key,
-        entry: entry,
-        order: i,
-        score: (q ? (Number(entries[i].score) || 0) : 0)
-          + Frecency.weight(root.usage[key], now) * (q ? root.appFrecencyBoost : root.idleFrecencyBoost)
-      })
-    }
-    candidates.sort(function(a, b) {
-      if (b.score !== a.score) return b.score - a.score
-      return a.order - b.order
-    })
-
-    var limit = q ? Util.clamp(root.settings.maxApps, 3, root.maxAppRows) : root.maxIdleAppRows
-    var out = []
-    for (var j = 0; j < candidates.length && out.length < limit; j++) {
-      var c = candidates[j]
+      if (learnedOnly && !Frecency.hasItem(root.usage, key)) continue
       out.push(root.row({
-        key: c.key,
+        key: key,
         kind: "app",
-        title: root.appName(c.entry),
-        subtitle: root.appSubtext(c.entry),
+        title: root.appName(entry),
+        subtitle: root.appSubtext(entry),
         accessory: "App",
-        image: root.appIcon(c.entry.icon),
+        image: root.appIcon(entry.icon),
         primaryLabel: "Open",
-        keywords: String(c.entry.id || "") + " " + root.appSubtext(c.entry),
-        payload: { appId: String(c.entry.id || ""), name: root.appName(c.entry) }
+        keywords: Apps.entrySearchText(entry),
+        resultType: "app",
+        stableId: key,
+        payload: { appId: String(entry.id || ""), name: root.appName(entry) }
       }))
+      if (out.length >= limit) break
     }
     return out
   }
 
   // Open windows, so "switch to that Slack window" is one query away.
-  function windowRows(q) {
-    if (!q) return []
+  function windowRows(q, learnedOnly) {
     var candidates = []
     var values = []
     try { values = ToplevelManager.toplevels.values || [] } catch (e) { return [] }
@@ -666,10 +637,13 @@ Item {
       var title = String(t.title || "").slice(0, root.maxTitleChars)
       var appId = String(t.appId || "").slice(0, 256)
       if (!title && !appId) continue
+      var stableId = appId ? "window:" + appId : ""
+      if (learnedOnly && !Frecency.hasItem(root.usage, stableId)) continue
       candidates.push({
         title: title || appId,
         subtitle: appId,
         keywords: "window switch focus " + appId,
+        stableId: stableId,
         toplevel: t
       })
     }
@@ -685,38 +659,25 @@ Item {
         primaryLabel: "Focus window",
         secondaryLabel: "Close window",
         keywords: ranked[j].keywords,
+        resultType: "window",
+        stableId: ranked[j].stableId,
         payload: { toplevel: ranked[j].toplevel }
       }))
     }
     return out
   }
 
-  function commandRows(q, actionsOnly) {
-    if (!q) return []
+  function commandRows(q, actionsOnly, learnedOnly) {
     var catalogue = Commands.commands().concat(Commands.quicklinks()).concat(root.menuCommands)
     if (actionsOnly) catalogue = catalogue.filter(function(c) { return c.kind !== "url" })
-    var ranked = Fuzzy.rank(catalogue, q, 40)
-
-    // Usage reorders within the matched set without overriding a strong
-    // title match, hence the bonus being added to the fuzzy score.
-    var now = Date.now()
-    var scored = []
-    for (var i = 0; i < ranked.length; i++) {
-      var key = "cmd:" + ranked[i].key
-      scored.push({
-        cmd: ranked[i],
-        score: Fuzzy.score(ranked[i], q) + Frecency.weight(root.usage[key], now) * root.commandFrecencyBoost,
-        order: i
-      })
-    }
-    scored.sort(function(a, b) {
-      if (b.score !== a.score) return b.score - a.score
-      return a.order - b.order
+    if (learnedOnly) catalogue = catalogue.filter(function(c) {
+      return c.kind !== "url" && Frecency.hasItem(root.usage, "action:" + c.key)
     })
+    var ranked = Fuzzy.rank(catalogue, q, root.maxAppCandidates)
 
     var out = []
-    for (var j = 0; j < scored.length && j < root.maxGlobalResults; j++) {
-      var c = scored[j].cmd
+    for (var j = 0; j < ranked.length && j < root.maxAppCandidates; j++) {
+      var c = ranked[j]
       var isWeb = c.kind === "url"
       out.push(root.row({
         key: "cmd:" + c.key,
@@ -727,6 +688,8 @@ Item {
         primaryLabel: isWeb ? "Open in browser" : "Run",
         confirm: c.confirm === true,
         keywords: c.keywords,
+        resultType: isWeb ? "web" : "action",
+        stableId: isWeb ? "" : "action:" + c.key,
         payload: { argv: c.argv || [], id: c.id || "", url: c.url || "" }
       }))
     }
@@ -762,6 +725,7 @@ Item {
         accessory: "Clipboard", icon: "󰅌", mono: true,
         primaryLabel: "Copy to clipboard",
         matchText: target.pattern,
+        resultType: "clipboard",
         payload: { index: ranked[i].index, title: ranked[i].title }
       }))
     }
@@ -774,7 +738,8 @@ Item {
       return [root.row({
         key: "reminder.none", kind: "noop",
         title: "No active reminders", subtitle: "Try “remind me in 20m to …”",
-        accessory: "", icon: "󰢌", primaryLabel: ""
+        accessory: "", icon: "󰢌", primaryLabel: "",
+        textMatch: Fuzzy.MATCH_EXACT
       })]
     }
     var out = []
@@ -785,14 +750,16 @@ Item {
         kind: "noop",
         title: String(r.label || ""),
         subtitle: "in " + String(r.remaining || "") + " · at " + String(r.atTime || ""),
-        accessory: "Reminder", icon: "󰔟", primaryLabel: ""
+        accessory: "Reminder", icon: "󰔟", primaryLabel: "",
+        textMatch: Fuzzy.MATCH_EXACT
       }))
     }
     out.push(root.row({
       key: "reminder.clear", kind: "shell",
       title: "Clear all reminders", subtitle: root.reminderRows.length + " active",
       accessory: "Action", icon: "󰩹",
-      primaryLabel: "Clear", payload: { argv: ["omarchy", "reminder", "clear"] }
+      primaryLabel: "Clear", resultType: "action", stableId: "action:reminder.clear",
+      payload: { argv: ["omarchy", "reminder", "clear"] }
     }))
     return out
   }
@@ -815,10 +782,45 @@ Item {
         primaryLabel: "Open",
         secondaryLabel: "Open folder",
         matchText: target.pattern,
+        resultType: "file",
+        stableId: f.id ? "file:" + f.id : "",
+        tieRank: i,
+        learningMeta: { path: f.path, name: f.name, dir: f.dir, isDir: f.isDir },
         payload: { path: f.path, dir: f.dir }
       }))
     }
     return out
+  }
+
+  function learnedFileRows() {
+    var out = []
+    var items = root.usage && root.usage.items ? root.usage.items : ({})
+    var ids = Object.keys(items)
+    for (var i = 0; i < ids.length; i++) {
+      var entry = items[ids[i]]
+      var f = entry && entry.meta
+      if (ids[i].indexOf("file:") !== 0 || !f || !f.path) continue
+      out.push(root.row({
+        key: "idle:" + ids[i], kind: "file",
+        title: f.name, subtitle: f.dir,
+        accessory: f.isDir ? "Folder" : "File",
+        icon: f.isDir ? "󰉋" : "󰈔",
+        primaryLabel: "Open", secondaryLabel: "Open folder",
+        resultType: "file", stableId: ids[i], textMatch: 0,
+        learningMeta: f, payload: { path: f.path, dir: f.dir }
+      }))
+    }
+    return out
+  }
+
+  function idleRows() {
+    if (!root.settings.learningEnabled || !root.usage || !root.usage.items
+        || Object.keys(root.usage.items).length === 0) return root.appRows("", false)
+    var out = root.appRows("", true)
+      .concat(root.windowRows("", true))
+      .concat(root.commandRows("", true, true))
+      .concat(root.learnedFileRows())
+    return out.length ? out : root.appRows("", false)
   }
 
   function suggestionResultRows(q) {
@@ -836,7 +838,7 @@ Item {
         icon: Web.engineIcon(engine),
         primaryLabel: "Search " + Web.engineName(engine),
         matchText: needle,
-        rankBoost: -3000,
+        resultType: "web",
         payload: { url: Web.searchUrl(s, engine) }
       }))
     }
@@ -854,7 +856,8 @@ Item {
       accessory: "Web",
       icon: Web.engineIcon(engine),
       primaryLabel: "Search " + Web.engineName(engine),
-      rankBoost: -5000,
+      resultType: "web",
+      textMatch: Fuzzy.MATCH_RESIDUAL,
       payload: { url: Web.searchUrl(q, engine) }
     })]
   }
@@ -864,25 +867,28 @@ Item {
       key: "filter.hint", kind: "noop",
       title: "Type a search after “" + parsed.raw + "”",
       subtitle: "This filter searches " + parsed.filter + " results only",
-      accessory: "Hint", icon: "󰋼", primaryLabel: ""
+      accessory: "Hint", icon: "󰋼", primaryLabel: "",
+      textMatch: Fuzzy.MATCH_EXACT
     })
   }
 
   function globallyRank(list, q) {
-    var scored = []
+    var now = Date.now()
+    var context = Query.contextKey(Query.parse(root.query))
     for (var i = 0; i < list.length; i++) {
       var row = list[i]
-      var match = Fuzzy.score(row, row.matchText || q)
-      scored.push({ row: row, score: Math.max(0, match) + row.rankBoost, order: i })
+      if (row.textMatch < 0) {
+        var matched = Fuzzy.score(row, row.matchText || q)
+        row.textMatch = matched >= 0 ? matched : Fuzzy.MATCH_RESIDUAL
+      }
+      var bonus = Frecency.bonuses(root.usage, row.stableId, context, now,
+        root.settings.learningEnabled)
+      row.recencyBonus = bonus.recency
+      row.frequencyBonus = bonus.frequency
+      row.contextBonus = bonus.context
     }
-    scored.sort(function(a, b) {
-      if (b.score !== a.score) return b.score - a.score
-      return a.order - b.order
-    })
-    var out = []
     var limit = Util.clamp(root.settings.maxResults, 8, root.maxGlobalResults)
-    for (var j = 0; j < scored.length && out.length < limit; j++) out.push(scored[j].row)
-    return out
+    return Ranking.rank(list, limit)
   }
 
   // ------------------------------------------------------------- assembly
@@ -912,7 +918,7 @@ Item {
         push(root.intentRows(parsed.text, parsed.filter))
       }
     } else if (!q) {
-      push(root.appRows(""))
+      push(root.idleRows())
     } else {
       push(root.intentRows(q, ""))
       push(root.reminderListRows(q))
@@ -1068,16 +1074,15 @@ Item {
       return
     }
     root.armedKey = ""
+    if (!secondary && r.kind !== "spotlight-reset") root.bumpUsage(r)
 
     switch (r.kind) {
     case "app":
-      root.bumpUsage(r.key)
       root.dismiss()
       root.launchApp(r.payload.appId, r.payload.name)
       break
 
     case "shell":
-      root.bumpUsage(r.key)
       root.dismiss()
       // execArgv, not execDetached: the catalogue holds argv vectors rather
       // than command lines, so nothing here is ever re-tokenized by a shell.
@@ -1086,13 +1091,11 @@ Item {
       break
 
     case "url":
-      root.bumpUsage(r.key)
       root.dismiss()
       root.openUrl(r.payload.url)
       break
 
     case "summon":
-      root.bumpUsage(r.key)
       root.dismiss()
       if (root.shell && typeof root.shell.summon === "function")
         root.shell.summon(r.payload.id, "{}")
@@ -1146,7 +1149,6 @@ Item {
       break
 
     case "spotlight-settings":
-      root.bumpUsage(r.key)
       root.dismiss()
       maintenanceProc.running = false
       maintenanceProc.action = "settings"
@@ -1155,13 +1157,11 @@ Item {
       break
 
     case "spotlight-plugin":
-      root.bumpUsage(r.key)
       root.dismiss()
       root.openPath(root.pluginFolder)
       break
 
     case "spotlight-data":
-      root.bumpUsage(r.key)
       root.dismiss()
       maintenanceProc.running = false
       maintenanceProc.action = "data"
@@ -1172,6 +1172,7 @@ Item {
     case "spotlight-reset":
       root.dismiss()
       root.pendingUsage = ""
+      usageReadProc.running = false
       usageWriteProc.running = false
       maintenanceProc.running = false
       maintenanceProc.action = "reset"
@@ -1274,6 +1275,7 @@ Item {
       var f = list[i]
       if (!f || !f.path) continue
       candidates.push({
+        id: String(f.id || ""),
         path: String(f.path),
         name: String(f.name || ""),
         dir: String(f.dir || "/"),
@@ -1553,7 +1555,7 @@ Item {
         else if (maintenanceProc.action === "data" && reply.path)
           root.openPath(reply.path)
         else if (maintenanceProc.action === "reset" && reply.reset === true)
-          root.usage = Frecency.emptyMap()
+          root.usage = Frecency.emptyStore()
       }
     }
   }

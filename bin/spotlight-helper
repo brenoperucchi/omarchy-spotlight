@@ -26,6 +26,7 @@ files owned by us, which is what keeps a planted symlink, FIFO or device out.
 
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -46,9 +47,19 @@ USAGE_BYTES = 256 * 1024
 CLIPBOARD_BYTES = 8 * 1024 * 1024
 ICS_BYTES = 64 * 1024
 
+USAGE_VERSION = 2
 USAGE_KEEP = 400
-USAGE_KEY_LEN = 256
-USAGE_KEY_RE = re.compile(r"^(?:app:|cmd:|bang\.)[^\x00-\x1f]{1,240}$")
+USAGE_FILE_KEEP = 100
+USAGE_CONTEXT_KEEP = 128
+USAGE_CONTEXT_HIT_KEEP = 8
+USAGE_JSON_BUDGET_BYTES = 200000
+USAGE_ID_CHARS = 512
+USAGE_CONTEXT_CHARS = 256
+USAGE_ID_RE = re.compile(r"^(?:(?:app|window|action):[^\x00-\x1f]{1,505}|file:[0-9a-f]{64})$")
+USAGE_CONTEXT_RE = re.compile(
+    r"^(?:query:|filter:(?:app|window|file|action|clipboard|web|calc|unit|reminder|calendar):)"
+    r"[^\x00-\x1f]{2,220}$"
+)
 
 CLIP_ENTRIES = 200
 CLIP_TITLE_CHARS = 120
@@ -580,6 +591,7 @@ def normalize_settings(parsed):
         "fileSearchAlways": True,
         "clipboardSearch": True,
         "clipboardSearchAlways": True,
+        "learningEnabled": True,
         "maxResults": 20,
         "maxApps": 8,
         "maxSuggestions": 4,
@@ -591,6 +603,7 @@ def normalize_settings(parsed):
     out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), True)
     out["clipboardSearch"] = clamp_bool(parsed.get("clipboardSearch"), True)
     out["clipboardSearchAlways"] = clamp_bool(parsed.get("clipboardSearchAlways"), True)
+    out["learningEnabled"] = clamp_bool(parsed.get("learningEnabled"), True)
     out["maxResults"] = clamp_int(parsed.get("maxResults"), 8, 50, 20)
     out["maxApps"] = clamp_int(parsed.get("maxApps"), 3, 24, 8)
     out["maxSuggestions"] = clamp_int(parsed.get("maxSuggestions"), 0, SUGGEST_COUNT, 4)
@@ -601,20 +614,24 @@ def normalize_settings(parsed):
 
 
 def normalize_usage(parsed):
-    """Keep only well-formed entries under keys Spotlight itself mints.
-
-    The prefix test is what stops a hand-edited store introducing keys with
-    special meaning in a JS object — `__proto__` never matches it — and the
-    count cap is applied before anything is emitted, not after.
-    """
+    """Normalize V2 learning data and migrate the old flat usage map."""
     if not isinstance(parsed, dict):
-        return {}
+        parsed = {}
     now = int(time.time() * 1000)
-    kept = []
-    for key, value in parsed.items():
-        if not isinstance(key, str) or len(key) > USAGE_KEY_LEN:
-            continue
-        if not USAGE_KEY_RE.match(key):
+    is_v2 = parsed.get("version") == USAGE_VERSION
+    source = parsed.get("items", {}) if is_v2 else parsed
+    if not isinstance(source, dict):
+        source = {}
+
+    candidates = []
+    for source_key, value in list(source.items())[:USAGE_KEEP * 4]:
+        key = source_key
+        if not is_v2:
+            if isinstance(key, str) and key.startswith("cmd:"):
+                key = "action:" + key[4:]
+            elif not isinstance(key, str) or not key.startswith("app:"):
+                continue
+        if not isinstance(key, str) or len(key) > USAGE_ID_CHARS or not USAGE_ID_RE.match(key):
             continue
         if not isinstance(value, dict):
             continue
@@ -622,11 +639,76 @@ def normalize_usage(parsed):
         last = clamp_int(value.get("last"), 0, now + 86400000, 0)
         if count <= 0:
             continue
-        kept.append((key, count, last))
-        if len(kept) >= USAGE_KEEP * 4:
+        entry = {"count": count, "last": last}
+        if key.startswith("file:"):
+            meta = value.get("meta")
+            path = meta.get("path") if isinstance(meta, dict) else None
+            if (not isinstance(path, str) or not path.startswith("/")
+                    or len(path) > FILES_PATH_CHARS or path_fingerprint(path) != key[5:]
+                    or not os.path.exists(path)):
+                continue
+            entry["meta"] = {
+                "path": path,
+                "name": clamp_text(os.path.basename(path), 512),
+                "dir": clamp_text(os.path.dirname(path) or "/", FILES_PATH_CHARS),
+                "isDir": os.path.isdir(path),
+            }
+        candidates.append((key, entry))
+
+    candidates.sort(key=lambda item: (-item[1]["last"], -item[1]["count"], item[0]))
+    items = {}
+    files = 0
+    for key, entry in candidates:
+        if key.startswith("file:"):
+            files += 1
+            if files > USAGE_FILE_KEEP:
+                continue
+        if len(items) >= USAGE_KEEP:
             break
-    kept.sort(key=lambda e: e[2], reverse=True)
-    return {k: {"count": c, "last": l} for k, c, l in kept[:USAGE_KEEP]}
+        items[key] = entry
+
+    contexts = []
+    raw_contexts = parsed.get("contexts", {}) if is_v2 else {}
+    if isinstance(raw_contexts, dict):
+        for context_key, raw_hits in list(raw_contexts.items())[:USAGE_CONTEXT_KEEP * 4]:
+            if (not isinstance(context_key, str) or len(context_key) > USAGE_CONTEXT_CHARS
+                    or not USAGE_CONTEXT_RE.match(context_key) or not isinstance(raw_hits, dict)):
+                continue
+            hits = []
+            for item_id, value in list(raw_hits.items())[:USAGE_CONTEXT_HIT_KEEP * 4]:
+                if item_id not in items or not isinstance(value, dict):
+                    continue
+                count = clamp_int(value.get("count"), 0, 1000000, 0)
+                last = clamp_int(value.get("last"), 0, now + 86400000, 0)
+                if count > 0:
+                    hits.append((item_id, {"count": count, "last": last}))
+            hits.sort(key=lambda item: (-item[1]["last"], -item[1]["count"], item[0]))
+            kept_hits = dict(hits[:USAGE_CONTEXT_HIT_KEEP])
+            if kept_hits:
+                contexts.append((context_key, kept_hits,
+                                 max(hit["last"] for hit in kept_hits.values())))
+    contexts.sort(key=lambda item: (-item[2], item[0]))
+    out = {
+        "version": USAGE_VERSION,
+        "items": items,
+        "contexts": {key: hits for key, hits, _ in contexts[:USAGE_CONTEXT_KEEP]},
+    }
+
+    # Count limits normally fit comfortably; the serialized-byte check is the
+    # final hard stop for long paths and context keys.
+    while len(json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > USAGE_JSON_BUDGET_BYTES:
+        if out["contexts"]:
+            out["contexts"].pop(next(reversed(out["contexts"])))
+        elif out["items"]:
+            dropped = next(reversed(out["items"]))
+            out["items"].pop(dropped)
+        else:
+            break
+    return out
+
+
+def path_fingerprint(path):
+    return hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 # ------------------------------------------------------------- omarchy menu
@@ -1183,10 +1265,22 @@ def cmd_read_menu_commands():
 def cmd_read_usage():
     fd = walk([".local", "state", "omarchy"], create=True)
     try:
-        parsed = read_json(fd, "spotlight-usage.json", USAGE_BYTES, {})
+        raw = read_file(fd, "spotlight-usage.json", USAGE_BYTES)
+        try:
+            parsed = json.loads(raw.decode("utf-8", "replace")) if raw is not None else {}
+        except ValueError:
+            parsed = {}
+        usage = normalize_usage(parsed)
+        if raw is not None and parsed != usage:
+            lock = lock_at(fd, ".spotlight-usage.lock")
+            try:
+                write_atomic(fd, "spotlight-usage.json",
+                             json.dumps(usage, separators=(",", ":")).encode("utf-8"))
+            finally:
+                os.close(lock)
     finally:
         os.close(fd)
-    emit({"usage": normalize_usage(parsed)})
+    emit({"usage": usage})
 
 
 def cmd_write_usage():
@@ -1207,7 +1301,7 @@ def cmd_write_usage():
             os.close(lock)
     finally:
         os.close(fd)
-    emit({"written": len(usage)})
+    emit({"written": len(usage["items"])})
 
 
 def _clipboard_entries():
@@ -1410,7 +1504,8 @@ def cmd_files(argv):
         slash = path.rfind("/")
         name = path[slash + 1:] if slash >= 0 else path
         dirname = path[:slash] if slash > 0 else "/"
-        row = {"path": path, "name": name, "dir": dirname, "isDir": is_dir}
+        row = {"id": path_fingerprint(path), "path": path, "name": name,
+               "dir": dirname, "isDir": is_dir}
         # The real serialized size, not an estimate from raw string lengths:
         # a control character (legal in a Linux filename, not rejected
         # above) expands to a 6-char \uXXXX escape in JSON regardless of

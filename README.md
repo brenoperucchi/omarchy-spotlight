@@ -86,7 +86,7 @@ The plugin may also leave its optional settings and local ranking history:
 
 ```bash
 rm -f ~/.config/omarchy/spotlight.json            # your settings, if you wrote one
-rm -f ~/.local/state/omarchy/spotlight-usage.json # launch counts, for frecency
+rm -f ~/.local/state/omarchy/spotlight-usage.json # local ranking data
 ```
 
 ## What it answers
@@ -96,7 +96,7 @@ ranked and capped. The top row is preselected, so Enter does the obvious thing:
 
 | Type this | You get |
 |---|---|
-| `chrom` | Applications, ranked by how well the name matches and then by frecency |
+| `chrom` | Matching applications alongside other local result types |
 | `disc` | …plus any open window whose title or app id matches |
 | `screenshot`, `lock`, `theme` | Omarchy and system commands |
 | `12*7+3`, `sqrt(144)`, `20% of 250`, `15 mod 4` | Calculator — Enter copies the result |
@@ -122,21 +122,24 @@ broad search. The space-separated `w query` remains the Wikipedia bang.
 
 ## Ranking
 
-Applications are scored by the shell's own `AppSearch` — an exact name, a name
-that starts with the query, a name that contains it, then the id, the keywords
-and the acronym, each its own tier — and then nudged by **frecency**: the
-launch count decayed by how long ago the last launch was, the way `z` and
-zoxide rank directories. Two launches this morning outrank forty from last
-spring.
+Every provider uses the same match stages: exact, prefix, word, substring,
+metadata/acronym, then residual. The global score is:
 
-The nudge is bounded and it saturates, so it only ever reorders apps that
-matched about as well as each other. No amount of usage moves an app past one
-whose name starts with what you typed — `stea` is Steam on a fresh install and
-still Steam after a thousand launches of something else. On an empty query
-there is no match to respect, so the list is pure frecency: your most-used apps,
-most-used first.
+```text
+textMatch × typeWeight + recency + frequency + queryContext
+```
 
-Commands and quicklinks are ranked the same way.
+Type weights are Intent 1.05, App 1.00, Window 0.98, File 0.96, Action 0.94,
+Clipboard 0.92 and Web 0.80. Learning contributes at most 200 points: 40 for
+recency, 50 for frequency and 110 for the current query context. That is enough
+to swap adjacent match stages, but an exact result still beats a substantially
+weaker fully personalized match. Equal scores use deterministic title and
+stable-id tie breaks.
+
+Primary app, window, file and action activations learn. Clipboard rows and
+secondary actions do not. Empty search mixes learned apps and actions with
+still-present learned files and matching open windows; without history it falls
+back to applications.
 
 ## The cursor
 
@@ -168,7 +171,8 @@ field is a real input, so `Ctrl+V`, selection and caret movement work normally.
 ## Settings
 
 Optional, at `~/.config/omarchy/spotlight.json`. It is re-read every time you
-open Spotlight; the plugin never writes to it.
+open Spotlight. **Edit Spotlight Settings** creates the default file only when
+it is missing and never overwrites an existing one.
 
 ```json
 {
@@ -178,6 +182,7 @@ open Spotlight; the plugin never writes to it.
   "fileSearchAlways": true,
   "clipboardSearch": true,
   "clipboardSearchAlways": true,
+  "learningEnabled": true,
   "maxResults": 20,
   "maxApps": 8,
   "maxSuggestions": 4
@@ -195,6 +200,9 @@ providers join every query of at least two characters. Their corresponding
 One-character searches run them only through an explicit file or clipboard
 prefix. `maxResults` caps the combined list and accepts 8–50.
 
+`learningEnabled: false` stops both recording and ranking bonuses without
+deleting existing data.
+
 Every value is range-checked on the way in and a bad one falls back to its
 default rather than being used: `maxApps` is clamped to 3–24, `maxSuggestions`
 to 0–8, `maxResults` to 8–50, `searchEngine` has to name an engine in the bang
@@ -204,9 +212,11 @@ Search `spotlight settings` to create and edit this file, open the plugin or
 data folder, or reset Spotlight learning. Reset requires a second Enter and
 deletes only `spotlight-usage.json`.
 
-Launch counts live in `~/.local/state/omarchy/spotlight-usage.json` — one
-`{count, last}` per app, command and bang, capped at 400 entries. Delete it to
-forget the ranking.
+Learning data lives in `~/.local/state/omarchy/spotlight-usage.json`. V1 launch
+counts migrate automatically to V2 stable IDs. The store is capped at 400
+items, including at most 100 files, plus 128 query contexts with eight results
+each and a fixed serialized-byte budget. File IDs are SHA-256 fingerprints of
+their paths; missing files are discarded when the store is read.
 
 ## What it talks to
 
@@ -219,8 +229,8 @@ Everything else is local. No telemetry, no analytics, no background network.
 
 ## Requirements
 
-Omarchy 4 (Quattro) with the Quickshell-based `omarchy-shell`. Python is required;
-the other commands only provide their corresponding optional feature:
+Omarchy 4 (Quattro) with the Quickshell-based `omarchy-shell`. Spotlight uses
+only components present in stock Omarchy:
 
 | Package | Used for |
 |---|---|
@@ -234,8 +244,14 @@ The plugin has no telemetry or background service. Its helper bounds file and
 subprocess output, validates persistent files through directory descriptors,
 refuses symlinks and unsafe ownership or permissions, and uses atomic private
 writes. Subprocesses have deadlines and their process groups are cleaned up.
-Clipboard contents are read only when the selected entry is copied; the shell
-receives the bounded one-line preview.
+Clipboard search sends only bounded one-line previews to the shell; the full
+selected body goes directly from the helper to `wl-copy`.
+
+When learning is enabled, selected stable IDs, counts, timestamps, file paths,
+and the normalized search text and its prefixes from two characters are stored
+locally. Colon filters use separate context namespaces. Set `learningEnabled`
+to `false` to stop using or adding this data, or run **Reset Spotlight
+Learning** to delete it.
 
 ## Development
 
