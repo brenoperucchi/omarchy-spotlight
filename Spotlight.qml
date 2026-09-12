@@ -539,12 +539,17 @@ Item {
   function bangRows(q) {
     var bang = Web.bang(q)
     if (!bang) return []
+    // "tr … to german" drops the target off the end of the query, so the row has
+    // to show what is actually going to be translated and where it is going.
+    var target = bang.key === "tr" ? Web.translation(bang.query) : null
+    var text = target ? target.text : bang.query
+    var label = target ? "Translate to " + target.name : "Search " + bang.engine.name
     return [root.row({
       key: "bang." + bang.key, kind: "url",
-      title: bang.query, subtitle: "Search " + bang.engine.name,
+      title: text, subtitle: label,
       accessory: "Web", icon: bang.engine.icon,
-      primaryLabel: "Search " + bang.engine.name,
-      matchText: bang.query,
+      primaryLabel: label,
+      matchText: text,
       resultType: "web",
       payload: { url: Web.searchUrl(bang.query, bang.key) }
     })]

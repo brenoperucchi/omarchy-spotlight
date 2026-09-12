@@ -73,7 +73,7 @@ jobs:
         run: python -m unittest -v tests/helper_test.py
 
       - name: Run Node.js tests
-        run: node --test tests/apps.test.js tests/filerank.test.js
+        run: node --test tests/apps.test.js tests/filerank.test.js tests/web.test.js
 
       - name: Check committed whitespace
         run: git diff --check HEAD^ HEAD
