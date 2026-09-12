@@ -16,8 +16,9 @@ test("the displayed model is one globally ranked, globally capped list", () => {
 test("empty input keeps an application fallback and empty filters show only a hint", () => {
   assert.match(qml, /if \(parsed\.empty\) \{\s*next\.push\(root\.filterHintRow\(parsed\)\)/)
   assert.match(qml, /else if \(!q\) \{\s*push\(root\.idleRows\(\)\)/)
-  assert.match(qml, /return root\.appRows\("", false\)/)
+  assert.match(qml, /var fallback = root\.appRows\("", false\)/)
   assert.match(qml, /root\.appRows\("", true\)\s*\.concat\(root\.windowRows\("", true\)\)\s*\.concat\(root\.commandRows\("", true, true\)\)\s*\.concat\(root\.learnedFileRows\(\)\)/)
+  assert.match(qml, /if \(!Frecency\.hasItem\(root\.usage, fallback\[i\]\.stableId\)\) out\.push\(fallback\[i\]\)/)
 })
 
 test("one character starts only explicitly filtered file and clipboard providers", () => {

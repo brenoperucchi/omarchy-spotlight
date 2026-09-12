@@ -814,13 +814,17 @@ Item {
   }
 
   function idleRows() {
+    var fallback = root.appRows("", false)
     if (!root.settings.learningEnabled || !root.usage || !root.usage.items
-        || Object.keys(root.usage.items).length === 0) return root.appRows("", false)
+        || Object.keys(root.usage.items).length === 0) return fallback
     var out = root.appRows("", true)
       .concat(root.windowRows("", true))
       .concat(root.commandRows("", true, true))
       .concat(root.learnedFileRows())
-    return out.length ? out : root.appRows("", false)
+    for (var i = 0; i < fallback.length && out.length < root.maxGlobalResults; i++) {
+      if (!Frecency.hasItem(root.usage, fallback[i].stableId)) out.push(fallback[i])
+    }
+    return out.length ? out : fallback
   }
 
   function suggestionResultRows(q) {
