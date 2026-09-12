@@ -14,6 +14,8 @@ import "lib/Frecency.js" as Frecency
 import "lib/Commands.js" as Commands
 import "lib/Apps.js" as Apps
 import "lib/FileRank.js" as FileRank
+import "lib/Query.js" as Query
+import "lib/Ranking.js" as Ranking
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -46,6 +48,8 @@ Item {
   // over again, every path below switches back to it on its own.
   readonly property var appLibrary: root.shell ? root.shell.appLibrary : null
   readonly property string home: Quickshell.env("HOME")
+  readonly property string pluginFolder: decodeURIComponent(
+    String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, ""))
 
   // Spotlight is `keepLoaded`, so it lives inside the long-running
   // omarchy-shell process rather than being torn down with the overlay.
@@ -95,6 +99,7 @@ Item {
   property string fileFor: ""
   property var reminderRows: []
   property var clipboardRows: []
+  property string clipboardFor: ""
 
   // Destructive commands need a second Enter. Holds the row key that is armed.
   property string armedKey: ""
@@ -117,32 +122,17 @@ Item {
   // source.
   property var menuCommands: []
 
-  // Decayed launch counts, keyed by row key. See lib/Frecency.js.
-  property var usage: Frecency.emptyMap()
-
-  // Frecency is a bonus on top of the match score, never a replacement for it.
-  // Both caps sit under the smallest gap between two match tiers (500 in the
-  // shell's AppSearch, 500 in Fuzzy), so usage reorders rows that matched
-  // equally well and can never lift a weak match over a name that starts with
-  // what was typed.
-  readonly property int appFrecencyBoost: 450
-  readonly property int commandFrecencyBoost: 400
-  // With no query there is no match score to respect, so frecency owns the
-  // order outright and the alphabetical fallback only breaks its ties.
-  readonly property int idleFrecencyBoost: 100000
-  // Cap on remembered keys. Everything past it is the tail nothing ranks by.
-  // The helper enforces the same number on the way in and on the way out, so
-  // the store cannot grow past it by being edited by hand either.
-  readonly property int usageKeepCount: 400
+  // Versioned learning store: stable items plus query-local contexts. The
+  // helper validates and bounds it before it reaches this long-lived process.
+  property var usage: Frecency.emptyStore()
 
   // Hard ceilings on everything the model will hold, applied where the rows
   // are built rather than after. maxApps is a user setting, so it is clamped
   // rather than trusted; the rest bound lists that arrive from outside.
   readonly property int maxAppRows: 24
-  readonly property int maxIdleAppRows: 60
-  // The helper returns at most 400 hits (a scan pool, ranked below); the
-  // list shows the best 10 of them.
-  readonly property int maxFileRows: 10
+  // The helper returns at most 400 hits; the shared global cap shows at most
+  // 50 after ranking.
+  readonly property int maxFileRows: 50
   // Must match bin/spotlight-helper's file-search limits: the helper first
   // truncates the pattern to 256 characters, then AND-filters on its first
   // 8 terms. FileRank must score that same bounded pattern; otherwise text
@@ -150,13 +140,14 @@ Item {
   // or favor an incidental match.
   readonly property int filePatternChars: 256
   readonly property int fileMaxTerms: 8
-  readonly property int maxClipboardRows: 8
+  readonly property int maxClipboardRows: 50
   readonly property int maxReminderRows: 50
   readonly property int maxQueryChars: 512
   readonly property int maxPayloadChars: 4096
   readonly property int maxHelperPayloadChars: 524288
   readonly property int maxAppCandidates: 512
   readonly property int maxWindowCandidates: 256
+  readonly property int maxGlobalResults: 50
   readonly property int maxTitleChars: 512
   readonly property int maxSubtitleChars: 1024
 
@@ -164,8 +155,11 @@ Item {
     webSuggestions: false,
     searchEngine: "g",
     fileSearch: true,
-    // Fork-local default: on. See the matching note in loadSettings() below.
     fileSearchAlways: true,
+    clipboardSearch: true,
+    clipboardSearchAlways: true,
+    learningEnabled: true,
+    maxResults: 20,
     maxApps: 8,
     maxSuggestions: 4
   })
@@ -188,8 +182,8 @@ Item {
   readonly property color dividerColor: Util.alpha(Color.foreground, 0.10)
   readonly property string fontFamily: Style.font.menuFamily
 
-  // One left rail at `gutter`. The search glyph, every row icon and every
-  // section header align to it; a row is inset by `listPadding` and carries
+  // One left rail at `gutter`. The search glyph and every row icon align to
+  // it; a row is inset by `listPadding` and carries
   // the remainder internally, so the rail survives the inset.
   readonly property int gutter: Style.space(24)
   readonly property int listPadding: Style.space(10)
@@ -199,7 +193,6 @@ Item {
   readonly property int rowRadius: Style.space(8)
   readonly property int searchHeight: Style.space(56)
   readonly property int rowHeight: Style.space(40)
-  readonly property int sectionHeight: Style.space(30)
   readonly property int footerHeight: Style.space(36)
   readonly property int maxListHeight: Style.space(400)
   readonly property int hairline: Style.spacing.hairline
@@ -241,6 +234,8 @@ Item {
     root.suggestionFor = ""
     root.fileRows = []
     root.fileFor = ""
+    root.clipboardRows = []
+    root.clipboardFor = ""
     // The panel appears under wherever the pointer already is. Hold the cursor
     // for the same beat a keystroke would, so opening over a row does not hand
     // it the selection before the first character is typed.
@@ -277,6 +272,7 @@ Item {
     fileProc.running = false
     clipboardProc.running = false
     root.clipboardRows = []
+    root.clipboardFor = ""
   }
 
   function refreshSettings() {
@@ -332,12 +328,6 @@ Item {
         subtitle: String(c.subtitle || "").slice(0, root.maxSubtitleChars),
         icon: String(c.icon || "󰣇"),
         kind: "shell",
-        // Dispatch is still plain "shell" (activate()'s switch never sees
-        // this), but commandRows() reads it to label these distinctly from
-        // the hand-curated catalogue - these are real Omarchy menu tree
-        // entries, not entries this project wrote, and looking identical
-        // to a curated command made that distinction invisible.
-        source: "menu",
         argv: argv,
         keywords: String(c.keywords || "")
       })
@@ -366,19 +356,13 @@ Item {
   }
 
   // ------------------------------------------------------------- usage
-  // Only keys that still mean the same thing next week are worth remembering.
-  // A web suggestion, a file hit or a window is spelled out of the query that
-  // produced it and is never looked up again, so counting one only grows the
-  // file.
-  function trackable(key) {
-    var k = String(key || "")
-    return k.indexOf("app:") === 0 || k.indexOf("cmd:") === 0 || k.indexOf("bang.") === 0
-  }
-
-  function bumpUsage(key) {
-    if (!root.trackable(key)) return
+  function bumpUsage(row) {
+    if (!root.settings.learningEnabled || !row || !row.stableId) return
+    if (row.resultType !== "app" && row.resultType !== "window"
+        && row.resultType !== "file" && row.resultType !== "action") return
     var now = Date.now()
-    var next = Frecency.prune(Frecency.bump(root.usage, key, now), root.usageKeepCount, now)
+    var contexts = Query.contextKeys(Query.parse(root.query))
+    var next = Frecency.bump(root.usage, row.stableId, contexts, row.learningMeta, now)
     root.usage = next
     root.persistUsage(JSON.stringify(next))
   }
@@ -390,7 +374,7 @@ Item {
     // the second half of the same guarantee: on an ordinary object a key of
     // `__proto__` is an assignment to the prototype rather than an entry, so
     // one such line in the file would quietly reshape every lookup after it.
-    root.usage = Frecency.adopt(reply ? reply.usage : null)
+    root.usage = Frecency.adopt(reply ? reply.usage : null, Date.now())
   }
 
   // Writes go through the helper too: a locked, atomic 0600 replacement inside
@@ -424,11 +408,12 @@ Item {
       webSuggestions: parsed.webSuggestions === true,
       searchEngine: Web.hasEngine(parsed.searchEngine) ? parsed.searchEngine : "g",
       fileSearch: parsed.fileSearch !== false,
-      // Fork-local default: on, unlike the off-by-default this ships with in
-      // the PR to upstream. Mirrors fileSearch's own !== false fallback so a
-      // failed settings read (reply null, parsed = {}) still lands on our
-      // default rather than silently reverting to upstream's.
       fileSearchAlways: parsed.fileSearchAlways !== false,
+      clipboardSearch: parsed.clipboardSearch !== false,
+      clipboardSearchAlways: parsed.clipboardSearchAlways !== false,
+      learningEnabled: parsed.learningEnabled !== false,
+      maxResults: isFinite(parsed.maxResults)
+        ? Util.clamp(parsed.maxResults, 8, root.maxGlobalResults) : 20,
       maxApps: isFinite(parsed.maxApps)
         ? Util.clamp(parsed.maxApps, 3, root.maxAppRows) : 8,
       maxSuggestions: isFinite(parsed.maxSuggestions)
@@ -440,7 +425,6 @@ Item {
   function row(spec) {
     return {
       key: String(spec.key || "").slice(0, 2048),
-      section: String(spec.section || "").slice(0, 128),
       kind: String(spec.kind || "noop").slice(0, 32),
       title: String(spec.title || "").slice(0, root.maxTitleChars),
       subtitle: String(spec.subtitle || "").slice(0, root.maxSubtitleChars),
@@ -451,41 +435,53 @@ Item {
       primaryLabel: spec.primaryLabel || "Open",
       secondaryLabel: spec.secondaryLabel || "",
       confirm: spec.confirm === true,
+      keywords: String(spec.keywords || "").slice(0, 2048),
+      matchText: String(spec.matchText || ""),
+      resultType: String(spec.resultType || "intent"),
+      stableId: String(spec.stableId || "").slice(0, 512),
+      textMatch: isFinite(spec.textMatch) ? Number(spec.textMatch) : -1,
+      recencyBonus: 0,
+      frequencyBonus: 0,
+      contextBonus: 0,
+      tieRank: isFinite(spec.tieRank) ? Number(spec.tieRank) : NaN,
+      learningMeta: spec.learningMeta || null,
       payload: spec.payload || ({})
     }
   }
 
   // Calculator, unit conversion, reminders, calendar, URLs and bangs. These
   // are the rows that answer the query directly, so they sort above search.
-  function intentRows(q) {
+  function intentRows(q, filter) {
     var out = []
 
-    var calc = Calc.evaluate(q)
+    var calc = (!filter || filter === "calc") ? Calc.evaluate(q) : null
     if (calc) {
       out.push(root.row({
-        key: "calc", section: "Calculator", kind: "copy",
+        key: "calc", kind: "copy",
         title: calc.text, subtitle: q.replace(/^=/, "").trim(),
-        accessory: "Copy", icon: "󰃬", mono: true,
+        accessory: "Calculator", icon: "󰃬", mono: true,
         primaryLabel: "Copy result",
         payload: { text: calc.text.replace(/\s/g, "") }
       }))
     }
 
-    var unit = Units.convert(q)
+    var unit = (!filter || filter === "unit") ? Units.convert(q) : null
     if (unit) {
       out.push(root.row({
-        key: "unit", section: "Conversion", kind: "copy",
+        key: "unit", kind: "copy",
         title: unit.text, subtitle: unit.detail,
-        accessory: unit.family, icon: "󰑤", mono: true,
+        accessory: "Conversion", icon: "󰑤", mono: true,
         primaryLabel: "Copy result",
         payload: { text: unit.text.replace(/\s/g, "") }
       }))
     }
 
-    var reminder = NaturalTime.parseReminder(q)
+    var reminderText = filter === "reminder" ? "reminder " + q : q
+    var reminder = (!filter || filter === "reminder")
+      ? NaturalTime.parseReminder(reminderText) : null
     if (reminder && !reminder.needsTime && reminder.message) {
       out.push(root.row({
-        key: "reminder.create", section: "Reminder", kind: "reminder",
+        key: "reminder.create", kind: "reminder",
         title: reminder.message,
         subtitle: "Notify " + reminder.label + " · in " + NaturalTime.formatDuration(reminder.minutes),
         accessory: "Reminder", icon: "󰢌",
@@ -494,7 +490,7 @@ Item {
       }))
     } else if (reminder && reminder.needsTime) {
       out.push(root.row({
-        key: "reminder.hint", section: "Reminder", kind: "noop",
+        key: "reminder.hint", kind: "noop",
         title: reminder.message || "Set a reminder",
         subtitle: "Add a time — “in 20m”, “at 15:30”, “tomorrow at 9”",
         accessory: "Needs a time", icon: "󰢌",
@@ -502,13 +498,14 @@ Item {
       }))
     }
 
-    var event = NaturalTime.parseEvent(q)
+    var eventText = filter === "calendar" ? "event " + q : q
+    var event = (!filter || filter === "calendar") ? NaturalTime.parseEvent(eventText) : null
     if (event) {
       out.push(root.row({
-        key: "event.create", section: "Calendar", kind: "event",
+        key: "event.create", kind: "event",
         title: event.title,
         subtitle: event.label + " · " + NaturalTime.formatDuration(event.durationMinutes),
-        accessory: "Google Calendar", icon: "󰸗",
+        accessory: "Calendar", icon: "󰸗",
         primaryLabel: "Add to Google Calendar",
         secondaryLabel: "Save .ics file",
         payload: {
@@ -519,17 +516,18 @@ Item {
       }))
     }
 
-    var url = Web.detectUrl(q)
+    var url = (!filter || filter === "web") ? Web.detectUrl(q) : ""
     if (url) {
       out.push(root.row({
-        key: "url.open", section: "Open", kind: "url",
+        key: "url.open", kind: "url",
         title: url.replace(/^https?:\/\//, ""), subtitle: url,
-        accessory: "Website", icon: "󰖟",
+        accessory: "Web", icon: "󰖟",
         primaryLabel: "Open in browser",
         payload: { url: url }
       }))
     }
 
+    for (var i = 0; i < out.length; i++) out[i].textMatch = Fuzzy.MATCH_EXACT
     return out
   }
 
@@ -542,10 +540,12 @@ Item {
     var bang = Web.bang(q)
     if (!bang) return []
     return [root.row({
-      key: "bang." + bang.key, section: "Search", kind: "url",
+      key: "bang." + bang.key, kind: "url",
       title: bang.query, subtitle: "Search " + bang.engine.name,
-      accessory: bang.engine.name, icon: bang.engine.icon,
+      accessory: "Web", icon: bang.engine.icon,
       primaryLabel: "Search " + bang.engine.name,
+      matchText: bang.query,
+      resultType: "web",
       payload: { url: Web.searchUrl(bang.query, bang.key) }
     })]
   }
@@ -599,52 +599,34 @@ Item {
     Util.execArgv(["uwsm-app", "--", "gtk-launch", id + ".desktop"])
   }
 
-  function appRows(q) {
+  function appRows(q, learnedOnly) {
     var entries = root.appEntries(q)
-    var now = Date.now()
-    var candidates = []
+    var limit = q ? Util.clamp(root.settings.maxApps, 3, root.maxAppRows) : root.maxAppCandidates
+    var out = []
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i].entry
       var key = "app:" + String(entry.id || "")
-      // sortedEntries scored the match as well as ordering it, and keeping
-      // that number instead of the position is what lets frecency stay a
-      // bounded bonus. Flattened to a rank position, "the name starts with the
-      // query" and "one letter of the acronym matched" sit a single point
-      // apart, so any usage at all was enough to swap them.
-      candidates.push({
-        key: key,
-        entry: entry,
-        order: i,
-        score: (q ? (Number(entries[i].score) || 0) : 0)
-          + Frecency.weight(root.usage[key], now) * (q ? root.appFrecencyBoost : root.idleFrecencyBoost)
-      })
-    }
-    candidates.sort(function(a, b) {
-      if (b.score !== a.score) return b.score - a.score
-      return a.order - b.order
-    })
-
-    var limit = q ? Util.clamp(root.settings.maxApps, 3, root.maxAppRows) : root.maxIdleAppRows
-    var out = []
-    for (var j = 0; j < candidates.length && out.length < limit; j++) {
-      var c = candidates[j]
+      if (learnedOnly && !Frecency.hasItem(root.usage, key)) continue
       out.push(root.row({
-        key: c.key,
-        section: "Applications", kind: "app",
-        title: root.appName(c.entry),
-        subtitle: root.appSubtext(c.entry),
-        accessory: "Application",
-        image: root.appIcon(c.entry.icon),
+        key: key,
+        kind: "app",
+        title: root.appName(entry),
+        subtitle: root.appSubtext(entry),
+        accessory: "App",
+        image: root.appIcon(entry.icon),
         primaryLabel: "Open",
-        payload: { appId: String(c.entry.id || ""), name: root.appName(c.entry) }
+        keywords: Apps.entrySearchText(entry),
+        resultType: "app",
+        stableId: key,
+        payload: { appId: String(entry.id || ""), name: root.appName(entry) }
       }))
+      if (out.length >= limit) break
     }
     return out
   }
 
   // Open windows, so "switch to that Slack window" is one query away.
-  function windowRows(q) {
-    if (!q) return []
+  function windowRows(q, learnedOnly) {
     var candidates = []
     var values = []
     try { values = ToplevelManager.toplevels.values || [] } catch (e) { return [] }
@@ -655,78 +637,74 @@ Item {
       var title = String(t.title || "").slice(0, root.maxTitleChars)
       var appId = String(t.appId || "").slice(0, 256)
       if (!title && !appId) continue
+      var stableId = appId ? "window:" + appId : ""
+      if (learnedOnly && !Frecency.hasItem(root.usage, stableId)) continue
       candidates.push({
         title: title || appId,
         subtitle: appId,
         keywords: "window switch focus " + appId,
+        stableId: stableId,
         toplevel: t
       })
     }
 
-    var ranked = Fuzzy.rank(candidates, q, 5)
+    var ranked = Fuzzy.rank(candidates, q, root.maxGlobalResults)
     var out = []
     for (var j = 0; j < ranked.length; j++) {
       out.push(root.row({
         key: "win:" + ranked[j].subtitle + ":" + ranked[j].title,
-        section: "Open Windows", kind: "window",
+        kind: "window",
         title: ranked[j].title, subtitle: ranked[j].subtitle,
         accessory: "Window", icon: "󰖯",
         primaryLabel: "Focus window",
         secondaryLabel: "Close window",
+        keywords: ranked[j].keywords,
+        resultType: "window",
+        stableId: ranked[j].stableId,
         payload: { toplevel: ranked[j].toplevel }
       }))
     }
     return out
   }
 
-  function commandRows(q) {
-    if (!q) return []
+  function commandRows(q, actionsOnly, learnedOnly) {
     var catalogue = Commands.commands().concat(Commands.quicklinks()).concat(root.menuCommands)
-    var ranked = Fuzzy.rank(catalogue, q, 40)
-
-    // Usage reorders within the matched set without overriding a strong
-    // title match, hence the bonus being added to the fuzzy score.
-    var now = Date.now()
-    var scored = []
-    for (var i = 0; i < ranked.length; i++) {
-      var key = "cmd:" + ranked[i].key
-      scored.push({
-        cmd: ranked[i],
-        score: Fuzzy.score(ranked[i], q) + Frecency.weight(root.usage[key], now) * root.commandFrecencyBoost,
-        order: i
-      })
-    }
-    scored.sort(function(a, b) {
-      if (b.score !== a.score) return b.score - a.score
-      return a.order - b.order
+    if (actionsOnly) catalogue = catalogue.filter(function(c) { return c.kind !== "url" })
+    if (learnedOnly) catalogue = catalogue.filter(function(c) {
+      return c.kind !== "url" && Frecency.hasItem(root.usage, "action:" + c.key)
     })
+    var ranked = Fuzzy.rank(catalogue, q, root.maxAppCandidates)
 
     var out = []
-    for (var j = 0; j < scored.length && j < 7; j++) {
-      var c = scored[j].cmd
-      var fromMenu = c.source === "menu"
+    for (var j = 0; j < ranked.length && j < root.maxAppCandidates; j++) {
+      var c = ranked[j]
+      var isWeb = c.kind === "url"
       out.push(root.row({
         key: "cmd:" + c.key,
-        // Real Omarchy menu tree entries get their own section/badge -
-        // "Command" implied this project wrote and curated every one of
-        // them, which stopped being true once the actual menu tree (275+
-        // entries) got pulled in alongside the ~50 hand-curated ones.
-        section: c.kind === "url" ? "Quicklinks" : (fromMenu ? "Omarchy Menu" : "Commands"),
         kind: c.kind,
         title: c.title, subtitle: c.subtitle,
-        accessory: c.kind === "url" ? "Link" : (fromMenu ? "Menu" : "Command"),
+        accessory: isWeb ? "Web" : "Action",
         icon: c.icon,
-        primaryLabel: c.kind === "url" ? "Open in browser" : "Run",
+        primaryLabel: isWeb ? "Open in browser" : "Run",
         confirm: c.confirm === true,
+        keywords: c.keywords,
+        resultType: isWeb ? "web" : "action",
+        stableId: isWeb ? "" : "action:" + c.key,
         payload: { argv: c.argv || [], id: c.id || "", url: c.url || "" }
       }))
     }
     return out
   }
 
-  function clipboardQuery(q) {
-    var m = String(q || "").match(/^(?:cb|clip|clipboard)\s+(\S.*)$/i)
-    return m ? m[1].trim() : ""
+  function clipboardSearchTarget(q) {
+    if (!root.settings.clipboardSearch) return null
+    var parsed = Query.parse(q)
+    if (parsed.filter === "clipboard")
+      return parsed.empty ? null : { pattern: parsed.text, explicit: true }
+    if (parsed.filter) return null
+    if (root.settings.clipboardSearchAlways && parsed.text.length >= 2)
+      return { pattern: parsed.text, explicit: false }
+    return null
   }
 
   // Only the one-line titles are held here. A clipboard history is the last
@@ -735,17 +713,19 @@ Item {
   // helper pipes the chosen one straight into wl-copy without it ever crossing
   // back into the shell.
   function clipboardResultRows(q) {
-    var needle = root.clipboardQuery(q)
-    if (!needle) return []
-    var ranked = Fuzzy.rank(root.clipboardRows, needle, root.maxClipboardRows)
+    var target = root.clipboardSearchTarget(q)
+    if (!target || root.clipboardFor !== String(q || "").trim()) return []
+    var ranked = Fuzzy.rank(root.clipboardRows, target.pattern, root.maxClipboardRows)
     var out = []
     for (var i = 0; i < ranked.length; i++) {
       out.push(root.row({
         key: "clip:" + ranked[i].index,
-        section: "Clipboard History", kind: "clipcopy",
+        kind: "clipcopy",
         title: ranked[i].title, subtitle: "",
-        accessory: "Copy", icon: "󰅌", mono: true,
+        accessory: "Clipboard", icon: "󰅌", mono: true,
         primaryLabel: "Copy to clipboard",
+        matchText: target.pattern,
+        resultType: "clipboard",
         payload: { index: ranked[i].index, title: ranked[i].title }
       }))
     }
@@ -756,9 +736,10 @@ Item {
     if (!/^reminders?$/i.test(String(q || "").trim())) return []
     if (root.reminderRows.length === 0) {
       return [root.row({
-        key: "reminder.none", section: "Reminders", kind: "noop",
+        key: "reminder.none", kind: "noop",
         title: "No active reminders", subtitle: "Try “remind me in 20m to …”",
-        accessory: "", icon: "󰢌", primaryLabel: ""
+        accessory: "", icon: "󰢌", primaryLabel: "",
+        textMatch: Fuzzy.MATCH_EXACT
       })]
     }
     var out = []
@@ -766,17 +747,19 @@ Item {
       var r = root.reminderRows[i]
       out.push(root.row({
         key: "reminder.active." + i,
-        section: "Reminders", kind: "noop",
+        kind: "noop",
         title: String(r.label || ""),
         subtitle: "in " + String(r.remaining || "") + " · at " + String(r.atTime || ""),
-        accessory: "Active", icon: "󰔟", primaryLabel: ""
+        accessory: "Reminder", icon: "󰔟", primaryLabel: "",
+        textMatch: Fuzzy.MATCH_EXACT
       }))
     }
     out.push(root.row({
-      key: "reminder.clear", section: "Reminders", kind: "shell",
+      key: "reminder.clear", kind: "shell",
       title: "Clear all reminders", subtitle: root.reminderRows.length + " active",
-      accessory: "Command", icon: "󰩹",
-      primaryLabel: "Clear", payload: { argv: ["omarchy", "reminder", "clear"] }
+      accessory: "Action", icon: "󰩹",
+      primaryLabel: "Clear", resultType: "action", stableId: "action:reminder.clear",
+      payload: { argv: ["omarchy", "reminder", "clear"] }
     }))
     return out
   }
@@ -785,36 +768,81 @@ Item {
     // Results arrive asynchronously. Do not show the previous file query while
     // the helper is still answering the current one.
     if (root.fileFor !== String(q || "").trim() || root.fileRows.length === 0) return []
+    var target = root.fileSearchTarget(q)
+    if (!target) return []
     var out = []
     for (var i = 0; i < root.fileRows.length && i < root.maxFileRows; i++) {
       var f = root.fileRows[i]
       out.push(root.row({
         key: "file:" + f.path,
-        section: "Files", kind: "file",
+        kind: "file",
         title: f.name, subtitle: f.dir,
         accessory: f.isDir ? "Folder" : "File",
         icon: f.isDir ? "󰉋" : "󰈔",
         primaryLabel: "Open",
         secondaryLabel: "Open folder",
+        matchText: target.pattern,
+        resultType: "file",
+        stableId: f.id ? "file:" + f.id : "",
+        tieRank: i,
+        learningMeta: { path: f.path, name: f.name, dir: f.dir, isDir: f.isDir },
         payload: { path: f.path, dir: f.dir }
       }))
     }
     return out
   }
 
+  function learnedFileRows() {
+    var out = []
+    var items = root.usage && root.usage.items ? root.usage.items : ({})
+    var ids = Object.keys(items)
+    for (var i = 0; i < ids.length; i++) {
+      var entry = items[ids[i]]
+      var f = entry && entry.meta
+      if (ids[i].indexOf("file:") !== 0 || !f || !f.path) continue
+      out.push(root.row({
+        key: "idle:" + ids[i], kind: "file",
+        title: f.name, subtitle: f.dir,
+        accessory: f.isDir ? "Folder" : "File",
+        icon: f.isDir ? "󰉋" : "󰈔",
+        primaryLabel: "Open", secondaryLabel: "Open folder",
+        resultType: "file", stableId: ids[i], textMatch: 0,
+        learningMeta: f, payload: { path: f.path, dir: f.dir }
+      }))
+    }
+    return out
+  }
+
+  function idleRows() {
+    var fallback = root.appRows("", false)
+    if (!root.settings.learningEnabled || !root.usage || !root.usage.items
+        || Object.keys(root.usage.items).length === 0) return fallback
+    var out = root.appRows("", true)
+      .concat(root.windowRows("", true))
+      .concat(root.commandRows("", true, true))
+      .concat(root.learnedFileRows())
+    for (var i = 0; i < fallback.length && out.length < root.maxGlobalResults; i++) {
+      if (!Frecency.hasItem(root.usage, fallback[i].stableId)) out.push(fallback[i])
+    }
+    return out.length ? out : fallback
+  }
+
   function suggestionResultRows(q) {
     if (root.suggestionRows.length === 0) return []
+    var needle = Query.parse(q).text
     var engine = String(root.settings.searchEngine || "g")
     var out = []
     for (var i = 0; i < root.suggestionRows.length; i++) {
       var s = root.suggestionRows[i]
       out.push(root.row({
         key: "sugg:" + s,
-        section: "Web Suggestions", kind: "url",
+        kind: "url",
         title: s, subtitle: "",
-        accessory: Web.engineName(engine),
+        accessory: "Web",
         icon: Web.engineIcon(engine),
         primaryLabel: "Search " + Web.engineName(engine),
+        matchText: needle,
+        resultType: "web",
         payload: { url: Web.searchUrl(s, engine) }
       }))
     }
@@ -826,41 +854,91 @@ Item {
     if (Web.detectUrl(q)) return []
     var engine = String(root.settings.searchEngine || "g")
     return [root.row({
-      key: "web.fallback", section: "Search the Web", kind: "url",
+      key: "web.fallback", kind: "url",
       title: "Search " + Web.engineName(engine) + " for “" + q + "”",
       subtitle: "",
-      accessory: Web.engineName(engine),
+      accessory: "Web",
       icon: Web.engineIcon(engine),
       primaryLabel: "Search " + Web.engineName(engine),
+      resultType: "web",
+      textMatch: Fuzzy.MATCH_RESIDUAL,
       payload: { url: Web.searchUrl(q, engine) }
     })]
+  }
+
+  function filterHintRow(parsed) {
+    return root.row({
+      key: "filter.hint", kind: "noop",
+      title: "Type a search after “" + parsed.raw + "”",
+      subtitle: "This filter searches " + parsed.filter + " results only",
+      accessory: "Hint", icon: "󰋼", primaryLabel: "",
+      textMatch: Fuzzy.MATCH_EXACT
+    })
+  }
+
+  function globallyRank(list, q) {
+    var now = Date.now()
+    var context = Query.contextKey(Query.parse(root.query))
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i]
+      if (row.textMatch < 0) {
+        var matched = Fuzzy.score(row, row.matchText || q)
+        row.textMatch = matched >= 0 ? matched : Fuzzy.MATCH_RESIDUAL
+      }
+      var bonus = Frecency.bonuses(root.usage, row.stableId, context, now,
+        root.settings.learningEnabled)
+      row.recencyBonus = bonus.recency
+      row.frequencyBonus = bonus.frequency
+      row.contextBonus = bonus.context
+    }
+    var limit = Util.clamp(root.settings.maxResults, 8, root.maxGlobalResults)
+    return Ranking.rank(list, limit)
   }
 
   // ------------------------------------------------------------- assembly
   function rebuild() {
     var q = String(root.query || "").trim()
+    var parsed = Query.parse(q)
 
     var next = []
     function push(list) { for (var i = 0; i < list.length; i++) next.push(list[i]) }
 
-    var fileTarget = root.settings.fileSearch ? root.fileSearchTarget(q) : null
-    if (fileTarget && fileTarget.explicit) {
-      // A file keyword is an explicit provider choice, just like the clipboard
-      // prefix. Keep unrelated matches from burying the result it requested.
-      push(root.fileResultRows(q))
+    if (parsed.empty) {
+      next.push(root.filterHintRow(parsed))
+    } else if (parsed.filter) {
+      var searchable = parsed.text.length >= 2
+      if (parsed.filter === "app" && searchable) push(root.appRows(parsed.text))
+      else if (parsed.filter === "window" && searchable) push(root.windowRows(parsed.text))
+      else if (parsed.filter === "file") push(root.fileResultRows(q))
+      else if (parsed.filter === "action" && searchable) push(root.commandRows(parsed.text, true))
+      else if (parsed.filter === "clipboard") push(root.clipboardResultRows(q))
+      else if (parsed.filter === "web") {
+        push(root.intentRows(parsed.text, "web"))
+        push(root.bangRows(parsed.text))
+        push(root.suggestionResultRows(q))
+        push(root.webFallbackRows(parsed.text))
+      } else if (parsed.filter === "calc" || parsed.filter === "unit"
+          || parsed.filter === "reminder" || parsed.filter === "calendar") {
+        push(root.intentRows(parsed.text, parsed.filter))
+      }
+    } else if (!q) {
+      push(root.idleRows())
     } else {
-      push(root.intentRows(q))
-      push(root.clipboardResultRows(q))
+      push(root.intentRows(q, ""))
       push(root.reminderListRows(q))
-      push(root.appRows(q))
-      push(root.windowRows(q))
+      if (q.length >= 2) {
+        push(root.appRows(q))
+        push(root.windowRows(q))
+        push(root.commandRows(q, false))
+        push(root.fileResultRows(q))
+        push(root.clipboardResultRows(q))
+      }
       push(root.bangRows(q))
-      push(root.commandRows(q))
-      push(root.fileResultRows(q))
       push(root.suggestionResultRows(q))
       push(root.webFallbackRows(q))
     }
 
+    next = root.globallyRank(next, parsed.text)
     root.rows = next
 
     displayModel.clear()
@@ -868,7 +946,6 @@ Item {
       var r = next[j]
       displayModel.append({
         rowIndex: j,
-        section: r.section,
         rowTitle: r.title,
         rowSubtitle: r.subtitle,
         rowAccessory: r.accessory,
@@ -1001,16 +1078,15 @@ Item {
       return
     }
     root.armedKey = ""
+    if (!secondary && r.kind !== "spotlight-reset") root.bumpUsage(r)
 
     switch (r.kind) {
     case "app":
-      root.bumpUsage(r.key)
       root.dismiss()
       root.launchApp(r.payload.appId, r.payload.name)
       break
 
     case "shell":
-      root.bumpUsage(r.key)
       root.dismiss()
       // execArgv, not execDetached: the catalogue holds argv vectors rather
       // than command lines, so nothing here is ever re-tokenized by a shell.
@@ -1019,13 +1095,11 @@ Item {
       break
 
     case "url":
-      root.bumpUsage(r.key)
       root.dismiss()
       root.openUrl(r.payload.url)
       break
 
     case "summon":
-      root.bumpUsage(r.key)
       root.dismiss()
       if (root.shell && typeof root.shell.summon === "function")
         root.shell.summon(r.payload.id, "{}")
@@ -1076,6 +1150,38 @@ Item {
       root.dismiss()
       if (secondary) root.openPath(r.payload.dir)
       else root.openPath(r.payload.path)
+      break
+
+    case "spotlight-settings":
+      root.dismiss()
+      maintenanceProc.running = false
+      maintenanceProc.action = "settings"
+      maintenanceProc.command = root.helperArgv(["ensure-settings"])
+      maintenanceProc.running = true
+      break
+
+    case "spotlight-plugin":
+      root.dismiss()
+      root.openPath(root.pluginFolder)
+      break
+
+    case "spotlight-data":
+      root.dismiss()
+      maintenanceProc.running = false
+      maintenanceProc.action = "data"
+      maintenanceProc.command = root.helperArgv(["ensure-data"])
+      maintenanceProc.running = true
+      break
+
+    case "spotlight-reset":
+      root.dismiss()
+      root.pendingUsage = ""
+      usageReadProc.running = false
+      usageWriteProc.running = false
+      maintenanceProc.running = false
+      maintenanceProc.action = "reset"
+      maintenanceProc.command = root.helperArgv(["reset-usage"])
+      maintenanceProc.running = true
       break
     }
   }
@@ -1142,8 +1248,10 @@ Item {
 
   function fileSearchTarget(q) {
     var s = String(q || "").trim()
-    var m = s.match(/^(?:f|file|files)\s+(\S.*)$/i)
-    if (m) return { pattern: m[1].trim(), dir: root.home, explicit: true }
+    var parsed = Query.parse(s)
+    if (parsed.filter === "file")
+      return parsed.empty ? null : { pattern: parsed.text, dir: root.home, explicit: true }
+    if (parsed.filter) return null
     if (/^~\//.test(s) || /^\//.test(s)) {
       var slash = s.lastIndexOf("/")
       var dir = s.slice(0, slash + 1).replace(/^~/, root.home)
@@ -1155,7 +1263,7 @@ Item {
     // explicit (it does not scope the results to files only) nor treated like
     // one for the web-suggestions guard below (it did not ask for files, it
     // just also got them).
-    if (root.settings.fileSearchAlways && s.length >= 1) {
+    if (root.settings.fileSearchAlways && s.length >= 2) {
       return { pattern: s, dir: root.home, explicit: false, implicit: true }
     }
     return null
@@ -1171,6 +1279,7 @@ Item {
       var f = list[i]
       if (!f || !f.path) continue
       candidates.push({
+        id: String(f.id || ""),
         path: String(f.path),
         name: String(f.name || ""),
         dir: String(f.dir || "/"),
@@ -1205,7 +1314,8 @@ Item {
     if (root.opened) root.rebuild()
   }
 
-  function loadClipboard(raw) {
+  function loadClipboard(raw, forQuery) {
+    if (forQuery !== String(root.query || "").trim()) return
     var reply = root.helperReply(raw)
     var list = (reply && Array.isArray(reply.items)) ? reply.items : []
     var out = []
@@ -1215,6 +1325,7 @@ Item {
       out.push({ index: Util.clamp(item.index, 0, 1000), title: item.title })
     }
     root.clipboardRows = out
+    root.clipboardFor = forQuery
     if (root.opened) root.rebuild()
   }
 
@@ -1228,15 +1339,19 @@ Item {
     typingGuard.restart()
 
     var q = String(root.query || "").trim()
+    var parsed = Query.parse(q)
 
     // The clipboard list is fetched while a clipboard query is on screen and
     // dropped the moment it is not, so the titles are resident for the length
     // of the query rather than the length of the session.
-    if (root.clipboardQuery(q)) {
+    var clipboardTarget = root.clipboardSearchTarget(q)
+    if (clipboardTarget) {
+      clipboardDebounce.forQuery = q
       clipboardDebounce.restart()
     } else {
       clipboardDebounce.stop()
       if (root.clipboardRows.length > 0) root.clipboardRows = []
+      root.clipboardFor = ""
     }
 
     var target = root.settings.fileSearch ? root.fileSearchTarget(q) : null
@@ -1253,13 +1368,16 @@ Item {
     // A fileSearchAlways match is passive — the query never asked for files,
     // it just also got them — so unlike an explicit "f " prefix or a typed
     // path, it must not be the thing that silences web suggestions too.
+    var suggestionText = parsed.filter === "web" ? parsed.text : q
     var fileSuggestGuard = root.fileSearchTarget(q)
-    var wantSuggestions = root.settings.webSuggestions && q.length >= 2
-      && !Web.detectUrl(q) && !Web.bang(q) && !Calc.evaluate(q)
-      && !NaturalTime.isReminderQuery(q) && !NaturalTime.isEventQuery(q)
-      && !root.clipboardQuery(q) && !(fileSuggestGuard && !fileSuggestGuard.implicit)
+    var wantSuggestions = root.settings.webSuggestions && suggestionText.length >= 2
+      && (!parsed.filter || parsed.filter === "web")
+      && !Web.detectUrl(suggestionText) && !Web.bang(suggestionText) && !Calc.evaluate(suggestionText)
+      && !NaturalTime.isReminderQuery(suggestionText) && !NaturalTime.isEventQuery(suggestionText)
+      && !(fileSuggestGuard && !fileSuggestGuard.implicit)
     if (wantSuggestions) {
       suggestDebounce.forQuery = q
+      suggestDebounce.pattern = suggestionText
       suggestDebounce.restart()
       // Suggestions go stale the moment the query stops being a continuation
       // of the one that fetched them. Keeping the ones the new query still
@@ -1292,17 +1410,18 @@ Item {
     id: suggestDebounce
     interval: 220
     property string forQuery: ""
+    property string pattern: ""
     onTriggered: {
       suggestProc.running = false
       suggestProc.forQuery = suggestDebounce.forQuery
-      suggestProc.command = root.helperArgv(["suggest", suggestDebounce.forQuery])
+      suggestProc.command = root.helperArgv(["suggest", suggestDebounce.pattern])
       suggestProc.running = true
     }
   }
 
-  // The helper builds the endpoint itself and runs curl under a byte ceiling
-  // and its own deadline, so neither a slow endpoint nor an oversized response
-  // can hold or fill the shell process.
+  // The helper builds the endpoint itself and reads it under a byte ceiling
+  // and timeout, so neither a slow endpoint nor an oversized response can fill
+  // the shell process.
   Process {
     id: suggestProc
     property string forQuery: ""
@@ -1342,8 +1461,10 @@ Item {
   Timer {
     id: clipboardDebounce
     interval: 160
+    property string forQuery: ""
     onTriggered: {
       clipboardProc.running = false
+      clipboardProc.forQuery = clipboardDebounce.forQuery
       clipboardProc.command = root.helperArgv(["read-clipboard"])
       clipboardProc.running = true
     }
@@ -1351,9 +1472,10 @@ Item {
 
   Process {
     id: clipboardProc
+    property string forQuery: ""
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.loadClipboard(text)
+      onStreamFinished: root.loadClipboard(text, clipboardProc.forQuery)
     }
   }
 
@@ -1424,6 +1546,24 @@ Item {
     }
   }
 
+  Process {
+    id: maintenanceProc
+    property string action: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (!reply) return
+        if (maintenanceProc.action === "settings" && reply.path)
+          Util.execArgv(["omarchy", "launch", "editor", String(reply.path)])
+        else if (maintenanceProc.action === "data" && reply.path)
+          root.openPath(reply.path)
+        else if (maintenanceProc.action === "reset" && reply.reset === true)
+          root.usage = Frecency.emptyStore()
+      }
+    }
+  }
+
   Component.onCompleted: {
     if (root.appLibrary) root.appLibrary.refreshIcons()
     root.refreshSettings()
@@ -1443,6 +1583,7 @@ Item {
     usageReadProc.running = false
     usageWriteProc.running = false
     icsProc.running = false
+    maintenanceProc.running = false
   }
 
   Connections {
@@ -1709,30 +1850,6 @@ Item {
           currentIndex: root.selectedIndex
           highlightMoveDuration: 0
 
-          section.property: "section"
-          section.criteria: ViewSection.FullString
-          section.delegate: Item {
-            required property string section
-            width: ListView.view.width
-            height: root.sectionHeight
-
-            // Sentence case, not caps: it is what Raycast does, and a
-            // tracked-out all-caps label is the tell of a templated UI.
-            Text {
-              text: parent.section
-              textFormat: Text.PlainText
-              color: root.foreground
-              opacity: 0.45
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              font.weight: Font.Medium
-              anchors.left: parent.left
-              anchors.leftMargin: root.rowInset + root.listPadding
-              anchors.bottom: parent.bottom
-              anchors.bottomMargin: Style.space(7)
-            }
-          }
-
           // The delegate root spans the full view width and is left where the
           // view puts it: a vertical ListView positions its delegates itself
           // and overwrites any `x` set here, which would push the whole inset
@@ -1791,7 +1908,7 @@ Item {
               color: resultRow.hasCursor ? root.selectedText : root.foreground
               opacity: resultRow.hasCursor ? 1 : 0.75
               font.family: root.fontFamily
-              font.pixelSize: Style.font.icon
+              font.pixelSize: Style.font.iconLarge
               width: Style.space(20)
               horizontalAlignment: Text.AlignHCenter
               anchors.left: rowSurface.left
@@ -1932,19 +2049,10 @@ Item {
     }
   }
 
-  // Total height the result list wants, headers included. Driving the card
+  // Total height the result list wants. Driving the card
   // height off this is what gives the panel the Raycast grow/shrink feel.
   readonly property int contentHeight: {
     if (displayModel.count === 0) return 0
-    var total = 0
-    var lastSection = ""
-    for (var i = 0; i < root.rows.length; i++) {
-      if (root.rows[i].section !== lastSection) {
-        total += root.sectionHeight
-        lastSection = root.rows[i].section
-      }
-      total += root.rowHeight
-    }
-    return total
+    return root.rows.length * root.rowHeight
   }
 }

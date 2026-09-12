@@ -84,6 +84,17 @@ test("a term fd admitted only via regex still ranks, never dropped", () => {
   assert.equal(ranked.length, 2)
 })
 
+test("file names share the metadata/acronym tier before residual", () => {
+  assert.equal(
+    FileRank.nameTier("Visual Studio Code.desktop", "vsc"),
+    FileRank.FILE_TIER_METADATA
+  )
+  assert.equal(
+    FileRank.nameTier("report.txt", "docs"),
+    FileRank.FILE_TIER_RESIDUAL
+  )
+})
+
 test("browsing (path-typed, pattern '.') still applies the path penalty", () => {
   // Regression: browsing must skip the *tier* (there is no term to match)
   // but not the *penalty* - depth/hidden still has to separate a shallow
