@@ -280,7 +280,7 @@ metadata / acronym
 residual
 ```
 
-Results are then ranked globally using:
+Matching types are ordered as Intent, App, Window, Action, File, Clipboard, then Web. Within each type, results are ranked using:
 
 ```text
 textMatch × typeWeight + recency + frequency + queryContext
@@ -306,7 +306,7 @@ Frequency        50
 Query context   110
 ```
 
-That is intentionally enough to rearrange close results, but not enough for a weak personalized result to beat a substantially better exact match.
+That is intentionally enough to rearrange close results within a type, but not enough for a weak personalized result to beat a substantially better exact match there.
 
 Equal scores use deterministic title and stable-ID tie breakers.
 
@@ -474,6 +474,8 @@ These providers are enabled by default:
 ```
 
 With the `Always` options enabled, file and clipboard results join normal searches once the query reaches two characters.
+
+To keep mixed searches mixed, passive file search contributes at most four rows and at most half the configured list. Explicit `f:` and path searches retain the full file result cap.
 
 One-character searches only run them when you explicitly use a file or clipboard prefix.
 

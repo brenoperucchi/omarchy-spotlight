@@ -10,6 +10,7 @@ const qml = fs.readFileSync(path.join(__dirname, "..", "Spotlight.qml"), "utf8")
 test("the displayed model is one globally ranked, globally capped list", () => {
   assert.match(qml, /next = root\.globallyRank\(next, parsed\.text\)/)
   assert.match(qml, /Util\.clamp\(root\.settings\.maxResults, 8, root\.maxGlobalResults\)/)
+  assert.match(qml, /var limit = target\.implicit\s*\? Math\.min\(root\.maxUnifiedFileRows/)
   assert.doesNotMatch(qml, /section\.delegate/)
 })
 
