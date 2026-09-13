@@ -194,6 +194,7 @@ Item {
   readonly property int rowRadius: Style.space(8)
   readonly property int searchHeight: Style.space(56)
   readonly property int rowHeight: Style.space(40)
+  readonly property int sectionHeight: Style.space(24)
   readonly property int footerHeight: Style.space(36)
   readonly property int maxListHeight: Style.space(400)
   readonly property int hairline: Style.spacing.hairline
@@ -548,12 +549,17 @@ Item {
   function bangRows(q) {
     var bang = Web.bang(q)
     if (!bang) return []
+    // "tr … to german" drops the target off the end of the query, so the row has
+    // to show what is actually going to be translated and where it is going.
+    var target = bang.key === "tr" ? Web.translation(bang.query) : null
+    var text = target ? target.text : bang.query
+    var label = target ? "Translate to " + target.name : "Search " + bang.engine.name
     return [root.row({
       key: "bang." + bang.key, kind: "url",
-      title: bang.query, subtitle: "Search " + bang.engine.name,
+      title: text, subtitle: label,
       accessory: "Web", icon: bang.engine.icon,
-      primaryLabel: "Search " + bang.engine.name,
-      matchText: bang.query,
+      primaryLabel: label,
+      matchText: text,
       resultType: "web",
       payload: { url: Web.searchUrl(bang.query, bang.key) }
     })]
@@ -920,6 +926,22 @@ Item {
     return Ranking.rank(list, limit)
   }
 
+  function resultSection(row) {
+    if (!row || row.key === "filter.hint") return ""
+    if (row.resultType === "app") return "Applications"
+    if (row.resultType === "window") return "Windows"
+    if (row.resultType === "action") return "Commands"
+    if (row.resultType === "file") return "Files"
+    if (row.resultType === "clipboard") return "Clipboard"
+    if (row.resultType === "web") return "Web"
+    if (row.kind === "event") return "Calendar"
+    if (row.key.indexOf("reminder.") === 0) return "Reminders"
+    if (row.key === "calc") return "Calculator"
+    if (row.key === "unit") return "Conversions"
+    if (row.kind === "url") return "Direct links"
+    return "Results"
+  }
+
   // ------------------------------------------------------------- assembly
   function rebuild() {
     var q = String(root.query || "").trim()
@@ -977,6 +999,7 @@ Item {
         rowIcon: r.icon,
         rowImage: r.image,
         rowMono: r.mono,
+        rowSection: root.resultSection(r),
         selectable: r.kind !== "noop"
       })
     }
@@ -1874,6 +1897,25 @@ Item {
           boundsBehavior: Flickable.StopAtBounds
           currentIndex: root.selectedIndex
           highlightMoveDuration: 0
+          section.property: "rowSection"
+          section.delegate: Item {
+            required property string section
+
+            width: resultList.width
+            height: section.length > 0 ? root.sectionHeight : 0
+
+            Text {
+              text: parent.section
+              textFormat: Text.PlainText
+              color: root.foreground
+              opacity: 0.5
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              anchors.left: parent.left
+              anchors.leftMargin: root.gutter
+              anchors.verticalCenter: parent.verticalCenter
+            }
+          }
 
           // The delegate root spans the full view width and is left where the
           // view puts it: a vertical ListView positions its delegates itself
@@ -2078,6 +2120,13 @@ Item {
   // height off this is what gives the panel the Raycast grow/shrink feel.
   readonly property int contentHeight: {
     if (displayModel.count === 0) return 0
-    return root.rows.length * root.rowHeight
+    var height = root.rows.length * root.rowHeight
+    var previous = ""
+    for (var i = 0; i < root.rows.length; i++) {
+      var section = root.resultSection(root.rows[i])
+      if (section && section !== previous) height += root.sectionHeight
+      previous = section
+    }
+    return height
   }
 }

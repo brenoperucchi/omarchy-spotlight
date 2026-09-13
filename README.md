@@ -89,6 +89,8 @@ You do not have to decide which kind of search you are doing before you start ty
 
 From two characters onward, Spotlight can search local providers together, merge their results, rank them globally, and put the most likely result at the top.
 
+Compact section labels keep applications, windows, commands, files, clipboard entries, and web results visually distinct without splitting the combined result list.
+
 So the same input can find an application, an already-open window, a file, a command, or something from your clipboard.
 
 Press Enter and the selected result performs its primary action.
@@ -118,6 +120,7 @@ Press Enter and the selected result performs its primary action.
 | `gh quickshell` | Searches GitHub |
 | `yt lofi` | Searches YouTube |
 | `aw hyprland` | Searches ArchWiki |
+| `tr what is this to german` | Translates, into the language you name |
 | `example.com` | Opens the URL directly |
 | `localhost:3000` | Opens the local URL |
 | anything else | Offers a web search |
@@ -199,6 +202,12 @@ calc: 125 * 1.19
 A filter without a query shows a hint instead of launching an unnecessarily broad search.
 
 The space-separated `w query` syntax remains the Wikipedia bang; `w:` is the window filter.
+
+The `tr` bang reads an optional target language off the end of the query, so
+`tr what is this to german` translates just `what is this`. `to`, `in` and `into`
+all work, and the language can be a name or a code (`german`, `de`, `pt-br`).
+Without one it opens English to German. The source language is always
+auto-detected, so `tr wie geht es dir to english` goes the other way.
 
 ---
 
