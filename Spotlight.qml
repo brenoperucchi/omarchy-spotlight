@@ -1743,11 +1743,22 @@ Item {
         } else if (!reply) {
           root.bindingState = "error"
         } else {
-          Util.execArgv(["hyprctl", "reload"])
-          root.bindingState = bindingProc.action === "write" ? "ok" : "reverted"
-          root.readBinding()
+          bindingReloadProc.action = bindingProc.action
+          bindingReloadProc.command = ["hyprctl", "reload"]
+          bindingReloadProc.running = true
         }
       }
+    }
+  }
+
+  Process {
+    id: bindingReloadProc
+    property string action: ""
+    onExited: function(exitCode) {
+      root.bindingState = exitCode === 0
+        ? (bindingReloadProc.action === "write" ? "ok" : "reverted")
+        : "reloadError"
+      root.readBinding()
     }
   }
 
@@ -1780,6 +1791,7 @@ Item {
     icsProc.running = false
     maintenanceProc.running = false
     bindingProc.running = false
+    bindingReloadProc.running = false
     settingsWriteProc.running = false
   }
 

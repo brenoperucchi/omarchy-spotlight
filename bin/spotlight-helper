@@ -122,9 +122,13 @@ TOGGLE_CMD = "omarchy-shell shell toggle io.github.maajix.spotlight '{}'"
 # literal. A bind carrying a query payload is a different shortcut and is
 # left alone.
 TOGGLE_RE = re.compile(
-    r'''^\s*o\.bind\(\s*"([^"]+)"\s*,.*omarchy-shell shell toggle io\.github\.maajix\.spotlight'''
-    r'''(?:\s*'\{\}')?\s*"\s*[,)]''')
+    r'''^\s*o\.bind\(\s*(?P<chord_quote>["'])(?P<chord>[^"']+)(?P=chord_quote)\s*,.*?'''
+    r'''(?P<command_quote>["'])omarchy-shell shell toggle io\.github\.maajix\.spotlight'''
+    r'''(?:\s+["']?\{\}["']?)?(?P=command_quote)\s*[,)]''')
+UNBIND_RE = re.compile(r'''^\s*hl\.unbind\(\s*["']([^"']+)["']\s*\)''')
 CHORD_MODS = ("SUPER", "CTRL", "ALT", "SHIFT")
+CHORD_ALIASES = {"WIN": "SUPER", "LOGO": "SUPER", "MOD4": "SUPER",
+                 "CONTROL": "CTRL", "MOD1": "ALT"}
 # Canonical chord as written into bindings.lua: modifiers in CHORD_MODS
 # order, then exactly one key.
 CHORD_RE = re.compile(
@@ -1606,14 +1610,20 @@ def cmd_write_settings():
         if not isinstance(existing, dict):
             # A hand edit that no longer parses is never overwritten.
             raise Denied("spotlight.json is not a JSON object")
-        for key in normalize_settings({}):
+        known = normalize_settings({})
+        for key in known:
             if key in patch:
                 existing[key] = patch[key]
         settings = normalize_settings(existing)
-        existing.update(settings)
+        for key in known:
+            if key in patch:
+                existing[key] = settings[key]
+        payload = (json.dumps(existing, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        if len(payload) > SETTINGS_BYTES:
+            raise Denied("spotlight.json would be larger than %d bytes" % SETTINGS_BYTES)
         # ponytail: no lock - Spotlight.qml funnels every write through one
         # Process; wrap in lock_at() if a second writer ever appears.
-        write_atomic(fd, "spotlight.json", (json.dumps(existing, indent=2) + "\n").encode("utf-8"))
+        write_atomic(fd, "spotlight.json", payload)
     finally:
         os.close(fd)
     emit({"settings": settings})
@@ -1642,7 +1652,8 @@ def _write_bindings(dirfd, lines):
 
 def _canon_chord(text):
     """'SUPER SHIFT CTRL + SPACE' or 'ctrl+space' -> 'SUPER + CTRL + SHIFT + SPACE'; None if malformed."""
-    parts = [p for p in re.split(r"[\s+]+", str(text).upper()) if p]
+    parts = [CHORD_ALIASES.get(p, p)
+             for p in re.split(r"[\s+]+", str(text).upper()) if p]
     keys = [p for p in parts if p not in CHORD_MODS]
     if len(keys) != 1:
         return None
@@ -1655,10 +1666,10 @@ def _bound_chords():
         raw, truncated = run_bounded(["omarchy-menu-keybindings", "--print"],
                                      BINDINGS_PRINT_BYTES, BINDINGS_PRINT_DEADLINE)
     except Denied:
-        return {}
-    lines = raw.decode("utf-8", "replace").split("\n")
+        return None
     if truncated:
-        lines = lines[:-1]
+        return None
+    lines = raw.decode("utf-8", "replace").split("\n")
     bound = {}
     for line in lines:
         left, arrow, desc = line.partition("\u2192")
@@ -1670,17 +1681,69 @@ def _bound_chords():
 
 def _strip_managed(lines):
     """Drop the managed block and the blank line before it. -> (lines, block contents)"""
-    if MARK_START not in lines:
+    start = next((i for i, line in enumerate(lines) if line.strip() == MARK_START), None)
+    if start is None:
         return lines, []
-    start = lines.index(MARK_START)
-    try:
-        end = lines.index(MARK_END, start)
-    except ValueError:
+    end = next((i for i in range(start, len(lines)) if lines[i].strip() == MARK_END), None)
+    if end is None:
         raise Denied("managed block in bindings.lua is not closed")
     block = lines[start + 1:end]
-    if start and lines[start - 1] == "":
+    if start and lines[start - 1].strip() == "":
         start -= 1
     return lines[:start] + lines[end + 1:], block
+
+
+def _lua_call_end(lines, start):
+    """Return the last line of an o.bind call, ignoring parentheses inside strings."""
+    depth = 0
+    quote = None
+    escaped = False
+    opened = False
+    for end in range(start, len(lines)):
+        line = lines[end]
+        i = line.find("o.bind") if end == start else 0
+        while i < len(line):
+            char = line[i]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+            elif line.startswith("--", i):
+                break
+            elif char in "\"'":
+                quote = char
+            elif char == "(":
+                depth += 1
+                opened = True
+            elif char == ")":
+                depth -= 1
+                if opened and depth == 0:
+                    return end
+            i += 1
+    raise Denied("Spotlight binding in bindings.lua is not closed")
+
+
+def _disable_toggle_calls(lines):
+    """Comment every line of each live Spotlight toggle call."""
+    lines = list(lines)
+    i = 0
+    while i < len(lines):
+        match = TOGGLE_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        end = _lua_call_end(lines, i)
+        if i:
+            unbind = UNBIND_RE.match(lines[i - 1])
+            if unbind and _canon_chord(unbind.group(1)) == _canon_chord(match.group("chord")):
+                lines[i - 1] = DISABLED_PREFIX + lines[i - 1]
+        for line_no in range(i, end + 1):
+            lines[line_no] = DISABLED_PREFIX + lines[line_no]
+        i = end + 1
+    return lines
 
 
 def cmd_read_binding():
@@ -1695,16 +1758,16 @@ def cmd_read_binding():
     finally:
         os.close(fd)
     for line in lines:
-        if line == MARK_START:
+        if line.strip() == MARK_START:
             reply["managed"] = True
         elif line.startswith(DISABLED_PREFIX):
             old = TOGGLE_RE.match(line[len(DISABLED_PREFIX):])
             if old and reply["previous"] is None:
-                reply["previous"] = old.group(1)
+                reply["previous"] = old.group("chord")
         else:
             live = TOGGLE_RE.match(line)
             if live and reply["current"] is None:
-                reply["current"] = live.group(1)
+                reply["current"] = live.group("chord")
     emit(reply)
 
 
@@ -1715,20 +1778,28 @@ def cmd_write_binding(argv):
     unbind = 'hl.unbind("%s")' % chord
     fd = _hypr_dir()
     try:
-        lines = _bindings_lines(fd) or [""]
-        own = {_canon_chord(m.group(1)) for m in map(TOGGLE_RE.match, lines) if m}
+        original = _bindings_lines(fd)
+        new_file = original is None
+        lines = original or [""]
+        own = {_canon_chord(m.group("chord")) for m in map(TOGGLE_RE.match, lines) if m}
         lines, block = _strip_managed(lines)
-        lines = [DISABLED_PREFIX + line if TOGGLE_RE.match(line) else line for line in lines]
-        if lines[-1] != "":
-            lines.append("")
-        body = lines[:-1]
+        lines = _disable_toggle_calls(lines)
         # Unbind a chord someone else holds, and keep an unbind the previous
         # block already carried: hyprctl reload rebuilds every default, so
         # "not bound right now" may only mean our own block removed it.
-        unbound = unbind in block or (chord in _bound_chords() and chord not in own)
+        bound = _bound_chords()
+        unbound = (any(line.strip() == unbind for line in block) or bound is None
+                   or (chord in bound and chord not in own))
         block = [MARK_START] + ([unbind] if unbound else []) + [
-            'o.bind("%s", "Spotlight", "%s")' % (chord, TOGGLE_CMD), MARK_END, ""]
-        _write_bindings(fd, body + ([""] if body else []) + block)
+            'o.bind("%s", "Spotlight", "%s")' % (chord, TOGGLE_CMD), MARK_END]
+        body = "\n".join(lines)
+        trailing_newline = body.endswith("\n")
+        if body:
+            body += "\n" if trailing_newline else "\n\n"
+        body += "\n".join(block)
+        if trailing_newline or new_file:
+            body += "\n"
+        _write_bindings(fd, body.split("\n"))
     finally:
         os.close(fd)
     emit({"chord": chord, "unbound": unbound,
@@ -1749,7 +1820,7 @@ def cmd_revert_binding():
                 lines[i] = line = line[len(DISABLED_PREFIX):]
                 live = TOGGLE_RE.match(line)
                 if live and restored is None:
-                    restored = live.group(1)
+                    restored = live.group("chord")
         if lines != original:
             _write_bindings(fd, lines)
     finally:

@@ -29,7 +29,7 @@ FocusScope {
   property string previousBinding: ""
   property bool bindingManaged: false
   property var boundChords: ({})
-  property string bindingState: ""   // "" | busy | ok | reverted | error
+  property string bindingState: ""   // "" | busy | ok | reverted | error | reloadError
 
   // owned
   property int step: 0
@@ -71,6 +71,7 @@ FocusScope {
   readonly property string statusText: bindingState === "busy" ? "Saving..."
       : bindingState === "ok" ? "Shortcut set to " + currentBinding
       : bindingState === "reverted" ? (currentBinding ? "Restored " + currentBinding : "Shortcut removed")
+      : bindingState === "reloadError" ? "Shortcut saved, but Hyprland could not reload it."
       : bindingState === "error" ? "Could not write the shortcut. Edit ~/.config/hypr/bindings.lua by hand." : ""
 
   // palette
@@ -942,7 +943,8 @@ FocusScope {
           Text {
             Layout.fillWidth: true
             text: tour.statusText
-            color: tour.bindingState === "error" ? Color.urgent : tour.dim
+            color: tour.bindingState === "error" || tour.bindingState === "reloadError"
+                   ? Color.urgent : tour.dim
             font.family: tour.fontFamily
             font.pixelSize: Style.font.body
             wrapMode: Text.WordWrap
@@ -951,7 +953,6 @@ FocusScope {
           Pill {
             id: undoBtn
             visible: tour.bindingManaged && tour.bindingState !== "busy"
-                     && (tour.previousBinding !== "" || tour.bindingState === "ok")
             text: tour.bindingState === "ok" || tour.previousBinding === "" ? "Undo" : "Restore " + tour.previousBinding
             onClicked: tour.revertRequested()
           }

@@ -440,6 +440,35 @@ class SettingsWriteTests(unittest.TestCase):
             self.assertTrue(reply["settings"]["webSuggestions"])
             self.assertTrue((home / ".config" / "omarchy" / "spotlight.json").exists())
 
+    def test_write_settings_only_persists_patched_keys(self):
+        with fake_home() as home:
+            run(HELPER.cmd_write_settings, stdin=b'{"setupCompleted": true}')
+            path = home / ".config" / "omarchy" / "spotlight.json"
+            self.assertEqual(json.loads(path.read_text()), {"setupCompleted": True})
+
+    def test_write_settings_stays_readable_with_large_utf8_values(self):
+        with fake_home() as home:
+            cfg = home / ".config" / "omarchy"
+            cfg.mkdir(parents=True)
+            path = cfg / "spotlight.json"
+            custom = "\u4e16" * 13000
+            path.write_text(json.dumps({"custom": custom}, ensure_ascii=False))
+            run(HELPER.cmd_write_settings, stdin=b'{"setupCompleted": true}')
+            self.assertLessEqual(path.stat().st_size, HELPER.SETTINGS_BYTES)
+            self.assertEqual(json.loads(path.read_text())["custom"], custom)
+            self.assertTrue(run(HELPER.cmd_read_settings)["ok"])
+
+    def test_write_settings_refuses_an_oversized_serialization(self):
+        with fake_home() as home:
+            cfg = home / ".config" / "omarchy"
+            cfg.mkdir(parents=True)
+            path = cfg / "spotlight.json"
+            original = json.dumps({"custom": [0] * 15000}, separators=(",", ":"))
+            path.write_text(original)
+            with self.assertRaises(HELPER.Denied):
+                run(HELPER.cmd_write_settings, stdin=b'{"setupCompleted": true}')
+            self.assertEqual(path.read_text(), original)
+
     def test_write_settings_refuses_bad_input_and_corrupt_file(self):
         with fake_home() as home:
             cfg = home / ".config" / "omarchy"
@@ -485,6 +514,8 @@ class BindingTests(unittest.TestCase):
             "SUPER SHIFT CTRL + SPACE": "SUPER + CTRL + SHIFT + SPACE",
             "ctrl+space": "CTRL + SPACE",
             "SHIFT + SUPER + K": "SUPER + SHIFT + K",
+            "win + control + space": "SUPER + CTRL + SPACE",
+            "mod4 mod1 + k": "SUPER + ALT + K",
             "PRINT": "PRINT",
             "SUPER + A + B": None,
             "SUPER": None,
@@ -512,7 +543,7 @@ class BindingTests(unittest.TestCase):
         with fake_home():
             reply = run(HELPER.cmd_read_binding)
             self.assertEqual(reply, {"current": None, "previous": None,
-                                     "managed": False, "bound": {}, "ok": True})
+                                     "managed": False, "bound": None, "ok": True})
 
     def test_write_binding_validates_chord(self):
         with fake_home() as home:
@@ -542,6 +573,58 @@ class BindingTests(unittest.TestCase):
             self.assertEqual((reply["current"], reply["previous"], reply["managed"]),
                              ("SUPER + SPACE", "CTRL + SPACE", True))
 
+    def test_write_binding_disables_a_whole_multiline_call_and_reverts_exactly(self):
+        original = "\n".join([
+            "-- no trailing newline",
+            'o.bind("CTRL + SPACE", "Spotlight", "%s",' % TOGGLE,
+            "  {})",
+        ])
+        with fake_home() as home:
+            path = self._hypr(home, original)
+            run(HELPER.cmd_write_binding, ["ALT + SPACE"])
+            written = path.read_text()
+            self.assertIn(HELPER.DISABLED_PREFIX + 'o.bind("CTRL + SPACE"', written)
+            self.assertIn(HELPER.DISABLED_PREFIX + "  {})", written)
+            self.assertEqual(run(HELPER.cmd_revert_binding)["restored"], "CTRL + SPACE")
+            self.assertEqual(path.read_text(), original)
+
+    def test_single_quoted_toggle_is_recognized(self):
+        original = (
+            "hl.unbind('CTRL + SPACE')\n"
+            "o.bind('CTRL + SPACE', 'Spotlight', "
+            "'omarchy-shell shell toggle io.github.maajix.spotlight')"
+        )
+        with fake_home() as home:
+            path = self._hypr(home, original)
+            run(HELPER.cmd_write_binding, ["ALT + SPACE"])
+            self.assertIn(HELPER.DISABLED_PREFIX + "hl.unbind('CTRL + SPACE')",
+                          path.read_text())
+            self.assertEqual(run(HELPER.cmd_read_binding)["previous"], "CTRL + SPACE")
+            run(HELPER.cmd_revert_binding)
+            self.assertEqual(path.read_text(), original)
+
+    def test_managed_markers_tolerate_whitespace_and_crlf(self):
+        variants = {
+            "spaces": lambda text: text.replace(HELPER.MARK_START, "  " + HELPER.MARK_START + " ")
+                                         .replace(HELPER.MARK_END, "\t" + HELPER.MARK_END + "  "),
+            "crlf": lambda text: text.replace("\n", "\r\n"),
+        }
+        for name, transform in variants.items():
+            with self.subTest(name=name), fake_home() as home:
+                path = self._hypr(home)
+                run(HELPER.cmd_write_binding, ["SUPER + SPACE"])
+                path.write_bytes(transform(path.read_text()).encode())
+                run(HELPER.cmd_write_binding, ["ALT + SPACE"])
+                written = path.read_text()
+                self.assertNotIn('hl.unbind("SUPER + SPACE")', written)
+                self.assertNotIn('o.bind("SUPER + SPACE", "Spotlight"', written)
+
+    def test_write_binding_handles_an_empty_managed_block(self):
+        with fake_home() as home:
+            path = self._hypr(home, HELPER.MARK_START + "\n" + HELPER.MARK_END)
+            run(HELPER.cmd_write_binding, ["ALT + SPACE"])
+            self.assertIn('o.bind("ALT + SPACE", "Spotlight"', path.read_text())
+
     def test_unbind_only_when_someone_else_holds_the_chord(self):
         with fake_home() as home:
             self._hypr(home)
@@ -555,6 +638,13 @@ class BindingTests(unittest.TestCase):
             run(HELPER.cmd_write_binding, ["ALT + SPACE"])
             self.print_output = PRINT_FIXTURE.replace(b"\nCTRL + SPACE", b"\nALT + SPACE ")
             self.assertFalse(run(HELPER.cmd_write_binding, ["ALT + SPACE"])["unbound"])
+
+    def test_write_binding_unbinds_when_the_keybinding_list_is_unavailable(self):
+        self.print_output = None
+        with fake_home() as home:
+            path = self._hypr(home)
+            self.assertTrue(run(HELPER.cmd_write_binding, ["ALT + SPACE"])["unbound"])
+            self.assertIn('hl.unbind("ALT + SPACE")', path.read_text())
 
     def test_write_binding_refuses_missing_dir_and_unclosed_block(self):
         with fake_home():
