@@ -16,6 +16,7 @@ import "lib/Apps.js" as Apps
 import "lib/FileRank.js" as FileRank
 import "lib/Query.js" as Query
 import "lib/Ranking.js" as Ranking
+import "lib/Chord.js" as Chord
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -162,8 +163,18 @@ Item {
     learningEnabled: true,
     maxResults: 20,
     maxApps: 8,
-    maxSuggestions: 4
+    maxSuggestions: 4,
+    // true until the helper answers, so the tour never flashes before the
+    // first-run flag has actually been read.
+    setupCompleted: true
   })
+
+  // ------------------------------------------------------------- tour
+  // The setup tour replaces the search card inside the same PanelWindow.
+  // Spotlight.qml does all of the tour's I/O; SetupTour.qml only paints.
+  property bool tourActive: false
+  property string bindingState: ""
+  property var tourBinding: ({ current: "", previous: "", managed: false, bound: {} })
 
   // ------------------------------------------------------------- theme
   // Shares the [menu] surface tokens, so any theme that styles the Omarchy
@@ -225,6 +236,7 @@ Item {
     }
 
     root.opened = true
+    root.tourActive = false
     root.armedKey = ""
     root.rows = []
     root.pinnedKey = ""
@@ -251,8 +263,10 @@ Item {
     root.refreshReminders()
     root.rebuild()
     pointerGate.reset()
+    if (root.settings.setupCompleted === false || (tour.started && !tour.singleStep)) root.resumeTour()
     Qt.callLater(function() {
-      input.forceActiveFocus()
+      if (root.tourActive) tour.focusStep()
+      else input.forceActiveFocus()
       resultList.positionViewAtBeginning()
     })
   }
@@ -353,8 +367,90 @@ Item {
   }
 
   function toggle() {
+    // The current shortcut pressed while the recorder step is up: show it as
+    // "already your shortcut" instead of closing the tour.
+    if (root.opened && root.tourActive && tour.step === 1) {
+      tour.selected = root.tourBinding.current
+      return
+    }
     if (root.opened) root.dismiss()
     else root.open("{}")
+  }
+
+  // Re-raise an unfinished tour at the step the user left; fresh start otherwise.
+  function resumeTour() {
+    if (tour.started && !tour.singleStep) {
+      root.tourActive = true
+      root.readBinding()
+      tour.focusStep()
+    } else root.showTour(0, false)
+  }
+
+  // ------------------------------------------------------------- tour
+  function showTour(step, single) {
+    input.text = ""
+    root.armedKey = ""
+    root.bindingState = ""
+    root.tourActive = true
+    tour.start(root.settings, step, single)
+    root.readBinding()
+  }
+
+  // `patch` holds the settings keys to persist; {} means the tour was only
+  // looked at (single-step Done, or Esc on the shortcut chooser).
+  function finishTour(patch) {
+    root.tourActive = false
+    if (Object.keys(patch || {}).length > 0) {
+      settingsWriteProc.running = false
+      settingsWriteProc.stdinEnabled = true
+      settingsWriteProc.command = root.helperArgv(["write-settings"])
+      settingsWriteProc.running = true
+      settingsWriteProc.write(JSON.stringify(patch))
+      settingsWriteProc.stdinEnabled = false
+    }
+    Qt.callLater(function() { input.forceActiveFocus() })
+  }
+
+  function readBinding() {
+    bindingProc.running = false
+    bindingProc.action = "read"
+    bindingProc.command = root.helperArgv(["read-binding"])
+    bindingProc.running = true
+  }
+
+  function writeBinding(chord) {
+    root.bindingState = "busy"
+    bindingProc.running = false
+    bindingProc.action = "write"
+    bindingProc.command = root.helperArgv(["write-binding", chord])
+    bindingProc.running = true
+  }
+
+  function revertBinding() {
+    root.bindingState = "busy"
+    bindingProc.running = false
+    bindingProc.action = "revert"
+    bindingProc.command = root.helperArgv(["revert-binding"])
+    bindingProc.running = true
+  }
+
+  // Chords arrive in two spellings (bindings.lua and the keybindings menu),
+  // so every one is canonicalized before the tour compares them.
+  function loadBinding(reply) {
+    var bound = {}
+    var raw = (reply && reply.bound && typeof reply.bound === "object") ? reply.bound : {}
+    for (var key in raw) {
+      if (!Object.prototype.hasOwnProperty.call(raw, key)) continue
+      var chord = Chord.normalize(key)
+      if (chord && !Object.prototype.hasOwnProperty.call(bound, chord))
+        bound[chord] = String(raw[key]).slice(0, 80)
+    }
+    root.tourBinding = {
+      current: Chord.normalize(reply && reply.current ? reply.current : ""),
+      previous: Chord.normalize(reply && reply.previous ? reply.previous : ""),
+      managed: !!(reply && reply.managed === true),
+      bound: bound
+    }
   }
 
   // ------------------------------------------------------------- usage
@@ -419,8 +515,13 @@ Item {
       maxApps: isFinite(parsed.maxApps)
         ? Util.clamp(parsed.maxApps, 3, root.maxAppRows) : 8,
       maxSuggestions: isFinite(parsed.maxSuggestions)
-        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4
+        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4,
+      setupCompleted: parsed.setupCompleted !== false
     }
+    // First run: the flag usually lands after open() has already drawn the
+    // search card, so the tour is raised from here as well.
+    if (root.opened && !root.tourActive && root.settings.setupCompleted === false)
+      root.resumeTour()
   }
 
   // ------------------------------------------------------------- providers
@@ -1192,6 +1293,14 @@ Item {
       root.openPath(root.pluginFolder)
       break
 
+    case "spotlight-tour":
+      root.showTour(0, false)
+      break
+
+    case "spotlight-shortcut":
+      root.showTour(1, true)
+      break
+
     case "spotlight-data":
       root.dismiss()
       maintenanceProc.running = false
@@ -1591,6 +1700,37 @@ Item {
     }
   }
 
+  // Separate from maintenanceProc: a failed write must surface as an error
+  // state instead of being swallowed, and a settings write must never cancel
+  // an in-flight binding write.
+  Process {
+    id: bindingProc
+    property string action: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (bindingProc.action === "read") {
+          root.loadBinding(reply)
+        } else if (!reply) {
+          root.bindingState = "error"
+        } else {
+          Util.execArgv(["hyprctl", "reload"])
+          root.bindingState = bindingProc.action === "write" ? "ok" : "reverted"
+          root.readBinding()
+        }
+      }
+    }
+  }
+
+  Process {
+    id: settingsWriteProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (root.helperReply(text)) root.loadSettings(text)
+    }
+  }
+
   Component.onCompleted: {
     if (root.appLibrary) root.appLibrary.refreshIcons()
     root.refreshSettings()
@@ -1611,6 +1751,8 @@ Item {
     usageWriteProc.running = false
     icsProc.running = false
     maintenanceProc.running = false
+    bindingProc.running = false
+    settingsWriteProc.running = false
   }
 
   Connections {
@@ -1712,6 +1854,9 @@ Item {
 
     Rectangle {
       id: card
+      // Hidden items cannot hold focus, which is what keeps keystrokes away
+      // from the search input while the tour is up.
+      visible: !root.tourActive
 
       readonly property int listHeight: Math.min(root.maxListHeight, root.contentHeight)
       readonly property bool hasResults: displayModel.count > 0
@@ -2092,6 +2237,29 @@ Item {
           }
         }
       }
+    }
+
+    SetupTour {
+      id: tour
+      visible: root.tourActive
+      anchors.centerIn: parent
+      foreground: root.foreground
+      accent: root.accent
+      fontFamily: root.fontFamily
+      surface: root.glassBackground
+      surfaceBorder: root.glassBorder
+      sheen: root.glassSheen
+      hairline: root.hairline
+      surfaceRadius: root.cardRadius
+      rowRadius: root.rowRadius
+      currentBinding: root.tourBinding.current
+      previousBinding: root.tourBinding.previous
+      bindingManaged: root.tourBinding.managed
+      boundChords: root.tourBinding.bound
+      bindingState: root.bindingState
+      onBindingRequested: function(chord) { root.writeBinding(chord) }
+      onRevertRequested: root.revertBinding()
+      onFinished: function(patch) { root.finishTour(patch) }
     }
   }
 

@@ -361,6 +361,244 @@ class HelperTests(unittest.TestCase):
                     os.environ["HOME"] = old_home
 
 
+@contextlib.contextmanager
+def fake_home():
+    """A throwaway $HOME; restores the real one even when the test fails."""
+    old = os.environ.get("HOME")
+    home = tempfile.mkdtemp()
+    os.environ["HOME"] = home
+    try:
+        yield Path(home)
+    finally:
+        os.environ["HOME"] = old
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def run(handler, argv=None, stdin=b""):
+    """Run a helper command, feed it `stdin`, return its parsed JSON reply."""
+    buf = io.StringIO()
+    with mock.patch("sys.stdin", io.TextIOWrapper(io.BytesIO(stdin))):
+        with contextlib.redirect_stdout(buf):
+            handler(argv) if argv is not None else handler()
+    return json.loads(buf.getvalue())
+
+
+PRINT_FIXTURE = (
+    "SUPER + SPACE                       \u2192 Omarchy menu\n"
+    "SUPER SHIFT CTRL + SPACE            \u2192 Theme menu\n"
+    "CTRL + SPACE                        \u2192 Spotlight\n"
+    "PRINT                               \u2192 Screenshot\n"
+).encode("utf-8")
+TOGGLE = "omarchy-shell shell toggle io.github.maajix.spotlight '{}'"
+LUA_FIXTURE = "\n".join([
+    "-- my bindings",
+    'o.bind("SUPER + B", "Browser", "omarchy-launch-browser")',
+    "",
+    "-- Spotlight",
+    'o.bind("CTRL + SPACE", "Spotlight", "%s")' % TOGGLE,
+    '-- o.bind("ALT + SPACE", "Spotlight", "%s")' % TOGGLE,
+    'o.bind("SUPER + R", "Spotlight reminder", "omarchy-shell shell toggle io.github.maajix.spotlight \'{\\"query\\":\\"remind me \\"}\'")',
+    "",
+])
+MANAGED = "\n".join([
+    HELPER.MARK_START,
+    'hl.unbind("SUPER + SPACE")',
+    'o.bind("SUPER + SPACE", "Spotlight", "%s")' % TOGGLE,
+    HELPER.MARK_END,
+    "",
+])
+EXPECTED_AFTER_WRITE = LUA_FIXTURE.replace(
+    'o.bind("CTRL + SPACE"', HELPER.DISABLED_PREFIX + 'o.bind("CTRL + SPACE"') + "\n" + MANAGED
+
+
+class SettingsWriteTests(unittest.TestCase):
+    def test_setup_completed_defaults_false_and_clamps(self):
+        self.assertFalse(HELPER.normalize_settings({})["setupCompleted"])
+        self.assertFalse(HELPER.normalize_settings({"setupCompleted": "yes"})["setupCompleted"])
+        self.assertTrue(HELPER.normalize_settings({"setupCompleted": True})["setupCompleted"])
+
+    def test_write_settings_merges_and_keeps_unknown_keys(self):
+        with fake_home() as home:
+            cfg = home / ".config" / "omarchy"
+            cfg.mkdir(parents=True)
+            (cfg / "spotlight.json").write_text(
+                '{"maxResults": 12, "customThing": [1, 2], "bogus": true}\n')
+            reply = run(HELPER.cmd_write_settings,
+                        stdin=b'{"setupCompleted": true, "maxResults": 999, "evil": 1}')
+            self.assertTrue(reply["ok"])
+            self.assertTrue(reply["settings"]["setupCompleted"])
+            self.assertEqual(reply["settings"]["maxResults"], 50)
+            on_disk = json.loads((cfg / "spotlight.json").read_text())
+            self.assertEqual(on_disk["customThing"], [1, 2])
+            self.assertNotIn("evil", on_disk)
+            self.assertTrue(on_disk["setupCompleted"])
+            self.assertEqual(stat.S_IMODE((cfg / "spotlight.json").stat().st_mode), 0o600)
+
+    def test_write_settings_creates_file(self):
+        with fake_home() as home:
+            reply = run(HELPER.cmd_write_settings, stdin=b'{"webSuggestions": true}')
+            self.assertTrue(reply["settings"]["webSuggestions"])
+            self.assertTrue((home / ".config" / "omarchy" / "spotlight.json").exists())
+
+    def test_write_settings_refuses_bad_input_and_corrupt_file(self):
+        with fake_home() as home:
+            cfg = home / ".config" / "omarchy"
+            cfg.mkdir(parents=True)
+            for raw in (b"[1]", b"nope", b""):
+                with self.assertRaises(HELPER.Denied):
+                    run(HELPER.cmd_write_settings, stdin=raw)
+            (cfg / "spotlight.json").write_bytes(b"{broken")
+            with self.assertRaises(HELPER.Denied):
+                run(HELPER.cmd_write_settings, stdin=b'{"setupCompleted": true}')
+            self.assertEqual((cfg / "spotlight.json").read_bytes(), b"{broken")
+
+
+class BindingTests(unittest.TestCase):
+    def setUp(self):
+        self.print_output = PRINT_FIXTURE
+        self.print_calls = []
+        real = HELPER.run_bounded
+
+        def fake_run(argv, cap, deadline, *rest):
+            self.print_calls.append(argv)
+            if argv[0] == "omarchy-menu-keybindings":
+                if self.print_output is None:
+                    raise HELPER.Denied("cannot run")
+                return self.print_output, False
+            return real(argv, cap, deadline, *rest)
+
+        HELPER.run_bounded = fake_run
+        self.addCleanup(setattr, HELPER, "run_bounded", real)
+
+    @staticmethod
+    def _hypr(home, text=LUA_FIXTURE):
+        hypr = home / ".config" / "hypr"
+        hypr.mkdir(parents=True, exist_ok=True)
+        if text is not None:
+            path = hypr / "bindings.lua"
+            path.write_text(text)
+            path.chmod(0o644)
+        return hypr / "bindings.lua"
+
+    def test_canon_chord(self):
+        cases = {
+            "SUPER SHIFT CTRL + SPACE": "SUPER + CTRL + SHIFT + SPACE",
+            "ctrl+space": "CTRL + SPACE",
+            "SHIFT + SUPER + K": "SUPER + SHIFT + K",
+            "PRINT": "PRINT",
+            "SUPER + A + B": None,
+            "SUPER": None,
+            "": None,
+        }
+        for text, want in cases.items():
+            self.assertEqual(HELPER._canon_chord(text), want, text)
+
+    def test_read_binding_reports_current_and_bound(self):
+        with fake_home() as home:
+            self._hypr(home)
+            reply = run(HELPER.cmd_read_binding)
+            self.assertEqual(reply["current"], "CTRL + SPACE")
+            self.assertIsNone(reply["previous"])
+            self.assertFalse(reply["managed"])
+            self.assertEqual(reply["bound"], {
+                "SUPER + SPACE": "Omarchy menu",
+                "SUPER + CTRL + SHIFT + SPACE": "Theme menu",
+                "CTRL + SPACE": "Spotlight",
+                "PRINT": "Screenshot",
+            })
+
+    def test_read_binding_tolerates_missing_dir_and_tool(self):
+        self.print_output = None
+        with fake_home():
+            reply = run(HELPER.cmd_read_binding)
+            self.assertEqual(reply, {"current": None, "previous": None,
+                                     "managed": False, "bound": {}, "ok": True})
+
+    def test_write_binding_validates_chord(self):
+        with fake_home() as home:
+            self._hypr(home)
+            for argv in (["SPACE"], ["ALT+SPACE"], ["alt + space"], ["SHIFT + SUPER + A"],
+                         ["SUPER + F13"], ["SUPER + SPACE; rm -rf"], [""],
+                         ["ALT + SPACE", "x"], []):
+                with self.assertRaises(HELPER.Denied, msg=repr(argv)):
+                    run(HELPER.cmd_write_binding, argv)
+            for chord in ("ALT + SPACE", "SUPER + SHIFT + K", "CTRL + ALT + F6",
+                          "SUPER + 1", "SHIFT + PRINT"):
+                self.assertEqual(run(HELPER.cmd_write_binding, [chord])["chord"], chord)
+
+    def test_write_binding_exact_bytes_and_idempotent(self):
+        with fake_home() as home:
+            path = self._hypr(home)
+            reply = run(HELPER.cmd_write_binding, ["SUPER + SPACE"])
+            self.assertTrue(reply["unbound"])
+            self.assertEqual(reply["path"], str(path))
+            self.assertEqual(path.read_text(), EXPECTED_AFTER_WRITE)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+            # Second run, even after hyprctl reload made the chord look free.
+            self.print_output = PRINT_FIXTURE.replace(b"SUPER + SPACE   ", b"ALT + SPACE     ")
+            run(HELPER.cmd_write_binding, ["SUPER + SPACE"])
+            self.assertEqual(path.read_text(), EXPECTED_AFTER_WRITE)
+            reply = run(HELPER.cmd_read_binding)
+            self.assertEqual((reply["current"], reply["previous"], reply["managed"]),
+                             ("SUPER + SPACE", "CTRL + SPACE", True))
+
+    def test_unbind_only_when_someone_else_holds_the_chord(self):
+        with fake_home() as home:
+            self._hypr(home)
+            self.assertFalse(run(HELPER.cmd_write_binding, ["CTRL + SPACE"])["unbound"])
+        with fake_home() as home:
+            self._hypr(home)
+            self.assertFalse(run(HELPER.cmd_write_binding, ["ALT + SPACE"])["unbound"])
+        with fake_home() as home:
+            # After our own write + reload the chord shows up as Spotlight; still ours.
+            self._hypr(home)
+            run(HELPER.cmd_write_binding, ["ALT + SPACE"])
+            self.print_output = PRINT_FIXTURE.replace(b"\nCTRL + SPACE", b"\nALT + SPACE ")
+            self.assertFalse(run(HELPER.cmd_write_binding, ["ALT + SPACE"])["unbound"])
+
+    def test_write_binding_refuses_missing_dir_and_unclosed_block(self):
+        with fake_home():
+            with self.assertRaises(HELPER.Denied):
+                run(HELPER.cmd_write_binding, ["ALT + SPACE"])
+        with fake_home() as home:
+            path = self._hypr(home, LUA_FIXTURE + HELPER.MARK_START + "\n")
+            before = path.read_bytes()
+            with self.assertRaises(HELPER.Denied):
+                run(HELPER.cmd_write_binding, ["ALT + SPACE"])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_write_binding_creates_missing_file(self):
+        with fake_home() as home:
+            path = self._hypr(home, None)
+            run(HELPER.cmd_write_binding, ["SUPER + SPACE"])
+            self.assertEqual(path.read_text(), MANAGED)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_revert_round_trips(self):
+        with fake_home() as home:
+            path = self._hypr(home)
+            run(HELPER.cmd_write_binding, ["SUPER + SPACE"])
+            reply = run(HELPER.cmd_revert_binding)
+            self.assertEqual(reply["restored"], "CTRL + SPACE")
+            self.assertEqual(path.read_text(), LUA_FIXTURE)
+            reply = run(HELPER.cmd_read_binding)
+            self.assertEqual((reply["current"], reply["previous"], reply["managed"]),
+                             ("CTRL + SPACE", None, False))
+
+    def test_revert_without_block_is_a_noop(self):
+        with fake_home() as home:
+            path = self._hypr(home)
+            os.utime(path, (1000000, 1000000))
+            self.assertIsNone(run(HELPER.cmd_revert_binding)["restored"])
+            self.assertEqual(path.stat().st_mtime, 1000000)
+        with fake_home() as home:
+            self._hypr(home, None)
+            self.assertIsNone(run(HELPER.cmd_revert_binding)["restored"])
+        with fake_home():
+            with self.assertRaises(HELPER.Denied):
+                run(HELPER.cmd_revert_binding)
+
+
 class MenuCommandsTests(unittest.TestCase):
     MENU_FIXTURE = {
         "root": {"label": "Go"},

@@ -28,7 +28,11 @@ omarchy plugin add https://github.com/maajix/omarchy-spotlight.git
 
 ### Add a shortcut
 
-Add this to `~/.config/hypr/bindings.lua`:
+The first time Spotlight opens it runs a short setup tour. Its shortcut step shows the key combination Spotlight is bound to right now, warns when a preset is already taken by something else, writes the binding to `~/.config/hypr/bindings.lua` and reloads Hyprland. Everything it writes sits in one marked block at the end of the file, and the tour can undo it.
+
+Open Spotlight with `omarchy-shell shell toggle io.github.maajix.spotlight '{}'` (for example from a terminal) if you have no shortcut yet. Later you can rerun the tour with **Run Setup Tour**, or change just the key with **Change Spotlight Shortcut**, both from Spotlight itself.
+
+If you prefer to edit the file by hand, add this to `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("ALT + SPACE", "Spotlight", "omarchy-shell shell toggle io.github.maajix.spotlight '{}'")
@@ -431,9 +435,12 @@ A complete configuration looks like this:
   "learningEnabled": true,
   "maxResults": 20,
   "maxApps": 8,
-  "maxSuggestions": 4
+  "maxSuggestions": 4,
+  "setupCompleted": true
 }
 ```
+
+`setupCompleted` is set by the setup tour when you finish or skip it. Set it to `false` to see the tour again on the next open, or run **Run Setup Tour** from Spotlight.
 
 Search for:
 
@@ -441,7 +448,7 @@ Search for:
 spotlight settings
 ```
 
-to access Spotlight's own maintenance actions. From there you can create or edit the settings file, open the plugin or data directory, or reset learning.
+to access Spotlight's own maintenance actions. From there you can create or edit the settings file, open the plugin or data directory, reset learning, rerun the setup tour, or change the shortcut.
 
 **Edit Spotlight Settings** only creates the default file when it is missing. It never overwrites an existing configuration.
 
@@ -615,6 +622,7 @@ omarchy plugin remove io.github.maajix.spotlight
 Then remove any Hyprland configuration you added manually:
 
 - the `o.bind(...)` entry from `~/.config/hypr/bindings.lua`
+- the block between `-- >>> spotlight setup tour` and `-- <<< spotlight setup tour <<<` in `~/.config/hypr/bindings.lua`, if the setup tour set your shortcut (before removing the plugin, `bin/spotlight-helper revert-binding` removes it and restores a shortcut line the tour disabled)
 - the `hl.layer_rule` for `omarchy-spotlight` from `~/.config/hypr/looknfeel.lua`
 
 You can leave the global `hl.config` blur configuration in place if something else uses it.

@@ -107,6 +107,30 @@ REMINDER_FIELD_CHARS = 200
 
 ICS_STAMP_RE = re.compile(r"^[0-9TZ]{1,32}$")
 
+# ~/.config/hypr/bindings.lua is edited only through a delimited block at EOF
+# plus a distinctive comment prefix on the line it replaces, so the whole
+# edit reverts byte for byte (cmd_revert_binding).
+BINDINGS_BYTES = 256 * 1024
+BINDINGS_PRINT_BYTES = 64 * 1024
+BINDINGS_PRINT_DEADLINE = 3.0
+BINDINGS_DESC_CHARS = 120
+MARK_START = '-- >>> spotlight setup tour (managed; rerun via "Run Setup Tour") >>>'
+MARK_END = "-- <<< spotlight setup tour <<<"
+DISABLED_PREFIX = "-- spotlight-tour:disabled "
+TOGGLE_CMD = "omarchy-shell shell toggle io.github.maajix.spotlight '{}'"
+# A live line binding the bare Spotlight toggle; group 1 is the chord
+# literal. A bind carrying a query payload is a different shortcut and is
+# left alone.
+TOGGLE_RE = re.compile(
+    r'''^\s*o\.bind\(\s*"([^"]+)"\s*,.*omarchy-shell shell toggle io\.github\.maajix\.spotlight'''
+    r'''(?:\s*'\{\}')?\s*"\s*[,)]''')
+CHORD_MODS = ("SUPER", "CTRL", "ALT", "SHIFT")
+# Canonical chord as written into bindings.lua: modifiers in CHORD_MODS
+# order, then exactly one key.
+CHORD_RE = re.compile(
+    r"^(?:SUPER \+ )?(?:CTRL \+ )?(?:ALT \+ )?(?:SHIFT \+ )?"
+    r"(?:[A-Z0-9]|SPACE|RETURN|TAB|F(?:[1-9]|1[0-2])|UP|DOWN|LEFT|RIGHT|BACKSPACE|DELETE|PRINT)$")
+
 # The packaged list of desktop ids Omarchy keeps out of its own launcher.
 # It lives under /usr/share, so it is the one read that is not ours: root
 # owns it, and root is the only other owner any read here will accept.
@@ -382,8 +406,8 @@ def lock_at(dirfd, name):
     return fd
 
 
-def write_atomic(dirfd, name, payload):
-    """Publish `payload` at `name` by renaming a private 0600 temp, dir-fd-relatively."""
+def write_atomic(dirfd, name, payload, mode=0o600):
+    """Publish `payload` at `name` by renaming a private temp, dir-fd-relatively."""
     tmp = ".%s.tmp.%d" % (name, os.getpid())
     try:
         os.unlink(tmp, dir_fd=dirfd)
@@ -395,6 +419,7 @@ def write_atomic(dirfd, name, payload):
         view = memoryview(payload)
         while view:
             view = view[os.write(fd, view):]
+        os.fchmod(fd, mode)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -595,10 +620,12 @@ def normalize_settings(parsed):
         "maxResults": 20,
         "maxApps": 8,
         "maxSuggestions": 4,
+        "setupCompleted": False,
     }
     if not isinstance(parsed, dict):
         return out
     out["webSuggestions"] = clamp_bool(parsed.get("webSuggestions"), False)
+    out["setupCompleted"] = clamp_bool(parsed.get("setupCompleted"), False)
     out["fileSearch"] = clamp_bool(parsed.get("fileSearch"), True)
     out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), True)
     out["clipboardSearch"] = clamp_bool(parsed.get("clipboardSearch"), True)
@@ -1560,6 +1587,176 @@ def cmd_write_ics(argv):
         os.close(fd)
 
 
+def cmd_write_settings():
+    """Merge a patch of known keys into spotlight.json; unknown keys on disk survive."""
+    raw = read_stdin(SETTINGS_BYTES)
+    try:
+        patch = json.loads(raw.decode("utf-8", "replace")) if raw else None
+    except ValueError:
+        patch = None
+    if not isinstance(patch, dict):
+        raise Denied("settings patch is not a JSON object")
+    fd = walk([".config", "omarchy"], create=True)
+    try:
+        raw = read_file(fd, "spotlight.json", SETTINGS_BYTES)
+        try:
+            existing = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+        except ValueError:
+            existing = None
+        if not isinstance(existing, dict):
+            # A hand edit that no longer parses is never overwritten.
+            raise Denied("spotlight.json is not a JSON object")
+        for key in normalize_settings({}):
+            if key in patch:
+                existing[key] = patch[key]
+        settings = normalize_settings(existing)
+        existing.update(settings)
+        # ponytail: no lock - Spotlight.qml funnels every write through one
+        # Process; wrap in lock_at() if a second writer ever appears.
+        write_atomic(fd, "spotlight.json", (json.dumps(existing, indent=2) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    emit({"settings": settings})
+
+
+# ---------------------------------------------------------------- bindings
+def _hypr_dir():
+    try:
+        return walk([".config", "hypr"])
+    except FileNotFoundError:
+        raise Denied("~/.config/hypr is missing")
+
+
+def _bindings_lines(dirfd):
+    raw = read_file(dirfd, "bindings.lua", BINDINGS_BYTES)
+    return None if raw is None else raw.decode("utf-8", "surrogateescape").split("\n")
+
+
+def _write_bindings(dirfd, lines):
+    try:
+        mode = stat.S_IMODE(os.stat("bindings.lua", dir_fd=dirfd, follow_symlinks=False).st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    write_atomic(dirfd, "bindings.lua", "\n".join(lines).encode("utf-8", "surrogateescape"), mode)
+
+
+def _canon_chord(text):
+    """'SUPER SHIFT CTRL + SPACE' or 'ctrl+space' -> 'SUPER + CTRL + SHIFT + SPACE'; None if malformed."""
+    parts = [p for p in re.split(r"[\s+]+", str(text).upper()) if p]
+    keys = [p for p in parts if p not in CHORD_MODS]
+    if len(keys) != 1:
+        return None
+    return " + ".join([m for m in CHORD_MODS if m in parts] + keys)
+
+
+def _bound_chords():
+    """Every chord Hyprland binds right now, canonical chord -> description."""
+    try:
+        raw, truncated = run_bounded(["omarchy-menu-keybindings", "--print"],
+                                     BINDINGS_PRINT_BYTES, BINDINGS_PRINT_DEADLINE)
+    except Denied:
+        return {}
+    lines = raw.decode("utf-8", "replace").split("\n")
+    if truncated:
+        lines = lines[:-1]
+    bound = {}
+    for line in lines:
+        left, arrow, desc = line.partition("\u2192")
+        chord = _canon_chord(left) if arrow else None
+        if chord and chord not in bound:
+            bound[chord] = clamp_text(desc, BINDINGS_DESC_CHARS).strip()
+    return bound
+
+
+def _strip_managed(lines):
+    """Drop the managed block and the blank line before it. -> (lines, block contents)"""
+    if MARK_START not in lines:
+        return lines, []
+    start = lines.index(MARK_START)
+    try:
+        end = lines.index(MARK_END, start)
+    except ValueError:
+        raise Denied("managed block in bindings.lua is not closed")
+    block = lines[start + 1:end]
+    if start and lines[start - 1] == "":
+        start -= 1
+    return lines[:start] + lines[end + 1:], block
+
+
+def cmd_read_binding():
+    reply = {"current": None, "previous": None, "managed": False, "bound": _bound_chords()}
+    try:
+        fd = walk([".config", "hypr"])
+    except FileNotFoundError:
+        emit(reply)
+        return
+    try:
+        lines = _bindings_lines(fd) or []
+    finally:
+        os.close(fd)
+    for line in lines:
+        if line == MARK_START:
+            reply["managed"] = True
+        elif line.startswith(DISABLED_PREFIX):
+            old = TOGGLE_RE.match(line[len(DISABLED_PREFIX):])
+            if old and reply["previous"] is None:
+                reply["previous"] = old.group(1)
+        else:
+            live = TOGGLE_RE.match(line)
+            if live and reply["current"] is None:
+                reply["current"] = live.group(1)
+    emit(reply)
+
+
+def cmd_write_binding(argv):
+    if len(argv) != 1 or "+" not in argv[0] or not CHORD_RE.match(argv[0]):
+        raise Denied("bad chord")
+    chord = argv[0]
+    unbind = 'hl.unbind("%s")' % chord
+    fd = _hypr_dir()
+    try:
+        lines = _bindings_lines(fd) or [""]
+        own = {_canon_chord(m.group(1)) for m in map(TOGGLE_RE.match, lines) if m}
+        lines, block = _strip_managed(lines)
+        lines = [DISABLED_PREFIX + line if TOGGLE_RE.match(line) else line for line in lines]
+        if lines[-1] != "":
+            lines.append("")
+        body = lines[:-1]
+        # Unbind a chord someone else holds, and keep an unbind the previous
+        # block already carried: hyprctl reload rebuilds every default, so
+        # "not bound right now" may only mean our own block removed it.
+        unbound = unbind in block or (chord in _bound_chords() and chord not in own)
+        block = [MARK_START] + ([unbind] if unbound else []) + [
+            'o.bind("%s", "Spotlight", "%s")' % (chord, TOGGLE_CMD), MARK_END, ""]
+        _write_bindings(fd, body + ([""] if body else []) + block)
+    finally:
+        os.close(fd)
+    emit({"chord": chord, "unbound": unbound,
+          "path": os.path.join(os.environ["HOME"], ".config", "hypr", "bindings.lua")})
+
+
+def cmd_revert_binding():
+    fd = _hypr_dir()
+    try:
+        original = _bindings_lines(fd)
+        if original is None:
+            emit({"restored": None})
+            return
+        lines, _ = _strip_managed(original)
+        restored = None
+        for i, line in enumerate(lines):
+            if line.startswith(DISABLED_PREFIX):
+                lines[i] = line = line[len(DISABLED_PREFIX):]
+                live = TOGGLE_RE.match(line)
+                if live and restored is None:
+                    restored = live.group(1)
+        if lines != original:
+            _write_bindings(fd, lines)
+    finally:
+        os.close(fd)
+    emit({"restored": restored})
+
+
 # name -> (handler, whether it reads positional arguments)
 COMMANDS = {
     "read-settings": (cmd_read_settings, False),
@@ -1576,6 +1773,10 @@ COMMANDS = {
     "suggest": (cmd_suggest, True),
     "files": (cmd_files, True),
     "write-ics": (cmd_write_ics, True),
+    "write-settings": (cmd_write_settings, False),
+    "read-binding": (cmd_read_binding, False),
+    "write-binding": (cmd_write_binding, True),
+    "revert-binding": (cmd_revert_binding, False),
 }
 
 
