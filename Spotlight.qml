@@ -150,6 +150,14 @@ Item {
   readonly property int maxAppCandidates: 512
   readonly property int maxWindowCandidates: 256
   readonly property int maxGlobalResults: 50
+
+  // The empty query is a digest, not a search: every source is capped on its
+  // own so the longest one cannot crowd the others off the list. Ranking.rank
+  // already orders the sections by result type.
+  readonly property int idleAppRows: 5
+  readonly property int idleWindowRows: 2
+  readonly property int idleCommandRows: 1
+  readonly property int idleFileRows: 2
   readonly property int maxTitleChars: 512
   readonly property int maxSubtitleChars: 1024
 
@@ -186,28 +194,31 @@ Item {
   // and Hyprland's blur has no visible effect. 0.62 keeps text contrast while
   // letting the blurred wallpaper through as colour and shape.
   readonly property color glassBackground: Util.alpha(Color.menu.background, 0.62)
-  readonly property color glassBorder: Util.alpha(Color.foreground, 0.16)
+  readonly property color glassBorder: Util.alpha(Color.foreground, 0.09)
   readonly property color glassSheen: Util.alpha("#ffffff", 0.07)
   readonly property color scrim: Util.alpha(Color.menu.scrim, 0.25)
   readonly property color selectedBackground: Util.alpha(Color.foreground, 0.12)
   readonly property color selectedText: Color.menu.selectedText
-  readonly property color dividerColor: Util.alpha(Color.foreground, 0.10)
+  readonly property color dividerColor: Util.alpha(Color.foreground, 0.06)
   readonly property string fontFamily: Style.font.menuFamily
 
   // One left rail at `gutter`. The search glyph and every row icon align to
   // it; a row is inset by `listPadding` and carries
   // the remainder internally, so the rail survives the inset.
-  readonly property int gutter: Style.space(24)
+  readonly property int gutter: Style.space(21)
   readonly property int listPadding: Style.space(10)
   readonly property int rowInset: gutter - listPadding
 
   readonly property int cardRadius: Style.space(12)
   readonly property int rowRadius: Style.space(8)
   readonly property int searchHeight: Style.space(56)
-  readonly property int rowHeight: Style.space(40)
+  readonly property int rowHeight: Style.space(36)
   readonly property int sectionHeight: Style.space(24)
   readonly property int footerHeight: Style.space(36)
-  readonly property int maxListHeight: Style.space(400)
+  // Sized so the full empty-query digest lands above the fold: 5 apps, 1
+  // command, 2 files and 2 windows at rowHeight, plus their four section
+  // headings at sectionHeight. A query may still scroll.
+  readonly property int maxListHeight: Style.space(456)
   readonly property int hairline: Style.spacing.hairline
 
   // Between heading (16) and display (24): a hero input that is still an
@@ -932,18 +943,27 @@ Item {
     return out
   }
 
+  // Ranks one source on its own and keeps the head, so a cap selects the best
+  // rows of that section rather than whichever ones the catalogue listed first.
+  function idleSlice(list, limit) {
+    return root.globallyRank(list, "").slice(0, limit)
+  }
+
   function idleRows() {
     var fallback = root.appRows("", false)
-    if (!root.settings.learningEnabled || !root.usage || !root.usage.items
-        || Object.keys(root.usage.items).length === 0) return fallback
-    var out = root.appRows("", true)
-      .concat(root.windowRows("", true))
-      .concat(root.commandRows("", true, true))
-      .concat(root.learnedFileRows())
-    for (var i = 0; i < fallback.length && out.length < root.maxGlobalResults; i++) {
-      if (!Frecency.hasItem(root.usage, fallback[i].stableId)) out.push(fallback[i])
+    var learned = root.settings.learningEnabled && root.usage && root.usage.items
+      && Object.keys(root.usage.items).length > 0
+    var apps = learned ? root.idleSlice(root.appRows("", true), root.idleAppRows) : []
+    // Top up from the catalogue until the section is full, so a fresh install
+    // still opens on a usable list rather than an empty one.
+    for (var i = 0; i < fallback.length && apps.length < root.idleAppRows; i++) {
+      if (!learned || !Frecency.hasItem(root.usage, fallback[i].stableId)) apps.push(fallback[i])
     }
-    return out.length ? out : fallback
+    if (!learned) return apps
+    return apps
+      .concat(root.idleSlice(root.commandRows("", true, true), root.idleCommandRows))
+      .concat(root.idleSlice(root.learnedFileRows(), root.idleFileRows))
+      .concat(root.idleSlice(root.windowRows("", true), root.idleWindowRows))
   }
 
   function suggestionResultRows(q) {
@@ -1893,16 +1913,6 @@ Item {
       // Swallow clicks so they don't reach the dismiss MouseArea behind.
       MouseArea { anchors.fill: parent; onClicked: {} }
 
-      // The 1px light line along the top edge is what makes a translucent
-      // panel read as glass rather than as a flat tint.
-      Rectangle {
-        anchors { top: parent.top; left: parent.left; right: parent.right }
-        anchors.margins: root.hairline
-        height: root.hairline
-        color: root.glassSheen
-        radius: height
-      }
-
       // ------------------------------------------------------- search row
       Item {
         id: searchRow
@@ -1999,11 +2009,13 @@ Item {
         }
       }
 
+      // Both dividers stop where a row's highlight stops, so the list reads as
+      // one column with two rules across it rather than as three stacked bands.
       Rectangle {
         id: searchDivider
         anchors { top: searchRow.bottom; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.hairline
-        anchors.rightMargin: root.hairline
+        anchors.leftMargin: root.listPadding
+        anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
         visible: card.hasResults
@@ -2045,7 +2057,8 @@ Item {
               font.pixelSize: Style.font.caption
               anchors.left: parent.left
               anchors.leftMargin: root.gutter
-              anchors.verticalCenter: parent.verticalCenter
+              anchors.bottom: parent.bottom
+              anchors.bottomMargin: Style.space(3)
             }
           }
 
@@ -2192,8 +2205,8 @@ Item {
       // ------------------------------------------------------- footer
       Rectangle {
         anchors { bottom: footer.top; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.hairline
-        anchors.rightMargin: root.hairline
+        anchors.leftMargin: root.listPadding
+        anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
       }
@@ -2212,7 +2225,9 @@ Item {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           anchors.left: parent.left
-          anchors.leftMargin: root.gutter
+          // The mark sits inside the rail the rows use, so it reads as a corner
+          // signature, but not so far out that it crowds the rounded corner.
+          anchors.leftMargin: Style.space(15)
           anchors.verticalCenter: parent.verticalCenter
         }
 
