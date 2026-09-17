@@ -1392,6 +1392,77 @@ class ToggleStatesTests(unittest.TestCase):
         self.assertFalse(HELPER._tri("disabled", "enabled", "disabled"))
         self.assertTrue(HELPER._tri("enabled\n", "enabled", "disabled"))
 
+    def test_the_hyprland_probes_read_the_focused_window_and_workspace(self):
+        self.assertTrue(HELPER._probe_fullscreen('{"fullscreenClient":2}'))
+        self.assertFalse(HELPER._probe_fullscreen('{"fullscreenClient":0}'))
+        # A window that reports no such field, and a hyprctl that printed
+        # nothing usable, are both unknown rather than "not fullscreen".
+        self.assertIsNone(HELPER._probe_fullscreen('{"address":"0x1"}'))
+        self.assertIsNone(HELPER._probe_fullscreen("Invalid"))
+
+        self.assertTrue(HELPER._probe_scrolling('{"tiledLayout":"scrolling"}'))
+        self.assertFalse(HELPER._probe_scrolling('{"tiledLayout":"dwindle"}'))
+        # A third layout is neither end of this switch.
+        self.assertIsNone(HELPER._probe_scrolling('{"tiledLayout":"master"}'))
+        self.assertIsNone(HELPER._probe_scrolling("[]"))
+
+    def test_transparency_reads_the_inverse_of_the_opaque_override(self):
+        def probe(active, prop):
+            with mock.patch.object(HELPER, "run_bounded", side_effect=[
+                    (active.encode(), False), (prop.encode(), False)]):
+                return HELPER._probe_transparency()
+
+        window = '{"address":"0x5f2a1c","title":"kitty"}'
+        # Opaque forced on is transparency off, and the other way round.
+        self.assertFalse(probe(window, '{"opaque": true}'))
+        self.assertTrue(probe(window, '{"opaque": false}'))
+        # getprop answers a miss in prose, not JSON.
+        self.assertIsNone(probe(window, "window not found"))
+        self.assertIsNone(probe(window, "prop not found"))
+        # An address that is not one never reaches the window regex.
+        with mock.patch.object(HELPER, "run_bounded") as run_bounded:
+            run_bounded.return_value = (b'{"address":"address:.* opaque true"}', False)
+            self.assertIsNone(HELPER._probe_transparency())
+            self.assertEqual(run_bounded.call_count, 1)
+        # No focused window at all: nothing to report.
+        with mock.patch.object(HELPER, "run_bounded", return_value=(b"", False)):
+            self.assertIsNone(HELPER._probe_transparency())
+
+    def test_battery_percentage_reads_the_bar_entry_rather_than_a_flag(self):
+        def config(home):
+            path = home / ".config" / "omarchy"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        def write(home, *entries):
+            (config(home) / "shell.json").write_text(json.dumps(
+                {"bar": {"layout": {"left": [{"id": "omarchy.menu"}], "right": list(entries)}}}))
+
+        with fake_home() as home:
+            config(home)
+            self.assertIsNone(HELPER._probe_battery_percent())
+            write(home, {"id": "omarchy.power", "showPercentage": True})
+            self.assertTrue(HELPER._probe_battery_percent())
+            write(home, {"id": "omarchy.power", "showPercentage": False})
+            self.assertFalse(HELPER._probe_battery_percent())
+            # The bar's own default is off, so an entry that never toggled it
+            # reads off rather than unknown.
+            write(home, {"id": "omarchy.power"})
+            self.assertFalse(HELPER._probe_battery_percent())
+            # No power module in the bar: nothing for the percentage to sit on.
+            write(home, {"id": "omarchy.audio", "showPercentage": True})
+            self.assertIsNone(HELPER._probe_battery_percent())
+
+    def test_a_probe_that_raises_is_omitted_like_one_that_cannot_read(self):
+        # _probe_battery_percent walks $HOME rather than running a command, so
+        # the guard in cmd_toggle_states is what keeps a missing config quiet.
+        with fake_home():
+            with mock.patch.dict(HELPER.TOGGLE_PROBES,
+                                 {"batterypercent": HELPER._probe_battery_percent}, clear=True):
+                reply = run(HELPER.cmd_toggle_states)
+        self.assertTrue(reply["ok"])
+        self.assertNotIn("batterypercent", reply["states"])
+
     def test_a_menu_row_borrows_the_verb_its_own_command_names(self):
         # "Bluetooth" under Update > Hardware restarts the service; the
         # curated "Toggle Bluetooth" row flips the radio. Same noun, opposite

@@ -1493,6 +1493,70 @@ def _cmd_probe(argv, test):
     return lambda: _run_probe(argv, test)
 
 
+HYPR_ADDRESS_RE = re.compile(r"^0x[0-9a-f]{1,32}$")
+
+
+def _probe_json(text, key):
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed.get(key) if isinstance(parsed, dict) else None
+
+
+def _probe_fullscreen(text):
+    # `fullscreenClient == 2` is the state omarchy-hyprland-window-tiled-
+    # fullscreen-toggle sets, and it is the focused window's, not the session's:
+    # Spotlight is a layer surface, so the window behind it stays the active one.
+    value = _probe_json(text, "fullscreenClient")
+    return value == 2 if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _probe_scrolling(text):
+    # Dwindle and scrolling are the only two layouts the toggle cycles, so
+    # "scrolling is on" is the whole state rather than half of it.
+    value = _probe_json(text, "tiledLayout")
+    return _tri(value, "scrolling", "dwindle") if isinstance(value, str) else None
+
+
+def _probe_transparency():
+    """`opaque` is an override on the focused window rather than a session
+    setting, and hyprctl reports it only through `getprop` — it is absent from
+    the window's own JSON. Opaque on means transparency off, so the switch
+    reads the inverse of what the prop says."""
+    active, _ = run_bounded(["hyprctl", "activewindow", "-j"], TOGGLE_BYTES, TOGGLE_DEADLINE)
+    address = _probe_json(active.decode("utf-8", "replace"), "address")
+    # The address goes back out as part of a window regex, so it has to look
+    # like an address and nothing else, whatever hyprctl printed.
+    if not isinstance(address, str) or not HYPR_ADDRESS_RE.match(address):
+        return None
+    value = _run_probe(["hyprctl", "-j", "getprop", "address:" + address, "opaque"],
+                       lambda text: _probe_json(text, "opaque"))
+    return (not value) if isinstance(value, bool) else None
+
+
+def _probe_battery_percent():
+    """The bar writes this one into its own entry in shell.json, so the state
+    is the layout entry rather than a flag file or a command."""
+    # cmd_toggle_states turns a Denied or an OSError here into "unknown", which
+    # is the right answer for a home or a config this helper cannot read.
+    fd = walk([".config", "omarchy"])
+    try:
+        parsed = read_json(fd, "shell.json", SETTINGS_BYTES, None)
+    finally:
+        os.close(fd)
+    bar = parsed.get("bar") if isinstance(parsed, dict) else None
+    layout = bar.get("layout") if isinstance(bar, dict) else None
+    if not isinstance(layout, dict):
+        return None
+    for side in ("left", "center", "right"):
+        for entry in layout.get(side) or []:
+            if isinstance(entry, dict) and entry.get("id") == "omarchy.power":
+                return entry.get("showPercentage") is True
+    # No power module in the bar means nothing to show the percentage on.
+    return None
+
+
 def _probe_speaker():
     """The sink has to be resolved first: DSP sinks mean @DEFAULT_SINK@ is not
     always the device omarchy-audio-output-volume actually mutes."""
@@ -1512,6 +1576,10 @@ TOGGLE_PROBES = {
     "dnd":        _cmd_probe(["omarchy-shell", "notifications", "dndState"], lambda t: _tri(t, "on", "off")),
     "mic":        _cmd_probe(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"], _probe_mic),
     "speaker":    _probe_speaker,
+    "fullscreen": _cmd_probe(["hyprctl", "activewindow", "-j"], _probe_fullscreen),
+    "scrolling":  _cmd_probe(["hyprctl", "activeworkspace", "-j"], _probe_scrolling),
+    "batterypercent": _probe_battery_percent,
+    "transparency": _probe_transparency,
 }
 
 
