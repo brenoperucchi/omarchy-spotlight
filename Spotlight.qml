@@ -16,6 +16,7 @@ import "lib/Apps.js" as Apps
 import "lib/FileRank.js" as FileRank
 import "lib/Query.js" as Query
 import "lib/Ranking.js" as Ranking
+import "lib/Chord.js" as Chord
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -149,6 +150,14 @@ Item {
   readonly property int maxAppCandidates: 512
   readonly property int maxWindowCandidates: 256
   readonly property int maxGlobalResults: 50
+
+  // The empty query is a digest, not a search: every source is capped on its
+  // own so the longest one cannot crowd the others off the list. Ranking.rank
+  // already orders the sections by result type.
+  readonly property int idleAppRows: 5
+  readonly property int idleWindowRows: 2
+  readonly property int idleCommandRows: 1
+  readonly property int idleFileRows: 2
   readonly property int maxTitleChars: 512
   readonly property int maxSubtitleChars: 1024
 
@@ -162,8 +171,18 @@ Item {
     learningEnabled: true,
     maxResults: 20,
     maxApps: 8,
-    maxSuggestions: 4
+    maxSuggestions: 4,
+    // true until the helper answers, so the tour never flashes before the
+    // first-run flag has actually been read.
+    setupCompleted: true
   })
+
+  // ------------------------------------------------------------- tour
+  // The setup tour replaces the search card inside the same PanelWindow.
+  // Spotlight.qml does all of the tour's I/O; SetupTour.qml only paints.
+  property bool tourActive: false
+  property string bindingState: ""
+  property var tourBinding: ({ current: "", previous: "", managed: false, bound: {} })
 
   // ------------------------------------------------------------- theme
   // Shares the [menu] surface tokens, so any theme that styles the Omarchy
@@ -175,28 +194,31 @@ Item {
   // and Hyprland's blur has no visible effect. 0.62 keeps text contrast while
   // letting the blurred wallpaper through as colour and shape.
   readonly property color glassBackground: Util.alpha(Color.menu.background, 0.62)
-  readonly property color glassBorder: Util.alpha(Color.foreground, 0.16)
+  readonly property color glassBorder: Util.alpha(Color.foreground, 0.09)
   readonly property color glassSheen: Util.alpha("#ffffff", 0.07)
   readonly property color scrim: Util.alpha(Color.menu.scrim, 0.25)
   readonly property color selectedBackground: Util.alpha(Color.foreground, 0.12)
   readonly property color selectedText: Color.menu.selectedText
-  readonly property color dividerColor: Util.alpha(Color.foreground, 0.10)
+  readonly property color dividerColor: Util.alpha(Color.foreground, 0.06)
   readonly property string fontFamily: Style.font.menuFamily
 
   // One left rail at `gutter`. The search glyph and every row icon align to
   // it; a row is inset by `listPadding` and carries
   // the remainder internally, so the rail survives the inset.
-  readonly property int gutter: Style.space(24)
+  readonly property int gutter: Style.space(21)
   readonly property int listPadding: Style.space(10)
   readonly property int rowInset: gutter - listPadding
 
   readonly property int cardRadius: Style.space(12)
   readonly property int rowRadius: Style.space(8)
   readonly property int searchHeight: Style.space(56)
-  readonly property int rowHeight: Style.space(40)
+  readonly property int rowHeight: Style.space(36)
   readonly property int sectionHeight: Style.space(24)
   readonly property int footerHeight: Style.space(36)
-  readonly property int maxListHeight: Style.space(400)
+  // Sized so the full empty-query digest lands above the fold: 5 apps, 1
+  // command, 2 files and 2 windows at rowHeight, plus their four section
+  // headings at sectionHeight. A query may still scroll.
+  readonly property int maxListHeight: Style.space(456)
   readonly property int hairline: Style.spacing.hairline
 
   // Between heading (16) and display (24): a hero input that is still an
@@ -225,6 +247,7 @@ Item {
     }
 
     root.opened = true
+    root.tourActive = false
     root.armedKey = ""
     root.rows = []
     root.pinnedKey = ""
@@ -251,8 +274,10 @@ Item {
     root.refreshReminders()
     root.rebuild()
     pointerGate.reset()
+    if (root.settings.setupCompleted === false || (tour.started && !tour.singleStep)) root.resumeTour()
     Qt.callLater(function() {
-      input.forceActiveFocus()
+      if (root.tourActive) tour.focusStep()
+      else input.forceActiveFocus()
       resultList.positionViewAtBeginning()
     })
   }
@@ -353,8 +378,90 @@ Item {
   }
 
   function toggle() {
+    // The current shortcut pressed while the recorder step is up: show it as
+    // "already your shortcut" instead of closing the tour.
+    if (root.opened && root.tourActive && tour.step === 1) {
+      tour.selected = root.tourBinding.current
+      return
+    }
     if (root.opened) root.dismiss()
     else root.open("{}")
+  }
+
+  // Re-raise an unfinished tour at the step the user left; fresh start otherwise.
+  function resumeTour() {
+    if (tour.started && !tour.singleStep) {
+      root.tourActive = true
+      root.readBinding()
+      tour.focusStep()
+    } else root.showTour(0, false)
+  }
+
+  // ------------------------------------------------------------- tour
+  function showTour(step, single) {
+    input.text = ""
+    root.armedKey = ""
+    root.bindingState = ""
+    root.tourActive = true
+    tour.start(root.settings, step, single)
+    root.readBinding()
+  }
+
+  // `patch` holds the settings keys to persist; {} means the tour was only
+  // looked at (single-step Done, or Esc on the shortcut chooser).
+  function finishTour(patch) {
+    root.tourActive = false
+    if (Object.keys(patch || {}).length > 0) {
+      settingsWriteProc.running = false
+      settingsWriteProc.stdinEnabled = true
+      settingsWriteProc.command = root.helperArgv(["write-settings"])
+      settingsWriteProc.running = true
+      settingsWriteProc.write(JSON.stringify(patch))
+      settingsWriteProc.stdinEnabled = false
+    }
+    Qt.callLater(function() { input.forceActiveFocus() })
+  }
+
+  function readBinding() {
+    bindingProc.running = false
+    bindingProc.action = "read"
+    bindingProc.command = root.helperArgv(["read-binding"])
+    bindingProc.running = true
+  }
+
+  function writeBinding(chord) {
+    root.bindingState = "busy"
+    bindingProc.running = false
+    bindingProc.action = "write"
+    bindingProc.command = root.helperArgv(["write-binding", chord])
+    bindingProc.running = true
+  }
+
+  function revertBinding() {
+    root.bindingState = "busy"
+    bindingProc.running = false
+    bindingProc.action = "revert"
+    bindingProc.command = root.helperArgv(["revert-binding"])
+    bindingProc.running = true
+  }
+
+  // Chords arrive in two spellings (bindings.lua and the keybindings menu),
+  // so every one is canonicalized before the tour compares them.
+  function loadBinding(reply) {
+    var bound = {}
+    var raw = (reply && reply.bound && typeof reply.bound === "object") ? reply.bound : {}
+    for (var key in raw) {
+      if (!Object.prototype.hasOwnProperty.call(raw, key)) continue
+      var chord = Chord.normalize(key)
+      if (chord && !Object.prototype.hasOwnProperty.call(bound, chord))
+        bound[chord] = String(raw[key]).slice(0, 80)
+    }
+    root.tourBinding = {
+      current: Chord.normalize(reply && reply.current ? reply.current : ""),
+      previous: Chord.normalize(reply && reply.previous ? reply.previous : ""),
+      managed: !!(reply && reply.managed === true),
+      bound: bound
+    }
   }
 
   // ------------------------------------------------------------- usage
@@ -419,8 +526,13 @@ Item {
       maxApps: isFinite(parsed.maxApps)
         ? Util.clamp(parsed.maxApps, 3, root.maxAppRows) : 8,
       maxSuggestions: isFinite(parsed.maxSuggestions)
-        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4
+        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4,
+      setupCompleted: parsed.setupCompleted !== false
     }
+    // First run: the flag usually lands after open() has already drawn the
+    // search card, so the tour is raised from here as well.
+    if (root.opened && !root.tourActive && root.settings.setupCompleted === false)
+      root.resumeTour()
   }
 
   // ------------------------------------------------------------- providers
@@ -831,18 +943,27 @@ Item {
     return out
   }
 
+  // Ranks one source on its own and keeps the head, so a cap selects the best
+  // rows of that section rather than whichever ones the catalogue listed first.
+  function idleSlice(list, limit) {
+    return root.globallyRank(list, "").slice(0, limit)
+  }
+
   function idleRows() {
     var fallback = root.appRows("", false)
-    if (!root.settings.learningEnabled || !root.usage || !root.usage.items
-        || Object.keys(root.usage.items).length === 0) return fallback
-    var out = root.appRows("", true)
-      .concat(root.windowRows("", true))
-      .concat(root.commandRows("", true, true))
-      .concat(root.learnedFileRows())
-    for (var i = 0; i < fallback.length && out.length < root.maxGlobalResults; i++) {
-      if (!Frecency.hasItem(root.usage, fallback[i].stableId)) out.push(fallback[i])
+    var learned = root.settings.learningEnabled && root.usage && root.usage.items
+      && Object.keys(root.usage.items).length > 0
+    var apps = learned ? root.idleSlice(root.appRows("", true), root.idleAppRows) : []
+    // Top up from the catalogue until the section is full, so a fresh install
+    // still opens on a usable list rather than an empty one.
+    for (var i = 0; i < fallback.length && apps.length < root.idleAppRows; i++) {
+      if (!learned || !Frecency.hasItem(root.usage, fallback[i].stableId)) apps.push(fallback[i])
     }
-    return out.length ? out : fallback
+    if (!learned) return apps
+    return apps
+      .concat(root.idleSlice(root.commandRows("", true, true), root.idleCommandRows))
+      .concat(root.idleSlice(root.learnedFileRows(), root.idleFileRows))
+      .concat(root.idleSlice(root.windowRows("", true), root.idleWindowRows))
   }
 
   function suggestionResultRows(q) {
@@ -1198,6 +1319,14 @@ Item {
     case "spotlight-plugin":
       root.dismiss()
       root.openPath(root.pluginFolder)
+      break
+
+    case "spotlight-tour":
+      root.showTour(0, false)
+      break
+
+    case "spotlight-shortcut":
+      root.showTour(1, true)
       break
 
     case "spotlight-data":
@@ -1599,6 +1728,48 @@ Item {
     }
   }
 
+  // Separate from maintenanceProc: a failed write must surface as an error
+  // state instead of being swallowed, and a settings write must never cancel
+  // an in-flight binding write.
+  Process {
+    id: bindingProc
+    property string action: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (bindingProc.action === "read") {
+          root.loadBinding(reply)
+        } else if (!reply) {
+          root.bindingState = "error"
+        } else {
+          bindingReloadProc.action = bindingProc.action
+          bindingReloadProc.command = ["hyprctl", "reload"]
+          bindingReloadProc.running = true
+        }
+      }
+    }
+  }
+
+  Process {
+    id: bindingReloadProc
+    property string action: ""
+    onExited: function(exitCode) {
+      root.bindingState = exitCode === 0
+        ? (bindingReloadProc.action === "write" ? "ok" : "reverted")
+        : "reloadError"
+      root.readBinding()
+    }
+  }
+
+  Process {
+    id: settingsWriteProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (root.helperReply(text)) root.loadSettings(text)
+    }
+  }
+
   Component.onCompleted: {
     if (root.appLibrary) root.appLibrary.refreshIcons()
     root.refreshSettings()
@@ -1619,6 +1790,9 @@ Item {
     usageWriteProc.running = false
     icsProc.running = false
     maintenanceProc.running = false
+    bindingProc.running = false
+    bindingReloadProc.running = false
+    settingsWriteProc.running = false
   }
 
   Connections {
@@ -1720,6 +1894,9 @@ Item {
 
     Rectangle {
       id: card
+      // Hidden items cannot hold focus, which is what keeps keystrokes away
+      // from the search input while the tour is up.
+      visible: !root.tourActive
 
       readonly property int listHeight: Math.min(root.maxListHeight, root.contentHeight)
       readonly property bool hasResults: displayModel.count > 0
@@ -1747,16 +1924,6 @@ Item {
 
       // Swallow clicks so they don't reach the dismiss MouseArea behind.
       MouseArea { anchors.fill: parent; onClicked: {} }
-
-      // The 1px light line along the top edge is what makes a translucent
-      // panel read as glass rather than as a flat tint.
-      Rectangle {
-        anchors { top: parent.top; left: parent.left; right: parent.right }
-        anchors.margins: root.hairline
-        height: root.hairline
-        color: root.glassSheen
-        radius: height
-      }
 
       // ------------------------------------------------------- search row
       Item {
@@ -1854,11 +2021,13 @@ Item {
         }
       }
 
+      // Both dividers stop where a row's highlight stops, so the list reads as
+      // one column with two rules across it rather than as three stacked bands.
       Rectangle {
         id: searchDivider
         anchors { top: searchRow.bottom; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.hairline
-        anchors.rightMargin: root.hairline
+        anchors.leftMargin: root.listPadding
+        anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
         visible: card.hasResults
@@ -1900,7 +2069,8 @@ Item {
               font.pixelSize: Style.font.caption
               anchors.left: parent.left
               anchors.leftMargin: root.gutter
-              anchors.verticalCenter: parent.verticalCenter
+              anchors.bottom: parent.bottom
+              anchors.bottomMargin: Style.space(3)
             }
           }
 
@@ -2047,8 +2217,8 @@ Item {
       // ------------------------------------------------------- footer
       Rectangle {
         anchors { bottom: footer.top; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.hairline
-        anchors.rightMargin: root.hairline
+        anchors.leftMargin: root.listPadding
+        anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
       }
@@ -2067,7 +2237,9 @@ Item {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           anchors.left: parent.left
-          anchors.leftMargin: root.gutter
+          // The mark sits inside the rail the rows use, so it reads as a corner
+          // signature, but not so far out that it crowds the rounded corner.
+          anchors.leftMargin: Style.space(15)
           anchors.verticalCenter: parent.verticalCenter
         }
 
@@ -2100,6 +2272,29 @@ Item {
           }
         }
       }
+    }
+
+    SetupTour {
+      id: tour
+      visible: root.tourActive
+      anchors.centerIn: parent
+      foreground: root.foreground
+      accent: root.accent
+      fontFamily: root.fontFamily
+      surface: root.glassBackground
+      surfaceBorder: root.glassBorder
+      sheen: root.glassSheen
+      hairline: root.hairline
+      surfaceRadius: root.cardRadius
+      rowRadius: root.rowRadius
+      currentBinding: root.tourBinding.current
+      previousBinding: root.tourBinding.previous
+      bindingManaged: root.tourBinding.managed
+      boundChords: root.tourBinding.bound
+      bindingState: root.bindingState
+      onBindingRequested: function(chord) { root.writeBinding(chord) }
+      onRevertRequested: root.revertBinding()
+      onFinished: function(patch) { root.finishTour(patch) }
     }
   }
 
