@@ -107,9 +107,7 @@ FocusScope {
   }
 
   function completed(patch) {
-    var out = Object.assign({}, patch)
-    out.setupCompleted = true
-    return out
+    return Object.assign({}, patch, { setupCompleted: true })
   }
 
   function skip() { finished(singleStep ? {} : completed({})) }
