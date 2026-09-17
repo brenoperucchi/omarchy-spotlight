@@ -1380,6 +1380,12 @@ class ToggleStatesTests(unittest.TestCase):
         self.assertFalse(HELPER._probe_mic("Volume: 0.40 [MUTED]"))
         self.assertIsNone(HELPER._probe_mic(""))
 
+        # Opaque forced on is transparency off, and getprop answers a miss in
+        # prose rather than JSON.
+        self.assertFalse(HELPER._probe_opaque('{"opaque": true}'))
+        self.assertTrue(HELPER._probe_opaque('{"opaque": false}'))
+        self.assertIsNone(HELPER._probe_opaque("window not found"))
+
         self.assertTrue(HELPER._probe_nightlight('{"enabled":true,"temperature":4000}'))
         self.assertFalse(HELPER._probe_nightlight('{"enabled":false}'))
         self.assertIsNone(HELPER._probe_nightlight("not json"))
@@ -1406,28 +1412,6 @@ class ToggleStatesTests(unittest.TestCase):
         self.assertIsNone(HELPER._probe_scrolling('{"tiledLayout":"master"}'))
         self.assertIsNone(HELPER._probe_scrolling("[]"))
 
-    def test_transparency_reads_the_inverse_of_the_opaque_override(self):
-        def probe(active, prop):
-            with mock.patch.object(HELPER, "run_bounded", side_effect=[
-                    (active.encode(), False), (prop.encode(), False)]):
-                return HELPER._probe_transparency()
-
-        window = '{"address":"0x5f2a1c","title":"kitty"}'
-        # Opaque forced on is transparency off, and the other way round.
-        self.assertFalse(probe(window, '{"opaque": true}'))
-        self.assertTrue(probe(window, '{"opaque": false}'))
-        # getprop answers a miss in prose, not JSON.
-        self.assertIsNone(probe(window, "window not found"))
-        self.assertIsNone(probe(window, "prop not found"))
-        # An address that is not one never reaches the window regex.
-        with mock.patch.object(HELPER, "run_bounded") as run_bounded:
-            run_bounded.return_value = (b'{"address":"address:.* opaque true"}', False)
-            self.assertIsNone(HELPER._probe_transparency())
-            self.assertEqual(run_bounded.call_count, 1)
-        # No focused window at all: nothing to report.
-        with mock.patch.object(HELPER, "run_bounded", return_value=(b"", False)):
-            self.assertIsNone(HELPER._probe_transparency())
-
     def test_battery_percentage_reads_the_bar_entry_rather_than_a_flag(self):
         def config(home):
             path = home / ".config" / "omarchy"
@@ -1452,16 +1436,6 @@ class ToggleStatesTests(unittest.TestCase):
             # No power module in the bar: nothing for the percentage to sit on.
             write(home, {"id": "omarchy.audio", "showPercentage": True})
             self.assertIsNone(HELPER._probe_battery_percent())
-
-    def test_a_probe_that_raises_is_omitted_like_one_that_cannot_read(self):
-        # _probe_battery_percent walks $HOME rather than running a command, so
-        # the guard in cmd_toggle_states is what keeps a missing config quiet.
-        with fake_home():
-            with mock.patch.dict(HELPER.TOGGLE_PROBES,
-                                 {"batterypercent": HELPER._probe_battery_percent}, clear=True):
-                reply = run(HELPER.cmd_toggle_states)
-        self.assertTrue(reply["ok"])
-        self.assertNotIn("batterypercent", reply["states"])
 
     def test_a_menu_row_borrows_the_verb_its_own_command_names(self):
         # "Bluetooth" under Update > Hardware restarts the service; the

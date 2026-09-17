@@ -1458,6 +1458,14 @@ def _tri(text, on_token, off_token):
     return {on_token: True, off_token: False}.get(text.strip().lower())
 
 
+def _probe_json(text, key):
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed.get(key) if isinstance(parsed, dict) else None
+
+
 def _probe_bluetooth(text):
     # The soft block is the state Omarchy persists (see omarchy-bluetooth-power),
     # so read the block rather than BlueZ: no D-Bus round trip, and it survives
@@ -1469,11 +1477,7 @@ def _probe_bluetooth(text):
 
 
 def _probe_nightlight(text):
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        return None
-    value = parsed.get("enabled") if isinstance(parsed, dict) else None
+    value = _probe_json(text, "enabled")
     return value if isinstance(value, bool) else None
 
 
@@ -1493,23 +1497,12 @@ def _cmd_probe(argv, test):
     return lambda: _run_probe(argv, test)
 
 
-HYPR_ADDRESS_RE = re.compile(r"^0x[0-9a-f]{1,32}$")
-
-
-def _probe_json(text, key):
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        return None
-    return parsed.get(key) if isinstance(parsed, dict) else None
-
-
 def _probe_fullscreen(text):
     # `fullscreenClient == 2` is the state omarchy-hyprland-window-tiled-
     # fullscreen-toggle sets, and it is the focused window's, not the session's:
     # Spotlight is a layer surface, so the window behind it stays the active one.
     value = _probe_json(text, "fullscreenClient")
-    return value == 2 if isinstance(value, int) and not isinstance(value, bool) else None
+    return value == 2 if isinstance(value, int) else None
 
 
 def _probe_scrolling(text):
@@ -1519,19 +1512,10 @@ def _probe_scrolling(text):
     return _tri(value, "scrolling", "dwindle") if isinstance(value, str) else None
 
 
-def _probe_transparency():
-    """`opaque` is an override on the focused window rather than a session
-    setting, and hyprctl reports it only through `getprop` — it is absent from
-    the window's own JSON. Opaque on means transparency off, so the switch
-    reads the inverse of what the prop says."""
-    active, _ = run_bounded(["hyprctl", "activewindow", "-j"], TOGGLE_BYTES, TOGGLE_DEADLINE)
-    address = _probe_json(active.decode("utf-8", "replace"), "address")
-    # The address goes back out as part of a window regex, so it has to look
-    # like an address and nothing else, whatever hyprctl printed.
-    if not isinstance(address, str) or not HYPR_ADDRESS_RE.match(address):
-        return None
-    value = _run_probe(["hyprctl", "-j", "getprop", "address:" + address, "opaque"],
-                       lambda text: _probe_json(text, "opaque"))
+def _probe_opaque(text):
+    # `opaque` is a per-window override, absent from the window's own JSON and
+    # readable only through getprop. Opaque on is transparency off.
+    value = _probe_json(text, "opaque")
     return (not value) if isinstance(value, bool) else None
 
 
@@ -1579,7 +1563,9 @@ TOGGLE_PROBES = {
     "fullscreen": _cmd_probe(["hyprctl", "activewindow", "-j"], _probe_fullscreen),
     "scrolling":  _cmd_probe(["hyprctl", "activeworkspace", "-j"], _probe_scrolling),
     "batterypercent": _probe_battery_percent,
-    "transparency": _probe_transparency,
+    # `activewindow` is getprop's own selector for the focused window, so no
+    # address has to be resolved first and none goes back out in a regex.
+    "transparency": _cmd_probe(["hyprctl", "-j", "getprop", "activewindow", "opaque"], _probe_opaque),
 }
 
 
