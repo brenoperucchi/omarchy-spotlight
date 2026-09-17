@@ -317,35 +317,6 @@ FocusScope {
     }
   }
 
-  // Pill switch: accent track when on, dim track when off. Presentation only,
-  // the surrounding row owns the click.
-  component PillSwitch: Item {
-    id: sw
-    property bool checked: false
-    implicitWidth: Style.space(40)
-    implicitHeight: Style.space(22)
-
-    Rectangle {
-      anchors.fill: parent
-      radius: height / 2
-      color: sw.checked ? tour.accent : Util.alpha(tour.foreground, 0.18)
-
-      Behavior on color { ColorAnimation { duration: 120 } }
-
-      Rectangle {
-        width: parent.height - Style.space(6)
-        height: width
-        radius: width / 2
-        anchors.verticalCenter: parent.verticalCenter
-        x: sw.checked ? parent.width - width - Style.space(3) : Style.space(3)
-        color: sw.checked ? tour.onAccent : Util.alpha(tour.foreground, 0.75)
-
-        Behavior on x { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
-        Behavior on color { ColorAnimation { duration: 120 } }
-      }
-    }
-  }
-
   component Feature: RowLayout {
     id: feat
     property string glyph: ""
@@ -450,7 +421,13 @@ FocusScope {
           }
         }
 
-        PillSwitch { visible: row.switchable; checked: row.checked }
+        PillSwitch {
+          visible: row.switchable
+          checked: row.checked
+          accent: tour.accent
+          foreground: tour.foreground
+          knobOn: tour.onAccent
+        }
 
         Item {
           id: trailingSlot
@@ -508,7 +485,12 @@ FocusScope {
         }
       }
 
-      PillSwitch { checked: sub.checked }
+      PillSwitch {
+        checked: sub.checked
+        accent: tour.accent
+        foreground: tour.foreground
+        knobOn: tour.onAccent
+      }
     }
 
     MouseArea {

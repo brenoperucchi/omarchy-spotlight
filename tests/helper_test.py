@@ -1339,5 +1339,78 @@ class TokenizeVsBashTests(unittest.TestCase):
             self._assert_agrees_with_bash(action)
 
 
+class ToggleStatesTests(unittest.TestCase):
+    """The switch in the result list is only ever as honest as this probe."""
+
+    def _states(self):
+        """Flag files only: the command probes get their own tests."""
+        with mock.patch.dict(HELPER.TOGGLE_PROBES, {}, clear=True):
+            reply = run(HELPER.cmd_toggle_states)
+        self.assertTrue(reply["ok"])
+        return reply["states"]
+
+    def test_flag_files_report_their_documented_sense(self):
+        with fake_home() as home:
+            for name, (rel, present_is_on) in HELPER.TOGGLE_FLAGS.items():
+                flag = home / rel
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.write_text("")
+                self.assertEqual(self._states()[name], present_is_on, name)
+                flag.unlink()
+                self.assertEqual(self._states()[name], not present_is_on, name)
+
+    def test_a_probe_that_cannot_run_is_omitted_rather_than_reported_off(self):
+        with fake_home():
+            with mock.patch.dict(HELPER.TOGGLE_PROBES, {
+                "missing": HELPER._cmd_probe(["spotlight-no-such-binary"], lambda t: True),
+                "unreadable": HELPER._cmd_probe(["printf", "something else entirely"],
+                                                lambda t: HELPER._tri(t, "yes", "no")),
+            }, clear=True):
+                reply = run(HELPER.cmd_toggle_states)
+        self.assertTrue(reply["ok"])
+        self.assertNotIn("missing", reply["states"])
+        self.assertNotIn("unreadable", reply["states"])
+
+    def test_probe_output_maps_to_three_answers_never_to_a_guess(self):
+        self.assertTrue(HELPER._probe_bluetooth("bluetooth unblocked\nwlan blocked\n"))
+        self.assertFalse(HELPER._probe_bluetooth("bluetooth blocked\nwlan unblocked\n"))
+        self.assertIsNone(HELPER._probe_bluetooth("wlan unblocked\n"))
+
+        self.assertTrue(HELPER._probe_mic("Volume: 0.40"))
+        self.assertFalse(HELPER._probe_mic("Volume: 0.40 [MUTED]"))
+        self.assertIsNone(HELPER._probe_mic(""))
+
+        self.assertTrue(HELPER._probe_nightlight('{"enabled":true,"temperature":4000}'))
+        self.assertFalse(HELPER._probe_nightlight('{"enabled":false}'))
+        self.assertIsNone(HELPER._probe_nightlight("not json"))
+        self.assertIsNone(HELPER._probe_nightlight('{"enabled":"yes"}'))
+
+        self.assertTrue(HELPER._tri("Mute: no", "mute: no", "mute: yes"))
+        self.assertFalse(HELPER._tri("Mute: yes", "mute: no", "mute: yes"))
+        self.assertIsNone(HELPER._tri("", "mute: no", "mute: yes"))
+        # "enabled" is a substring of "disabled": the off answer has to win.
+        self.assertFalse(HELPER._tri("disabled", "enabled", "disabled"))
+        self.assertTrue(HELPER._tri("enabled\n", "enabled", "disabled"))
+
+    def test_a_menu_row_borrows_the_verb_its_own_command_names(self):
+        # "Bluetooth" under Update > Hardware restarts the service; the
+        # curated "Toggle Bluetooth" row flips the radio. Same noun, opposite
+        # expectations, so the title has to carry the verb.
+        self.assertEqual(
+            HELPER._menu_title("Bluetooth", ["omarchy-launch-floating-terminal-with-presentation",
+                                             "omarchy-restart-bluetooth"]),
+            "Restart Bluetooth")
+        self.assertEqual(HELPER._menu_title("Restart Audio", ["omarchy-restart-audio"]),
+                         "Restart Audio")
+        self.assertEqual(HELPER._menu_title("Nightlight", ["omarchy-toggle-nightlight"]),
+                         "Nightlight")
+        self.assertEqual(HELPER._menu_title("Anything", []), "Anything")
+
+    def test_the_handler_survives_a_home_it_cannot_use(self):
+        with mock.patch.dict(os.environ, {"HOME": "not-absolute"}):
+            reply = self._states()
+        self.assertEqual(reply, {})
+
+
 if __name__ == "__main__":
     unittest.main()

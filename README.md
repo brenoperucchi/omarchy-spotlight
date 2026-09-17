@@ -104,6 +104,8 @@ Press Enter and the selected result performs its primary action.
 | `chrom` | Finds matching applications alongside other local results |
 | `disc` | Finds the app and matching open windows |
 | `screenshot` | Finds Omarchy and system actions |
+| `bluetooth` | Shows a switch with the current state; Enter flips it without closing Spotlight |
+| `wifi` | Same for the Wi-Fi radio, night light, mute, Do Not Disturb and the rest |
 | `lock` | Locks the session |
 | `theme` | Finds theme-related actions |
 | `12*7+3` | Calculates the result; Enter copies it |
@@ -248,10 +250,14 @@ It is a small detail, but it makes fast keyboard use much more predictable.
 | `PageUp` `PageDown` | Move one screen |
 | `↵` | Run the primary action shown in the footer |
 | `⇧↵` / `Ctrl+↵` | Run the secondary action, when available |
+| `Space` | Flip the switch on the selected row; types a space on every other row |
+| `⇧Space` | Always types a literal space |
 | `Tab` | Complete the query with the selected application's name |
 | `Esc` | Clear the query; close Spotlight if the query is already empty |
 
 The search field is a real text input, so normal selection, caret movement, and shortcuts such as `Ctrl+V` work as expected.
+
+Rows for settings that are on or off show a switch instead of an `Action` label: Bluetooth, Wi-Fi, night light, speaker and microphone mute, Do Not Disturb, Stay Awake, the status bar, touchpad and touchscreen, window gaps, the screensaver, and crash capture. The switch shows the live state, `Enter`, `Space` or a click flips it, and Spotlight stays open so you can see it move. A setting whose state cannot be read shows no switch rather than a wrong one.
 
 Destructive system actions are harder to trigger accidentally: logout, restart, and shutdown require a second `Enter` before Spotlight performs them.
 

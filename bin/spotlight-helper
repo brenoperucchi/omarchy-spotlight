@@ -102,6 +102,9 @@ FILES_JSON_BUDGET_CHARS = 200000
 
 REMINDER_BYTES = 256 * 1024
 REMINDER_DEADLINE = 3.0
+
+TOGGLE_BYTES = 8 * 1024
+TOGGLE_DEADLINE = 1.0
 REMINDER_COUNT = 50
 REMINDER_FIELD_CHARS = 200
 
@@ -870,6 +873,11 @@ def _menu_merge(default_items, user_items):
     return merged, order
 
 
+def _menu_title(label, argv):
+    restart = any(os.path.basename(token).startswith("omarchy-restart-") for token in argv)
+    return "Restart " + label if restart and not label.lower().startswith("restart") else label
+
+
 def _menu_breadcrumb(item_id, merged):
     """Ancestor labels, root-to-parent, joined for a subtitle - `Style ›
     Font` rather than a bare `Font`, since dozens of leaves share generic
@@ -1198,7 +1206,7 @@ def _menu_commands():
         keywords = " ".join(a for a in aliases if isinstance(a, str)) if isinstance(aliases, list) else ""
         row = {
             "key": "menu:" + item_id,
-            "title": label,
+            "title": _menu_title(label, argv),
             "subtitle": _menu_breadcrumb(item_id, merged),
             "icon": clamp_text(entry.get("icon") or "", 8),
             "argv": argv,
@@ -1427,6 +1435,103 @@ def cmd_reminders():
                 "atTime": clamp_text(item.get("atTime"), REMINDER_FIELD_CHARS),
             })
     emit({"reminders": rows})
+
+
+# ------------------------------------------------------------ toggle states
+# Omarchy keeps most toggles as a flag file, and most of those flags record the
+# *off* state (`bar-off`), so which way the file reads is part of the table.
+# state id -> (path relative to $HOME, does the file existing mean "on")
+TOGGLE_FLAGS = {
+    "idle":         (".local/state/omarchy/indicators/stay-awake", True),
+    "bar":          (".local/state/omarchy/toggles/bar-off", False),
+    "screensaver":  (".local/state/omarchy/toggles/screensaver-off", False),
+    "suspend":      (".local/state/omarchy/toggles/suspend-off", False),
+    "crashcapture": (".local/state/omarchy/toggles/crash-capture-off", False),
+    "touchpad":     (".local/state/omarchy/toggles/hypr/touchpad-disabled-name", False),
+    "touchscreen":  (".local/state/omarchy/toggles/hypr/touchscreen-disabled-name", False),
+    "gaps":         (".local/state/omarchy/toggles/hypr/window-no-gaps.lua", False),
+    "aspect":       (".local/state/omarchy/toggles/hypr/single-window-aspect-ratio.lua", True),
+}
+
+
+def _tri(text, on_token, off_token):
+    return {on_token: True, off_token: False}.get(text.strip().lower())
+
+
+def _probe_bluetooth(text):
+    # The soft block is the state Omarchy persists (see omarchy-bluetooth-power),
+    # so read the block rather than BlueZ: no D-Bus round trip, and it survives
+    # a reboot the same way the setting does.
+    for line in text.splitlines():
+        if line.startswith("bluetooth"):
+            return line.split()[-1] == "unblocked"
+    return None
+
+
+def _probe_nightlight(text):
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    value = parsed.get("enabled") if isinstance(parsed, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def _probe_mic(text):
+    # wpctl always prints "Volume: <n>", and appends "[MUTED]" when muted.
+    if "volume" not in text.lower():
+        return None
+    return "muted" not in text.lower()
+
+
+def _run_probe(argv, test):
+    raw, _ = run_bounded(argv, TOGGLE_BYTES, TOGGLE_DEADLINE)
+    return test(raw.decode("utf-8", "replace").strip())
+
+
+def _cmd_probe(argv, test):
+    return lambda: _run_probe(argv, test)
+
+
+def _probe_speaker():
+    """The sink has to be resolved first: DSP sinks mean @DEFAULT_SINK@ is not
+    always the device omarchy-audio-output-volume actually mutes."""
+    sink, _ = run_bounded(["omarchy-audio-output-sink"], TOGGLE_BYTES, TOGGLE_DEADLINE)
+    sink = sink.decode("utf-8", "replace").strip()
+    if not sink:
+        return None
+    return _run_probe(["pactl", "get-sink-mute", sink],
+                      lambda t: _tri(t, "mute: no", "mute: yes"))
+
+
+# state id -> a probe that answers True, False, or None for "cannot tell"
+TOGGLE_PROBES = {
+    "bluetooth":  _cmd_probe(["rfkill", "--noheadings", "--output", "TYPE,SOFT"], _probe_bluetooth),
+    "wifi":       _cmd_probe(["nmcli", "radio", "wifi"], lambda t: _tri(t, "enabled", "disabled")),
+    "nightlight": _cmd_probe(["omarchy-toggle-nightlight", "--status"], _probe_nightlight),
+    "dnd":        _cmd_probe(["omarchy-shell", "notifications", "dndState"], lambda t: _tri(t, "on", "off")),
+    "mic":        _cmd_probe(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"], _probe_mic),
+    "speaker":    _probe_speaker,
+}
+
+
+def cmd_toggle_states():
+    home = os.environ.get("HOME", "")
+    states = {}
+    if home.startswith("/"):
+        for name, (rel, present_is_on) in TOGGLE_FLAGS.items():
+            states[name] = os.path.exists(os.path.join(home, rel)) == present_is_on
+
+    # ponytail: probes run one after another, ~300ms worst case off the UI
+    # thread; parallelise with Popen if open latency ever shows it.
+    for name, probe in TOGGLE_PROBES.items():
+        try:
+            value = probe()
+        except (Denied, OSError, ValueError):
+            value = None
+        if value is not None:
+            states[name] = bool(value)
+    emit({"states": states})
 
 
 def cmd_suggest(argv):
@@ -1841,6 +1946,7 @@ COMMANDS = {
     "read-clipboard": (cmd_read_clipboard, False),
     "clipboard-copy": (cmd_clipboard_copy, True),
     "reminders": (cmd_reminders, False),
+    "toggle-states": (cmd_toggle_states, False),
     "suggest": (cmd_suggest, True),
     "files": (cmd_files, True),
     "write-ics": (cmd_write_ics, True),
