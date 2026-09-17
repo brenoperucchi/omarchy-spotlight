@@ -1405,12 +1405,39 @@ class ToggleStatesTests(unittest.TestCase):
         # nothing usable, are both unknown rather than "not fullscreen".
         self.assertIsNone(HELPER._probe_fullscreen('{"address":"0x1"}'))
         self.assertIsNone(HELPER._probe_fullscreen("Invalid"))
+        # Nothing focused at all is off rather than unknown, so the home screen
+        # keeps the switch instead of falling back to a plain action row.
+        self.assertFalse(HELPER._probe_fullscreen("{}"))
 
         self.assertTrue(HELPER._probe_scrolling('{"tiledLayout":"scrolling"}'))
         self.assertFalse(HELPER._probe_scrolling('{"tiledLayout":"dwindle"}'))
         # A third layout is neither end of this switch.
         self.assertIsNone(HELPER._probe_scrolling('{"tiledLayout":"master"}'))
         self.assertIsNone(HELPER._probe_scrolling("[]"))
+
+    def test_transparency_reads_a_second_time_only_when_getprop_cannot_answer(self):
+        calls = []
+
+        def hyprctl(getprop, activewindow):
+            def fake(argv, *_rest):
+                calls.append(argv)
+                out = getprop if "getprop" in argv else activewindow
+                return out.encode(), False
+            return fake
+
+        with mock.patch.object(HELPER, "run_bounded", hyprctl('{"opaque": false}', "{}")):
+            self.assertTrue(HELPER._probe_transparency())
+        self.assertEqual(len(calls), 1)
+
+        del calls[:]
+        with mock.patch.object(HELPER, "run_bounded", hyprctl("Invalid window", "{}")):
+            self.assertFalse(HELPER._probe_transparency())
+        self.assertEqual(len(calls), 2)
+
+        del calls[:]
+        with mock.patch.object(HELPER, "run_bounded",
+                               hyprctl("Invalid window", '{"address":"0x1"}')):
+            self.assertIsNone(HELPER._probe_transparency())
 
     def test_battery_percentage_reads_the_bar_entry_rather_than_a_flag(self):
         def config(home):

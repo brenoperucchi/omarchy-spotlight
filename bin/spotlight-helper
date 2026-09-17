@@ -1497,10 +1497,22 @@ def _cmd_probe(argv, test):
     return lambda: _run_probe(argv, test)
 
 
+def _no_window(text):
+    # `activewindow` answers `{}` with nothing focused, which is a state rather
+    # than a gap: a window that does not exist is neither fullscreen nor
+    # transparent, so those two rows keep their switch on the home screen.
+    try:
+        return json.loads(text) == {}
+    except ValueError:
+        return False
+
+
 def _probe_fullscreen(text):
     # `fullscreenClient == 2` is the state omarchy-hyprland-window-tiled-
     # fullscreen-toggle sets, and it is the focused window's, not the session's:
     # Spotlight is a layer surface, so the window behind it stays the active one.
+    if _no_window(text):
+        return False
     value = _probe_json(text, "fullscreenClient")
     return value == 2 if isinstance(value, int) else None
 
@@ -1517,6 +1529,16 @@ def _probe_opaque(text):
     # readable only through getprop. Opaque on is transparency off.
     value = _probe_json(text, "opaque")
     return (not value) if isinstance(value, bool) else None
+
+
+def _probe_transparency():
+    """getprop answers the focused window in one call, which is the whole story
+    whenever there is one. Only when it cannot is a second call worth paying
+    for, to tell an empty home screen (off) from a probe that broke (unknown)."""
+    value = _run_probe(["hyprctl", "-j", "getprop", "activewindow", "opaque"], _probe_opaque)
+    if value is None and _run_probe(["hyprctl", "activewindow", "-j"], _no_window):
+        return False
+    return value
 
 
 def _probe_battery_percent():
@@ -1565,7 +1587,7 @@ TOGGLE_PROBES = {
     "batterypercent": _probe_battery_percent,
     # `activewindow` is getprop's own selector for the focused window, so no
     # address has to be resolved first and none goes back out in a regex.
-    "transparency": _cmd_probe(["hyprctl", "-j", "getprop", "activewindow", "opaque"], _probe_opaque),
+    "transparency": _probe_transparency,
 }
 
 
