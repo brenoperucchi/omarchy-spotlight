@@ -14,13 +14,15 @@ Launch apps, jump to open windows, find files, search your clipboard, run Omarch
 omarchy plugin add https://github.com/maajix/omarchy-spotlight.git --enable
 ```
 
-Spotlight's first-run tour can add a shortcut for you. Until then, open it from a terminal:
+Press `Alt+Space` to open Spotlight.
+
+That shortcut is set up on install: it is unbound on stock Omarchy, so Spotlight claims it on first run by writing one marked block to `~/.config/hypr/bindings.lua` and reloading Hyprland. If something on your system already holds `Alt+Space`, Spotlight leaves it alone and the first-run tour asks you to pick another one. The tour can change the shortcut at any time and can undo its own changes.
+
+If the shortcut does not work, open Spotlight from a terminal instead:
 
 ```bash
 omarchy-shell shell toggle io.github.maajix.spotlight '{}'
 ```
-
-The recommended shortcut is `Alt+Space`, which is unbound on stock Omarchy. The tour detects conflicts, writes one marked block to `~/.config/hypr/bindings.lua`, reloads Hyprland, and can undo its own changes.
 
 <details>
 <summary>Set the shortcut manually</summary>
