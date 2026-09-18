@@ -88,14 +88,12 @@ Spotlight runs inside the existing `omarchy-shell` process, so there is no separ
 | `PageUp` `PageDown` | Move one screen |
 | `Enter` | Run the primary action shown in the footer |
 | `Shift+Enter` or `Ctrl+Enter` | Run the secondary action, when available |
-| `Space` | Flip the selected switch; type a space on other rows |
-| `Shift+Space` | Always type a literal space |
 | `Tab` | Complete the query with the selected app name |
 | `Esc` | Clear the query; close Spotlight when already empty |
 
 The search field is a normal text input, so selection, caret movement, and shortcuts such as `Ctrl+V` work as expected.
 
-Settings that are on or off show their live state instead of a generic action label. This covers Bluetooth, Wi-Fi, night light, speaker and microphone mute, Do Not Disturb, Stay Awake, the status bar, the battery percentage, touchpad and touchscreen, window gaps, the square aspect ratio, the screensaver, crash capture, and suspend in the system menu. Window transparency, tiled fullscreen, and the workspace layout show a switch too, read from the focused window or the active workspace rather than from a global setting. `Enter`, `Space`, or a click flips the switch while Spotlight stays open. If a state cannot be read, Spotlight shows no switch rather than guessing.
+Settings that are on or off show their live state instead of a generic action label. This covers Bluetooth, Wi-Fi, night light, speaker and microphone mute, Do Not Disturb, Stay Awake, the status bar, the battery percentage, touchpad and touchscreen, window gaps, the square aspect ratio, the screensaver, crash capture, and suspend in the system menu. Window transparency, tiled fullscreen, and the workspace layout show a switch too, read from the focused window or the active workspace rather than from a global setting. `Enter` or a click flips the switch while Spotlight stays open. If a state cannot be read, Spotlight shows no switch rather than guessing.
 
 ## Search syntax
 

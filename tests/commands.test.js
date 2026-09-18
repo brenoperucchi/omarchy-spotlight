@@ -5,6 +5,7 @@ const test = require("node:test")
 const Commands = require("../lib/Commands.js")
 
 const helper = fs.readFileSync(path.join(__dirname, "..", "bin", "spotlight-helper"), "utf8")
+const qml = fs.readFileSync(path.join(__dirname, "..", "Spotlight.qml"), "utf8")
 const entries = Commands.commands().concat(Commands.quicklinks())
 
 test("a catalogue key names exactly one entry", () => {
@@ -19,12 +20,9 @@ test("a catalogue key names exactly one entry", () => {
 
 test("every shell entry carries a runnable argv vector", () => {
   for (const c of entries.filter(e => e.kind === "shell")) {
-    const pair = Array.isArray(c.argvOn) && Array.isArray(c.argvOff)
-    assert.ok(Array.isArray(c.argv) || pair, c.key + " has neither argv nor an argvOn/argvOff pair")
-    for (const argv of [c.argv, c.argvOn, c.argvOff].filter(Array.isArray)) {
-      assert.ok(argv.length > 0, c.key + " has an empty argv")
-      for (const token of argv) assert.equal(typeof token, "string")
-    }
+    assert.ok(Array.isArray(c.argv), c.key + " has no argv")
+    assert.ok(c.argv.length > 0, c.key + " has an empty argv")
+    for (const token of c.argv) assert.equal(typeof token, "string")
   }
 })
 
@@ -37,13 +35,11 @@ test("every state id is one the helper knows how to probe", () => {
   }
 })
 
-test("a toggle without a toggle verb declares both directions", () => {
-  // argvOn on its own would leave the row able to turn the setting on and
-  // never off, which is worse than the plain action row it replaced.
-  for (const c of entries) {
-    assert.equal(Array.isArray(c.argvOn), Array.isArray(c.argvOff), c.key + " declares only one direction")
-    if (Array.isArray(c.argvOn)) assert.ok(c.state, c.key + " has directions but no state to read")
-  }
+test("toggle interaction needs a known state and leaves Space to the search field", () => {
+  assert.match(qml,
+    /if \(r\.payload\.stateId && root\.toggleStates\[r\.payload\.stateId\] !== undefined\)/)
+  assert.doesNotMatch(qml, /event\.key === Qt\.Key_Space/)
+  assert.match(qml, /id: toggleReconcile\s+interval: 2500/)
 })
 
 test("argvId collapses the menu spelling of a command onto the catalogue one", () => {

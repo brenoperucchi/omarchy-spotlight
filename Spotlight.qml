@@ -861,7 +861,7 @@ Item {
         stableId: isWeb ? "" : "action:" + c.key,
         payload: {
           argv: c.argv || [], id: c.id || "", url: c.url || "",
-          stateId: c.state || "", argvOn: c.argvOn || null, argvOff: c.argvOff || null
+          stateId: c.state || ""
         }
       }))
     }
@@ -1270,14 +1270,12 @@ Item {
     root.activate(root.pinnedKey ? root.selectedIndex : root.firstSelectableIndex(), secondary)
   }
 
-  // Flipping a switch: send the direction, not a toggle verb, whenever the
-  // entry offers one, so a stale read cannot turn a press into a no-op. The
-  // switch moves immediately and the probe confirms it a beat later, because
-  // the command is detached and has no result to wait for.
+  // The switch moves immediately and the probe confirms it after the detached
+  // command has had time to finish.
   function flipToggle(r) {
     var id = r.payload.stateId
     var on = root.toggleStates[id] === true
-    var argv = on ? (r.payload.argvOff || r.payload.argv) : (r.payload.argvOn || r.payload.argv)
+    var argv = r.payload.argv
     if (!Array.isArray(argv) || argv.length === 0) return
     Util.execArgv(argv)
     var next = ({})
@@ -1285,14 +1283,6 @@ Item {
     next[id] = !on
     root.toggleStates = next
     toggleReconcile.restart()
-  }
-
-  // Space flips the selected switch, so it only stays a space when the row
-  // under the cursor has no switch to flip.
-  function toggleableSelection() {
-    var sel = root.selectedRow()
-    var id = (sel && sel.payload) ? sel.payload.stateId : ""
-    return !!id && root.toggleStates[id] !== undefined
   }
 
   function activate(index, secondary) {
@@ -1316,7 +1306,7 @@ Item {
     case "shell":
       // A toggle row keeps the panel open: its switch is the only feedback the
       // press produces, and closing over it would hide exactly that.
-      if (r.payload.stateId) {
+      if (r.payload.stateId && root.toggleStates[r.payload.stateId] !== undefined) {
         root.flipToggle(r)
         break
       }
@@ -1738,12 +1728,11 @@ Item {
     }
   }
 
-  // One confirmation pass, not a poll: the toggle scripts write their flag
-  // before they return, so a single re-read catches both the flag and the
-  // case where the command refused to do anything.
+  // One late confirmation pass, not a poll. Night Light's cold start retries
+  // for up to two seconds, so probing earlier can capture an intermediate state.
   Timer {
     id: toggleReconcile
-    interval: 400
+    interval: 2500
     onTriggered: root.refreshToggleStates()
   }
 
@@ -2103,14 +2092,6 @@ Item {
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               var secondary = (event.modifiers & Qt.ShiftModifier) || (event.modifiers & Qt.ControlModifier)
               root.activateSelection(secondary ? true : false)
-              event.accepted = true
-            } else if (event.key === Qt.Key_Space
-                && !(event.modifiers & Qt.ShiftModifier)
-                && root.toggleableSelection()) {
-              // Space is the switch while a toggle row is selected. Shift is
-              // the way back to a literal space, for a query whose own words
-              // keep landing on one of these rows.
-              root.activateSelection(false)
               event.accepted = true
             } else if (event.key === Qt.Key_Tab) {
               // Tab completes the query with the selected row's title, the way
