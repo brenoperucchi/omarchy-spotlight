@@ -4,7 +4,7 @@
   "name": "Spotlight",
   "version": "1.4.1",
   "author": "Max Randhahn",
-  "description": "A Raycast-style launcher for Omarchy. Launch apps, switch windows, find files, search clipboard history, run Omarchy commands and toggle system settings such as Wi-Fi or night light from one input. It also understands natural language: 20% of 250 or 10 km to miles for calculations and unit conversions, remind me in 20m to check the oven for reminders, and prefixes such as yt or gh for web search. Spotlight runs inside omarchy-shell and opens instantly, without a separate background process.",
+  "description": "A Raycast-style launcher for Omarchy. Spotlight launches applications, switches windows, finds files, searches clipboard history, runs Omarchy commands and toggles system settings such as Wi-Fi and night light from a single input. Natural-language input covers calculations, unit conversions, reminders and calendar events, and search prefixes route queries to sites such as YouTube and GitHub. Spotlight runs inside omarchy-shell and opens instantly, without a separate background process.",
   "kinds": [
     "overlay",
     "menu"
