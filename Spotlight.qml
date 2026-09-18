@@ -189,6 +189,11 @@ Item {
   property bool tourActive: false
   property string bindingState: ""
   property var tourBinding: ({ current: "", previous: "", managed: false, bound: {} })
+  // Written on first run so a fresh install has a working shortcut before the
+  // tour is ever opened. The tour can still change it.
+  readonly property string defaultChord: "ALT + SPACE"
+  property bool autoBindPending: false
+  property bool autoBindDone: false
 
   // ------------------------------------------------------------- theme
   // Shares the [menu] surface tokens, so any theme that styles the Omarchy
@@ -504,6 +509,15 @@ Item {
       managed: !!(reply && reply.managed === true),
       bound: bound
     }
+    // First run only: claim the recommended chord when Spotlight has no
+    // shortcut and nothing else holds it. A helper that could not read the
+    // live keybindings answers bound: null, and then nothing is taken.
+    if (root.autoBindPending) {
+      root.autoBindPending = false
+      if (root.tourBinding.current === "" && reply && reply.bound
+          && !Object.prototype.hasOwnProperty.call(bound, root.defaultChord))
+        root.writeBinding(root.defaultChord)
+    }
   }
 
   // ------------------------------------------------------------- usage
@@ -575,6 +589,11 @@ Item {
     // search card, so the tour is raised from here as well.
     if (root.opened && !root.tourActive && root.settings.setupCompleted === false)
       root.resumeTour()
+    if (root.settings.setupCompleted === false && !root.autoBindDone) {
+      root.autoBindDone = true
+      root.autoBindPending = true
+      root.readBinding()
+    }
   }
 
   // ------------------------------------------------------------- providers
