@@ -677,14 +677,18 @@ Item {
       out.push(root.row({
         key: "event.create", kind: "event",
         title: event.title,
-        subtitle: event.label + " · " + NaturalTime.formatDuration(event.durationMinutes),
+        subtitle: event.label + " · " + (event.allDay ? "All day" : NaturalTime.formatDuration(event.durationMinutes)),
         accessory: "Calendar", icon: "󰸗",
         primaryLabel: "Add to Google Calendar",
         secondaryLabel: "Save .ics file",
         payload: {
           title: event.title,
-          start: NaturalTime.toUtcBasic(event.start),
-          end: NaturalTime.toUtcBasic(event.end)
+          allDay: event.allDay === true,
+          // An all-day event travels as a plain date on both sides; DTEND and
+          // the Google range are exclusive, which is why end is the next day.
+          start: event.allDay ? NaturalTime.toDateBasic(event.start) : NaturalTime.toUtcBasic(event.start),
+          end: event.allDay ? NaturalTime.toDateBasic(event.end) : NaturalTime.toUtcBasic(event.end),
+          stamp: NaturalTime.toUtcBasic(event.start)
         }
       }))
     }
@@ -1445,8 +1449,10 @@ Item {
   // is stepped over rather than written through, and it reports back the path
   // it actually used.
   function saveIcs(payload) {
-    var stamp = String(payload.start).replace(/[^0-9TZ]/g, "").slice(0, 32)
+    var stamp = String(payload.stamp || payload.start).replace(/[^0-9TZ]/g, "").slice(0, 32)
     if (!stamp) return
+    // DTSTAMP is always an instant; only the event's own bounds go date-only.
+    var dateOnly = payload.allDay ? ";VALUE=DATE" : ""
     var ics = [
       "BEGIN:VCALENDAR",
       "VERSION:2.0",
@@ -1455,9 +1461,9 @@ Item {
       "METHOD:PUBLISH",
       "BEGIN:VEVENT",
       "UID:spotlight-" + stamp + "@omarchy",
-      "DTSTAMP:" + payload.start,
-      "DTSTART:" + payload.start,
-      "DTEND:" + payload.end,
+      "DTSTAMP:" + stamp,
+      "DTSTART" + dateOnly + ":" + payload.start,
+      "DTEND" + dateOnly + ":" + payload.end,
       "SUMMARY:" + String(payload.title).replace(/([,;\\])/g, "\\$1").slice(0, 400),
       "END:VEVENT",
       "END:VCALENDAR",
