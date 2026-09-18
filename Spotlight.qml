@@ -192,7 +192,6 @@ Item {
   // Written on first run so a fresh install has a working shortcut before the
   // tour is ever opened. The tour can still change it.
   readonly property string defaultChord: "ALT + SPACE"
-  property bool autoBindPending: false
   property bool autoBindDone: false
 
   // ------------------------------------------------------------- theme
@@ -512,8 +511,8 @@ Item {
     // First run only: claim the recommended chord when Spotlight has no
     // shortcut and nothing else holds it. A helper that could not read the
     // live keybindings answers bound: null, and then nothing is taken.
-    if (root.autoBindPending) {
-      root.autoBindPending = false
+    if (!root.autoBindDone && root.settings.setupCompleted === false) {
+      root.autoBindDone = true
       if (root.tourBinding.current === "" && reply && reply.bound
           && !Object.prototype.hasOwnProperty.call(bound, root.defaultChord))
         root.writeBinding(root.defaultChord)
@@ -589,11 +588,10 @@ Item {
     // search card, so the tour is raised from here as well.
     if (root.opened && !root.tourActive && root.settings.setupCompleted === false)
       root.resumeTour()
-    if (root.settings.setupCompleted === false && !root.autoBindDone) {
-      root.autoBindDone = true
-      root.autoBindPending = true
+    // resumeTour has just read the binding when the launcher is open; only
+    // a closed launcher needs a read of its own.
+    if (root.settings.setupCompleted === false && !root.autoBindDone && !root.tourActive)
       root.readBinding()
-    }
   }
 
   // ------------------------------------------------------------- providers
