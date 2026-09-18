@@ -53,6 +53,36 @@ test("a date with no clock runs all day and ends the next day", () => {
   assert.equal(event("birthday party 25.03.2027 for 2h").allDay, false)
 })
 
+// parseWhen used to stop at the first phrase, so "in 3w" was the whole answer
+// and "at 15pm" stayed in the title with the event left running all day.
+test("a day and a clock written as two phrases describe one moment", () => {
+  const cases = [
+    ["birthday party in 3w at 15pm", "Birthday party", "2026-10-10 15:00"],
+    ["birthday party at 3pm tomorrow", "Birthday party", "2026-09-20 15:00"],
+    ["standup in 3 days at 9:30", "Standup", "2026-09-22 09:30"],
+    ["lunch at 13:00 next monday", "Lunch", "2026-09-21 13:00"],
+    ["party at noon tomorrow", "Party", "2026-09-20 12:00"]
+  ]
+  for (const [text, title, start] of cases) {
+    const e = event(text)
+    assert.ok(e, text)
+    assert.equal(e.title, title, text)
+    assert.equal(stamp(e.start), start, text)
+    assert.equal(e.allDay, false, text)
+  }
+})
+
+// A clock standing alone rolls past an hour that has already gone by. Once a
+// day phrase turns up the literal hour is what was meant, so late in the
+// evening "in 3 days at 9:30" must not become half past nine at night.
+test("merging a clock onto a day keeps the hour as written", () => {
+  const late = new Date(2026, 8, 19, 22, 0, 0)
+  assert.equal(stamp(NaturalTime.parseEvent("standup in 3 days at 9:30", late).start), "2026-09-22 09:30")
+  assert.equal(stamp(NaturalTime.parseEvent("lunch at 13:00 next monday", late).start), "2026-09-21 13:00")
+  // A clock on its own still rolls forward.
+  assert.equal(stamp(NaturalTime.parseEvent("meeting at 9", late).start), "2026-09-20 21:00")
+})
+
 test("the trigger word is the title when the query is nothing but a date", () => {
   assert.equal(event("meeting 25 sep").title, "Meeting")
   assert.equal(event("meeting next monday").title, "Meeting")
