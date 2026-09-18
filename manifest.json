@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "io.github.maajix.spotlight",
   "name": "Spotlight",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": "Max Randhahn",
-  "description": "Unified Spotlight search for apps, windows, files, actions, clipboard, natural-language tools and the web",
+  "description": "A Raycast-style launcher for Omarchy. Launch apps, switch windows, find files, search clipboard history, run Omarchy commands and toggle system settings such as Wi-Fi or night light from one input. It also understands natural language: 20% of 250 or 10 km to miles for calculations and unit conversions, remind me in 20m to check the oven for reminders, and prefixes such as yt or gh for web search. Spotlight runs inside omarchy-shell and opens instantly, without a separate background process.",
   "kinds": [
     "overlay",
     "menu"
