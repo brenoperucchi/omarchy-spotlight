@@ -1339,5 +1339,125 @@ class TokenizeVsBashTests(unittest.TestCase):
             self._assert_agrees_with_bash(action)
 
 
+class ToggleStatesTests(unittest.TestCase):
+    """The switch in the result list is only ever as honest as this probe."""
+
+    def _states(self):
+        """Flag files only: the command probes get their own tests."""
+        with mock.patch.dict(HELPER.TOGGLE_PROBES, {}, clear=True):
+            reply = run(HELPER.cmd_toggle_states)
+        self.assertTrue(reply["ok"])
+        return reply["states"]
+
+    def test_flag_files_report_their_documented_sense(self):
+        with fake_home() as home:
+            for name, (rel, present_is_on) in HELPER.TOGGLE_FLAGS.items():
+                flag = home / rel
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.write_text("")
+                self.assertEqual(self._states()[name], present_is_on, name)
+                flag.unlink()
+                self.assertEqual(self._states()[name], not present_is_on, name)
+
+    def test_a_probe_that_cannot_run_is_omitted_rather_than_reported_off(self):
+        with fake_home():
+            with mock.patch.dict(HELPER.TOGGLE_PROBES, {
+                "missing": HELPER._cmd_probe(["spotlight-no-such-binary"], lambda t: True),
+                "unreadable": HELPER._cmd_probe(["printf", "something else entirely"],
+                                                lambda t: HELPER._tri(t, "yes", "no")),
+            }, clear=True):
+                reply = run(HELPER.cmd_toggle_states)
+        self.assertTrue(reply["ok"])
+        self.assertNotIn("missing", reply["states"])
+        self.assertNotIn("unreadable", reply["states"])
+
+    def test_probe_output_maps_to_three_answers_never_to_a_guess(self):
+        self.assertTrue(HELPER._probe_bluetooth("bluetooth unblocked\nwlan blocked\n"))
+        self.assertFalse(HELPER._probe_bluetooth("bluetooth blocked\nwlan unblocked\n"))
+        self.assertIsNone(HELPER._probe_bluetooth("wlan unblocked\n"))
+
+        self.assertTrue(HELPER._probe_mic("Volume: 0.40"))
+        self.assertFalse(HELPER._probe_mic("Volume: 0.40 [MUTED]"))
+        self.assertIsNone(HELPER._probe_mic(""))
+
+        # Opaque forced on is transparency off, and getprop answers a miss in
+        # prose rather than JSON.
+        self.assertFalse(HELPER._probe_opaque('{"opaque": true}'))
+        self.assertTrue(HELPER._probe_opaque('{"opaque": false}'))
+        self.assertIsNone(HELPER._probe_opaque("window not found"))
+
+        self.assertTrue(HELPER._probe_nightlight('{"enabled":true,"temperature":4000}'))
+        self.assertFalse(HELPER._probe_nightlight('{"enabled":false}'))
+        self.assertIsNone(HELPER._probe_nightlight("not json"))
+        self.assertIsNone(HELPER._probe_nightlight('{"enabled":"yes"}'))
+
+        self.assertTrue(HELPER._tri("Mute: no", "mute: no", "mute: yes"))
+        self.assertFalse(HELPER._tri("Mute: yes", "mute: no", "mute: yes"))
+        self.assertIsNone(HELPER._tri("", "mute: no", "mute: yes"))
+        # "enabled" is a substring of "disabled": the off answer has to win.
+        self.assertFalse(HELPER._tri("disabled", "enabled", "disabled"))
+        self.assertTrue(HELPER._tri("enabled\n", "enabled", "disabled"))
+
+    def test_the_hyprland_probes_read_the_focused_window_and_workspace(self):
+        self.assertTrue(HELPER._probe_fullscreen('{"fullscreenClient":2}'))
+        self.assertFalse(HELPER._probe_fullscreen('{"fullscreenClient":0}'))
+        # A window that reports no such field, and a hyprctl that printed
+        # nothing usable, are both unknown rather than "not fullscreen".
+        self.assertIsNone(HELPER._probe_fullscreen('{"address":"0x1"}'))
+        self.assertIsNone(HELPER._probe_fullscreen("Invalid"))
+        # With no focused window there is no target to toggle.
+        self.assertIsNone(HELPER._probe_fullscreen("{}"))
+
+        self.assertTrue(HELPER._probe_scrolling('{"tiledLayout":"scrolling"}'))
+        self.assertFalse(HELPER._probe_scrolling('{"tiledLayout":"dwindle"}'))
+        # A third layout is neither end of this switch.
+        self.assertIsNone(HELPER._probe_scrolling('{"tiledLayout":"master"}'))
+        self.assertIsNone(HELPER._probe_scrolling("[]"))
+
+    def test_battery_percentage_reads_the_bar_entry_rather_than_a_flag(self):
+        def config(home):
+            path = home / ".config" / "omarchy"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        def write(home, *entries):
+            (config(home) / "shell.json").write_text(json.dumps(
+                {"bar": {"layout": {"left": [{"id": "omarchy.menu"}], "right": list(entries)}}}))
+
+        with fake_home() as home:
+            config(home)
+            self.assertIsNone(HELPER._probe_battery_percent())
+            write(home, {"id": "omarchy.power", "showPercentage": True})
+            self.assertTrue(HELPER._probe_battery_percent())
+            write(home, {"id": "omarchy.power", "showPercentage": False})
+            self.assertFalse(HELPER._probe_battery_percent())
+            # The bar's own default is off, so an entry that never toggled it
+            # reads off rather than unknown.
+            write(home, {"id": "omarchy.power"})
+            self.assertFalse(HELPER._probe_battery_percent())
+            # No power module in the bar: nothing for the percentage to sit on.
+            write(home, {"id": "omarchy.audio", "showPercentage": True})
+            self.assertIsNone(HELPER._probe_battery_percent())
+
+    def test_a_menu_row_borrows_the_verb_its_own_command_names(self):
+        # "Bluetooth" under Update > Hardware restarts the service; the
+        # curated "Toggle Bluetooth" row flips the radio. Same noun, opposite
+        # expectations, so the title has to carry the verb.
+        self.assertEqual(
+            HELPER._menu_title("Bluetooth", ["omarchy-launch-floating-terminal-with-presentation",
+                                             "omarchy-restart-bluetooth"]),
+            "Restart Bluetooth")
+        self.assertEqual(HELPER._menu_title("Restart Audio", ["omarchy-restart-audio"]),
+                         "Restart Audio")
+        self.assertEqual(HELPER._menu_title("Nightlight", ["omarchy-toggle-nightlight"]),
+                         "Nightlight")
+        self.assertEqual(HELPER._menu_title("Anything", []), "Anything")
+
+    def test_the_handler_survives_a_home_it_cannot_use(self):
+        with mock.patch.dict(os.environ, {"HOME": "not-absolute"}):
+            reply = self._states()
+        self.assertEqual(reply, {})
+
+
 if __name__ == "__main__":
     unittest.main()

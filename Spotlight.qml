@@ -123,6 +123,12 @@ Item {
   // source.
   property var menuCommands: []
 
+  // Live state of every toggle the helper could actually read, as
+  // { stateId: bool }. An id the probe could not answer is absent rather than
+  // false, and an absent id draws no switch: a missing state is unknown, and
+  // a switch that is confidently wrong is worse than no switch at all.
+  property var toggleStates: ({})
+
   // Versioned learning store: stable items plus query-local contexts. The
   // helper validates and bounds it before it reaches this long-lived process.
   property var usage: Frecency.emptyStore()
@@ -272,6 +278,7 @@ Item {
     // up an edit just as promptly.
     root.refreshSettings()
     root.refreshReminders()
+    root.refreshToggleStates()
     root.rebuild()
     pointerGate.reset()
     if (root.settings.setupCompleted === false || (tour.started && !tour.singleStep)) root.resumeTour()
@@ -343,12 +350,23 @@ Item {
   function loadMenuCommands(raw) {
     var reply = root.helperReply(raw)
     var list = (reply && Array.isArray(reply.commands)) ? reply.commands : []
+    // The menu tree carries actions the catalogue already curates, only under
+    // the menu's own wording, so the merged list showed both. The catalogue
+    // copy wins: it is the one with the hand-written subtitle, the keywords
+    // and, for a toggle, the state the switch reads.
+    var known = {}
+    var catalogue = Commands.commands()
+    for (var k = 0; k < catalogue.length; k++) {
+      var id = Commands.argvId(catalogue[k].argv)
+      if (id) known[id] = true
+    }
     var out = []
     for (var i = 0; i < list.length; i++) {
       var c = list[i]
       if (!c || !Array.isArray(c.argv) || c.argv.length === 0) continue
       var argv = []
       for (var j = 0; j < c.argv.length; j++) argv.push(String(c.argv[j]))
+      if (known[Commands.argvId(argv)]) continue
       out.push({
         key: String(c.key || ""),
         title: String(c.title || "").slice(0, root.maxTitleChars),
@@ -366,6 +384,30 @@ Item {
     remindersProc.running = false
     remindersProc.command = root.helperArgv(["reminders"])
     remindersProc.running = true
+  }
+
+  function refreshToggleStates() {
+    toggleStatesProc.running = false
+    toggleStatesProc.command = root.helperArgv(["toggle-states"])
+    toggleStatesProc.running = true
+  }
+
+  function loadToggleStates(raw) {
+    var reply = root.helperReply(raw)
+    var states = (reply && reply.states && typeof reply.states === "object") ? reply.states : {}
+    var out = ({})
+    for (var id in states)
+      if (states[id] === true || states[id] === false) out[id] = states[id]
+    root.toggleStates = out
+  }
+
+  // The label under the cursor names what Enter will do, so a toggle row says
+  // which way it is about to go rather than a generic "Run".
+  function primaryLabelFor(r) {
+    var id = (r && r.payload) ? r.payload.stateId : ""
+    if (id && root.toggleStates[id] !== undefined)
+      return root.toggleStates[id] === true ? "Turn off" : "Turn on"
+    return r ? r.primaryLabel : ""
   }
 
   // Escape and successful activations go through here so the shell's
@@ -817,7 +859,10 @@ Item {
         keywords: c.keywords,
         resultType: isWeb ? "web" : "action",
         stableId: isWeb ? "" : "action:" + c.key,
-        payload: { argv: c.argv || [], id: c.id || "", url: c.url || "" }
+        payload: {
+          argv: c.argv || [], id: c.id || "", url: c.url || "",
+          stateId: c.state || ""
+        }
       }))
     }
     return out
@@ -1108,6 +1153,7 @@ Item {
         rowImage: r.image,
         rowMono: r.mono,
         rowSection: root.resultSection(r),
+        rowState: (r.payload && r.payload.stateId) ? r.payload.stateId : "",
         selectable: r.kind !== "noop"
       })
     }
@@ -1224,6 +1270,21 @@ Item {
     root.activate(root.pinnedKey ? root.selectedIndex : root.firstSelectableIndex(), secondary)
   }
 
+  // The switch moves immediately and the probe confirms it after the detached
+  // command has had time to finish.
+  function flipToggle(r) {
+    var id = r.payload.stateId
+    var on = root.toggleStates[id] === true
+    var argv = r.payload.argv
+    if (!Array.isArray(argv) || argv.length === 0) return
+    Util.execArgv(argv)
+    var next = ({})
+    for (var k in root.toggleStates) next[k] = root.toggleStates[k]
+    next[id] = !on
+    root.toggleStates = next
+    toggleReconcile.restart()
+  }
+
   function activate(index, secondary) {
     var r = root.rows[index]
     if (!r || r.kind === "noop") return
@@ -1243,6 +1304,12 @@ Item {
       break
 
     case "shell":
+      // A toggle row keeps the panel open: its switch is the only feedback the
+      // press produces, and closing over it would hide exactly that.
+      if (r.payload.stateId && root.toggleStates[r.payload.stateId] !== undefined) {
+        root.flipToggle(r)
+        break
+      }
       root.dismiss()
       // execArgv, not execDetached: the catalogue holds argv vectors rather
       // than command lines, so nothing here is ever re-tokenized by a shell.
@@ -1651,6 +1718,22 @@ Item {
       waitForEnd: true
       onStreamFinished: root.loadReminders(text)
     }
+  }
+
+  Process {
+    id: toggleStatesProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadToggleStates(text)
+    }
+  }
+
+  // One late confirmation pass, not a poll. Night Light's cold start retries
+  // for up to two seconds, so probing earlier can capture an intermediate state.
+  Timer {
+    id: toggleReconcile
+    interval: 2500
+    onTriggered: root.refreshToggleStates()
   }
 
   Process {
@@ -2088,9 +2171,12 @@ Item {
             required property string rowIcon
             required property string rowImage
             required property bool rowMono
+            required property string rowState
             required property bool selectable
 
             readonly property bool hasCursor: root.cursorActive && resultRow.index === root.selectedIndex
+            readonly property bool showSwitch: resultRow.rowState.length > 0
+              && root.toggleStates[resultRow.rowState] !== undefined
             readonly property bool armed: root.armedKey.length > 0
               && root.rows[resultRow.rowIndex]
               && root.rows[resultRow.rowIndex].key === root.armedKey
@@ -2140,8 +2226,21 @@ Item {
               anchors.verticalCenter: rowSurface.verticalCenter
             }
 
+            PillSwitch {
+              id: rowSwitch
+              visible: resultRow.showSwitch && !resultRow.armed
+              checked: root.toggleStates[resultRow.rowState] === true
+              accent: root.accent
+              foreground: root.foreground
+              anchors.right: rowSurface.right
+              anchors.rightMargin: root.rowInset
+              anchors.verticalCenter: rowSurface.verticalCenter
+            }
+
             Text {
               id: accessoryText
+              // The switch replaces the "Action" label rather than crowding it.
+              visible: !rowSwitch.visible
               text: resultRow.armed ? "Press ↵ again to confirm" : resultRow.rowAccessory
               textFormat: Text.PlainText
               color: resultRow.armed ? Color.urgent : root.foreground
@@ -2156,7 +2255,7 @@ Item {
             Row {
               anchors.left: rowGlyph.right
               anchors.leftMargin: Style.space(10)
-              anchors.right: accessoryText.left
+              anchors.right: rowSwitch.visible ? rowSwitch.left : accessoryText.left
               anchors.rightMargin: Style.space(14)
               anchors.verticalCenter: rowSurface.verticalCenter
               spacing: Style.space(8)
@@ -2251,7 +2350,7 @@ Item {
 
           Text {
             readonly property var sel: root.selectedRow()
-            text: sel && sel.primaryLabel ? "↵  " + sel.primaryLabel : ""
+            text: sel && sel.primaryLabel ? "↵  " + root.primaryLabelFor(sel) : ""
             visible: text.length > 0
             textFormat: Text.PlainText
             color: root.foreground
