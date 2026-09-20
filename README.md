@@ -62,6 +62,7 @@ From two characters onward, Spotlight searches enabled local providers together 
 | `f invoice` | Search files and folders |
 | `~/Downloads/` | Search within a path |
 | `cb ssh` | Search clipboard history; Enter copies the full item |
+| `man ssh` or `tldr ssh` | Show tldr examples for a command; Enter copies one, Shift+Enter opens it in a terminal without running it |
 | `gh quickshell` | Search GitHub |
 | `tr what is this to german` | Translate into the named language |
 | `example.com` | Open a URL directly |
@@ -113,6 +114,7 @@ Most of the time, just type. Use a filter when you want results from one provide
 | `unit:` or `convert:` | Unit converter |
 | `reminder:` | Reminders |
 | `calendar:` or `event:` | Calendar events |
+| `man:` or `tldr:` | Command help from tldr pages |
 
 A filter without a query shows a hint instead of launching a broad search.
 
@@ -212,6 +214,7 @@ Spotlight has no telemetry, analytics, or background network service. Almost eve
 | --- | --- |
 | `suggestqueries.google.com` | While typing, only when `webSuggestions` is enabled |
 | Your browser | After you activate a web search, URL, or calendar result |
+| tldr-pages (GitHub) | First lookup of a command not yet in `~/.cache/tldr`, via the `tldr` client |
 
 Live web suggestions are disabled by default. Normal web searches do not send the query anywhere until you activate the result.
 
@@ -228,6 +231,7 @@ Spotlight targets **Omarchy 4 (Quattro)** and only uses components included with
 | `python3` | File and subprocess helper |
 | `fd` | File search |
 | `wl-clipboard` | Clipboard actions |
+| `tldr` | Command help pages |
 
 ## Update and remove
 

@@ -1459,5 +1459,48 @@ class ToggleStatesTests(unittest.TestCase):
         self.assertEqual(reply, {})
 
 
+class TldrTests(unittest.TestCase):
+    PAGE = (
+        "# scp\n\n> Secure copy.\n> Copy files between hosts.\n"
+        "> More information: <https://man.archlinux.org/man/scp.1>.\n\n"
+        "- Copy a local file to a remote host:\n\n"
+        "`scp {{path/to/local_file}} {{remote_host}}:{{path/to/remote_file}}`\n\n"
+        "- Recursively copy a directory:\n\n"
+        "`scp {{[-r|--recursive]}} {{path/to/dir}} {{remote_host}}:{{path/to/dir}}`\n"
+    )
+
+    def _tldr(self, output, argv):
+        calls = []
+        real = HELPER.run_bounded
+        HELPER.run_bounded = lambda a, cap, deadline: calls.append(a) or (output, False)
+        self.addCleanup(setattr, HELPER, "run_bounded", real)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            HELPER.cmd_tldr(argv)
+        return json.loads(buf.getvalue()), calls
+
+    def test_page_is_parsed_into_ordered_examples(self):
+        reply, _ = self._tldr(self.PAGE.encode(), ["scp"])
+        self.assertEqual(reply["title"], "scp")
+        self.assertEqual(reply["description"], "Secure copy. Copy files between hosts.")
+        self.assertEqual(reply["url"], "https://man.archlinux.org/man/scp.1")
+        self.assertEqual(reply["examples"], [
+            {"description": "Copy a local file to a remote host",
+             "command": "scp path/to/local_file remote_host:path/to/remote_file"},
+            {"description": "Recursively copy a directory",
+             "command": "scp --recursive path/to/dir remote_host:path/to/dir"},
+        ])
+
+    def test_multi_word_page_joins_and_unknown_page_is_not_found(self):
+        reply, calls = self._tldr(b"`git-commit` documentation is not available.\n", ["Git Commit"])
+        self.assertEqual(calls, [["tldr", "-m", "--", "git-commit"]])
+        self.assertEqual(reply, {"ok": True, "page": "git-commit", "found": False})
+
+    def test_bad_page_names_are_denied(self):
+        for name in ["../x", "-v", "", "a b/c"]:
+            with self.assertRaises(HELPER.Denied):
+                HELPER.cmd_tldr([name])
+
+
 if __name__ == "__main__":
     unittest.main()

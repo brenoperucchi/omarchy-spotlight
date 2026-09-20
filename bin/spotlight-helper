@@ -108,6 +108,16 @@ TOGGLE_DEADLINE = 1.0
 REMINDER_COUNT = 50
 REMINDER_FIELD_CHARS = 200
 
+TLDR_BYTES = 64 * 1024
+# The first lookup of a page downloads it, so this is generous for a launcher.
+TLDR_DEADLINE = 4.0
+TLDR_EXAMPLES = 16
+TLDR_FIELD_CHARS = 512
+TLDR_PAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
+# `{{[-a|--all]}}` is an option alternation; the long form reads best.
+TLDR_OPTION_RE = re.compile(r"\{\{\[[^|\]]*\|([^\]]*)\]\}\}")
+TLDR_URL_RE = re.compile(r"More information: <(https?://[^>\s]+)>")
+
 ICS_STAMP_RE = re.compile(r"^[0-9TZ]{1,32}$")
 
 # ~/.config/hypr/bindings.lua is edited only through a delimited block at EOF
@@ -1709,6 +1719,48 @@ def cmd_files(argv):
     emit({"files": rows})
 
 
+def cmd_tldr(argv):
+    if len(argv) != 1:
+        raise Denied("tldr takes one page name")
+    # `tldr git commit` is the page git-commit; joining here means the name
+    # the regex vets is exactly the one that reaches `tldr`.
+    page = "-".join(clamp_text(argv[0], TLDR_FIELD_CHARS).lower().split())
+    if not TLDR_PAGE_RE.match(page):
+        raise Denied("bad tldr page name")
+    raw, _ = run_bounded(["tldr", "-m", "--", page], TLDR_BYTES, TLDR_DEADLINE)
+
+    # An unknown page is not an error to the client (exit 0, a one-line
+    # notice), so "found" is the presence of the markdown heading.
+    title = ""
+    description = []
+    url = ""
+    examples = []
+    pending = ""
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        line = line.strip()
+        if line.startswith("# "):
+            title = clamp_text(line[2:], TLDR_FIELD_CHARS)
+        elif line.startswith("> "):
+            match = TLDR_URL_RE.search(line)
+            if match:
+                url = match.group(1)
+            else:
+                description.append(line[2:])
+        elif line.startswith("- "):
+            pending = line[2:].rstrip(":")
+        elif line.startswith("`") and pending and len(examples) < TLDR_EXAMPLES:
+            command = TLDR_OPTION_RE.sub(r"\1", line.strip("`")).replace("{{", "").replace("}}", "")
+            examples.append({"description": clamp_text(pending, TLDR_FIELD_CHARS),
+                             "command": clamp_text(command, TLDR_FIELD_CHARS)})
+            pending = ""
+    if not title:
+        emit({"page": page, "found": False})
+        return
+    emit({"page": page, "found": True, "title": title,
+          "description": clamp_text(" ".join(description), TLDR_FIELD_CHARS),
+          "url": url, "examples": examples})
+
+
 def cmd_write_ics(argv):
     if len(argv) != 1 or not ICS_STAMP_RE.match(argv[0]):
         raise Denied("bad event stamp")
@@ -2002,6 +2054,7 @@ COMMANDS = {
     "toggle-states": (cmd_toggle_states, False),
     "suggest": (cmd_suggest, True),
     "files": (cmd_files, True),
+    "tldr": (cmd_tldr, True),
     "write-ics": (cmd_write_ics, True),
     "write-settings": (cmd_write_settings, False),
     "read-binding": (cmd_read_binding, False),

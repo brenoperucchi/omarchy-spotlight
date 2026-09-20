@@ -13,7 +13,8 @@ test("every colon alias selects exactly one provider", () => {
     calc: "calc",
     unit: "unit", convert: "unit",
     reminder: "reminder",
-    calendar: "calendar", event: "calendar"
+    calendar: "calendar", event: "calendar",
+    man: "tldr", tldr: "tldr"
   }
 
   for (const [alias, provider] of Object.entries(aliases)) {
@@ -24,13 +25,13 @@ test("every colon alias selects exactly one provider", () => {
 })
 
 test("empty filters are hints, not unscoped searches", () => {
-  for (const alias of ["a", "window", "f", "cmd", "cb", "web", "calc", "unit", "reminder", "event"]) {
+  for (const alias of ["a", "window", "f", "cmd", "cb", "web", "calc", "unit", "reminder", "event", "man"]) {
     const parsed = Query.parse(`${alias}:`)
     assert.equal(parsed.empty, true, alias)
   }
 })
 
-test("legacy file and clipboard syntax remains exclusive", () => {
+test("space-separated file, clipboard and tldr syntax is exclusive", () => {
   assert.deepEqual(
     { filter: Query.parse("f report").filter, text: Query.parse("f report").text },
     { filter: "file", text: "report" }
@@ -39,6 +40,12 @@ test("legacy file and clipboard syntax remains exclusive", () => {
     { filter: Query.parse("cb ssh").filter, text: Query.parse("cb ssh").text },
     { filter: "clipboard", text: "ssh" }
   )
+  assert.deepEqual(
+    { filter: Query.parse("man scp").filter, text: Query.parse("man scp").text },
+    { filter: "tldr", text: "scp" }
+  )
+  assert.equal(Query.parse("tldr git commit").text, "git commit")
+  assert.equal(Query.parse("tldr: scp").filter, "tldr")
 })
 
 test("window colon filter does not steal the Wikipedia bang", () => {
