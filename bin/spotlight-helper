@@ -117,6 +117,8 @@ TLDR_PAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
 # `{{[-a|--all]}}` is an option alternation; the long form reads best.
 TLDR_OPTION_RE = re.compile(r"\{\{\[[^|\]]*\|([^\]]*)\]\}\}")
 TLDR_URL_RE = re.compile(r"More information: <(https?://[^>\s]+)>")
+# tldr marks the option letter as in "[c]reate"; a heading reads better plain.
+TLDR_HINT_RE = re.compile(r"\[(\w)\]")
 
 ICS_STAMP_RE = re.compile(r"^[0-9TZ]{1,32}$")
 
@@ -1747,7 +1749,8 @@ def cmd_tldr(argv):
             else:
                 description.append(line[2:])
         elif line.startswith("- "):
-            pending = line[2:].rstrip(":")
+            pending = TLDR_HINT_RE.sub(r"\1", line[2:].rstrip(":")).replace("`", "")
+            pending = pending[:1].upper() + pending[1:]
         elif line.startswith("`") and pending and len(examples) < TLDR_EXAMPLES:
             command = TLDR_OPTION_RE.sub(r"\1", line.strip("`")).replace("{{", "").replace("}}", "")
             examples.append({"description": clamp_text(pending, TLDR_FIELD_CHARS),

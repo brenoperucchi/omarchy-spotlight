@@ -610,6 +610,7 @@ Item {
       kind: String(spec.kind || "noop").slice(0, 32),
       title: String(spec.title || "").slice(0, root.maxTitleChars),
       subtitle: String(spec.subtitle || "").slice(0, root.maxSubtitleChars),
+      section: String(spec.section || "").slice(0, root.maxTitleChars),
       accessory: String(spec.accessory || "").slice(0, 128),
       icon: String(spec.icon || "").slice(0, 128),
       image: String(spec.image || "").slice(0, 2048),
@@ -906,6 +907,7 @@ Item {
     var out = []
     function push(spec) {
       spec.accessory = "tldr"
+      spec.section = spec.section || "Command help"
       spec.resultType = "intent"
       spec.textMatch = Fuzzy.MATCH_EXACT
       spec.tieRank = out.length
@@ -921,13 +923,14 @@ Item {
     var examples = Array.isArray(page.examples) ? page.examples.slice(0, root.maxTldrRows) : []
     for (var i = 0; i < examples.length; i++) {
       var command = String(examples[i].command || "")
+      // Each example sits under its own description heading, so the row is the command alone.
       push({ key: "tldr.ex:" + i, kind: "command", icon: "󰆍", mono: true,
-             title: command, subtitle: examples[i].description,
+             section: examples[i].description, title: command,
              primaryLabel: "Copy command", secondaryLabel: "Open in terminal",
              payload: { text: command } })
     }
-    if (page.url) push({ key: "tldr.url", kind: "url", icon: "󰖟", title: "More information",
-                         subtitle: page.url, payload: { url: String(page.url) } })
+    if (page.url) push({ key: "tldr.url", kind: "url", icon: "󰖟", section: "More information",
+                         title: page.url, payload: { url: String(page.url) } })
     return out
   }
 
@@ -1144,7 +1147,7 @@ Item {
 
   function resultSection(row) {
     if (!row || row.key === "filter.hint") return ""
-    if (row.key.indexOf("tldr.") === 0) return "Command help"
+    if (row.section) return row.section
     if (row.resultType === "app") return "Applications"
     if (row.resultType === "window") return "Windows"
     if (row.resultType === "action") return "Commands"
@@ -2264,12 +2267,15 @@ Item {
             Text {
               text: parent.section
               textFormat: Text.PlainText
+              elide: Text.ElideRight
               color: root.foreground
               opacity: 0.5
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               anchors.left: parent.left
               anchors.leftMargin: root.gutter
+              anchors.right: parent.right
+              anchors.rightMargin: root.gutter
               anchors.bottom: parent.bottom
               anchors.bottomMargin: Style.space(3)
             }

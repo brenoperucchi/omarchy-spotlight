@@ -1465,7 +1465,7 @@ class TldrTests(unittest.TestCase):
         "> More information: <https://man.archlinux.org/man/scp.1>.\n\n"
         "- Copy a local file to a remote host:\n\n"
         "`scp {{path/to/local_file}} {{remote_host}}:{{path/to/remote_file}}`\n\n"
-        "- Recursively copy a directory:\n\n"
+        "- [r]ecursively copy a directory to `remote_host`:\n\n"
         "`scp {{[-r|--recursive]}} {{path/to/dir}} {{remote_host}}:{{path/to/dir}}`\n"
     )
 
@@ -1487,7 +1487,7 @@ class TldrTests(unittest.TestCase):
         self.assertEqual(reply["examples"], [
             {"description": "Copy a local file to a remote host",
              "command": "scp path/to/local_file remote_host:path/to/remote_file"},
-            {"description": "Recursively copy a directory",
+            {"description": "Recursively copy a directory to remote_host",
              "command": "scp --recursive path/to/dir remote_host:path/to/dir"},
         ])
 
