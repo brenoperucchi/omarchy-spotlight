@@ -65,3 +65,11 @@ test("inherited property names are not languages or engines", () => {
   assert.equal(Web.translation("x to toString"), null)
   assert.equal(Web.hasEngine("constructor"), false)
 })
+
+test("engineOptions lists every engine once, first key wins", () => {
+  const options = Web.engineOptions()
+  const google = options.filter((o) => o.label === "Google")
+  assert.deepEqual(google, [{ value: "g", label: "Google" }])
+  assert.ok(options.some((o) => o.value === "ddg" && o.label === "DuckDuckGo"))
+  for (const o of options) assert.ok(Web.hasEngine(o.value))
+})

@@ -102,10 +102,41 @@ FILES_JSON_BUDGET_CHARS = 200000
 
 REMINDER_BYTES = 256 * 1024
 REMINDER_DEADLINE = 3.0
+
+TOGGLE_BYTES = 8 * 1024
+TOGGLE_DEADLINE = 1.0
 REMINDER_COUNT = 50
 REMINDER_FIELD_CHARS = 200
 
 ICS_STAMP_RE = re.compile(r"^[0-9TZ]{1,32}$")
+
+# ~/.config/hypr/bindings.lua is edited only through a delimited block at EOF
+# plus a distinctive comment prefix on the line it replaces, so the whole
+# edit reverts byte for byte (cmd_revert_binding).
+BINDINGS_BYTES = 256 * 1024
+BINDINGS_PRINT_BYTES = 64 * 1024
+BINDINGS_PRINT_DEADLINE = 3.0
+BINDINGS_DESC_CHARS = 120
+MARK_START = '-- >>> spotlight setup tour (managed; rerun via "Run Setup Tour") >>>'
+MARK_END = "-- <<< spotlight setup tour <<<"
+DISABLED_PREFIX = "-- spotlight-tour:disabled "
+TOGGLE_CMD = "omarchy-shell shell toggle io.github.maajix.spotlight '{}'"
+# A live line binding the bare Spotlight toggle; group 1 is the chord
+# literal. A bind carrying a query payload is a different shortcut and is
+# left alone.
+TOGGLE_RE = re.compile(
+    r'''^\s*o\.bind\(\s*(?P<chord_quote>["'])(?P<chord>[^"']+)(?P=chord_quote)\s*,.*?'''
+    r'''(?P<command_quote>["'])omarchy-shell shell toggle io\.github\.maajix\.spotlight'''
+    r'''(?:\s+["']?\{\}["']?)?(?P=command_quote)\s*[,)]''')
+UNBIND_RE = re.compile(r'''^\s*hl\.unbind\(\s*["']([^"']+)["']\s*\)''')
+CHORD_MODS = ("SUPER", "CTRL", "ALT", "SHIFT")
+CHORD_ALIASES = {"WIN": "SUPER", "LOGO": "SUPER", "MOD4": "SUPER",
+                 "CONTROL": "CTRL", "MOD1": "ALT"}
+# Canonical chord as written into bindings.lua: modifiers in CHORD_MODS
+# order, then exactly one key.
+CHORD_RE = re.compile(
+    r"^(?:SUPER \+ )?(?:CTRL \+ )?(?:ALT \+ )?(?:SHIFT \+ )?"
+    r"(?:[A-Z0-9]|SPACE|RETURN|TAB|F(?:[1-9]|1[0-2])|UP|DOWN|LEFT|RIGHT|BACKSPACE|DELETE|PRINT)$")
 
 # The packaged list of desktop ids Omarchy keeps out of its own launcher.
 # It lives under /usr/share, so it is the one read that is not ours: root
@@ -382,8 +413,8 @@ def lock_at(dirfd, name):
     return fd
 
 
-def write_atomic(dirfd, name, payload):
-    """Publish `payload` at `name` by renaming a private 0600 temp, dir-fd-relatively."""
+def write_atomic(dirfd, name, payload, mode=0o600):
+    """Publish `payload` at `name` by renaming a private temp, dir-fd-relatively."""
     tmp = ".%s.tmp.%d" % (name, os.getpid())
     try:
         os.unlink(tmp, dir_fd=dirfd)
@@ -395,6 +426,7 @@ def write_atomic(dirfd, name, payload):
         view = memoryview(payload)
         while view:
             view = view[os.write(fd, view):]
+        os.fchmod(fd, mode)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -595,10 +627,12 @@ def normalize_settings(parsed):
         "maxResults": 20,
         "maxApps": 8,
         "maxSuggestions": 4,
+        "setupCompleted": False,
     }
     if not isinstance(parsed, dict):
         return out
     out["webSuggestions"] = clamp_bool(parsed.get("webSuggestions"), False)
+    out["setupCompleted"] = clamp_bool(parsed.get("setupCompleted"), False)
     out["fileSearch"] = clamp_bool(parsed.get("fileSearch"), True)
     out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), True)
     out["clipboardSearch"] = clamp_bool(parsed.get("clipboardSearch"), True)
@@ -837,6 +871,11 @@ def _menu_merge(default_items, user_items):
                 merged[item_id] = {}
             merged[item_id].update(entry)
     return merged, order
+
+
+def _menu_title(label, argv):
+    restart = any(os.path.basename(token).startswith("omarchy-restart-") for token in argv)
+    return "Restart " + label if restart and not label.lower().startswith("restart") else label
 
 
 def _menu_breadcrumb(item_id, merged):
@@ -1167,7 +1206,7 @@ def _menu_commands():
         keywords = " ".join(a for a in aliases if isinstance(a, str)) if isinstance(aliases, list) else ""
         row = {
             "key": "menu:" + item_id,
-            "title": label,
+            "title": _menu_title(label, argv),
             "subtitle": _menu_breadcrumb(item_id, merged),
             "icon": clamp_text(entry.get("icon") or "", 8),
             "argv": argv,
@@ -1398,6 +1437,156 @@ def cmd_reminders():
     emit({"reminders": rows})
 
 
+# ------------------------------------------------------------ toggle states
+# Omarchy keeps most toggles as a flag file, and most of those flags record the
+# *off* state (`bar-off`), so which way the file reads is part of the table.
+# state id -> (path relative to $HOME, does the file existing mean "on")
+TOGGLE_FLAGS = {
+    "idle":         (".local/state/omarchy/indicators/stay-awake", True),
+    "bar":          (".local/state/omarchy/toggles/bar-off", False),
+    "screensaver":  (".local/state/omarchy/toggles/screensaver-off", False),
+    "suspend":      (".local/state/omarchy/toggles/suspend-off", False),
+    "crashcapture": (".local/state/omarchy/toggles/crash-capture-off", False),
+    "touchpad":     (".local/state/omarchy/toggles/hypr/touchpad-disabled-name", False),
+    "touchscreen":  (".local/state/omarchy/toggles/hypr/touchscreen-disabled-name", False),
+    "gaps":         (".local/state/omarchy/toggles/hypr/window-no-gaps.lua", False),
+    "aspect":       (".local/state/omarchy/toggles/hypr/single-window-aspect-ratio.lua", True),
+}
+
+
+def _tri(text, on_token, off_token):
+    return {on_token: True, off_token: False}.get(text.strip().lower())
+
+
+def _probe_json(text, key):
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed.get(key) if isinstance(parsed, dict) else None
+
+
+def _probe_bluetooth(text):
+    # The soft block is the state Omarchy persists (see omarchy-bluetooth-power),
+    # so read the block rather than BlueZ: no D-Bus round trip, and it survives
+    # a reboot the same way the setting does.
+    for line in text.splitlines():
+        if line.startswith("bluetooth"):
+            return line.split()[-1] == "unblocked"
+    return None
+
+
+def _probe_nightlight(text):
+    value = _probe_json(text, "enabled")
+    return value if isinstance(value, bool) else None
+
+
+def _probe_mic(text):
+    # wpctl always prints "Volume: <n>", and appends "[MUTED]" when muted.
+    if "volume" not in text.lower():
+        return None
+    return "muted" not in text.lower()
+
+
+def _run_probe(argv, test):
+    raw, _ = run_bounded(argv, TOGGLE_BYTES, TOGGLE_DEADLINE)
+    return test(raw.decode("utf-8", "replace").strip())
+
+
+def _cmd_probe(argv, test):
+    return lambda: _run_probe(argv, test)
+
+
+def _probe_fullscreen(text):
+    # `fullscreenClient == 2` is the state omarchy-hyprland-window-tiled-
+    # fullscreen-toggle sets, and it is the focused window's, not the session's:
+    # Spotlight is a layer surface, so the window behind it stays the active one.
+    value = _probe_json(text, "fullscreenClient")
+    return value == 2 if isinstance(value, int) else None
+
+
+def _probe_scrolling(text):
+    # Dwindle and scrolling are the only two layouts the toggle cycles, so
+    # "scrolling is on" is the whole state rather than half of it.
+    value = _probe_json(text, "tiledLayout")
+    return _tri(value, "scrolling", "dwindle") if isinstance(value, str) else None
+
+
+def _probe_opaque(text):
+    # `opaque` is a per-window override, absent from the window's own JSON and
+    # readable only through getprop. Opaque on is transparency off.
+    value = _probe_json(text, "opaque")
+    return (not value) if isinstance(value, bool) else None
+
+
+def _probe_battery_percent():
+    """The bar writes this one into its own entry in shell.json, so the state
+    is the layout entry rather than a flag file or a command."""
+    # cmd_toggle_states turns a Denied or an OSError here into "unknown", which
+    # is the right answer for a home or a config this helper cannot read.
+    fd = walk([".config", "omarchy"])
+    try:
+        parsed = read_json(fd, "shell.json", SETTINGS_BYTES, None)
+    finally:
+        os.close(fd)
+    bar = parsed.get("bar") if isinstance(parsed, dict) else None
+    layout = bar.get("layout") if isinstance(bar, dict) else None
+    if not isinstance(layout, dict):
+        return None
+    for side in ("left", "center", "right"):
+        for entry in layout.get(side) or []:
+            if isinstance(entry, dict) and entry.get("id") == "omarchy.power":
+                return entry.get("showPercentage") is True
+    # No power module in the bar means nothing to show the percentage on.
+    return None
+
+
+def _probe_speaker():
+    """The sink has to be resolved first: DSP sinks mean @DEFAULT_SINK@ is not
+    always the device omarchy-audio-output-volume actually mutes."""
+    sink, _ = run_bounded(["omarchy-audio-output-sink"], TOGGLE_BYTES, TOGGLE_DEADLINE)
+    sink = sink.decode("utf-8", "replace").strip()
+    if not sink:
+        return None
+    return _run_probe(["pactl", "get-sink-mute", sink],
+                      lambda t: _tri(t, "mute: no", "mute: yes"))
+
+
+# state id -> a probe that answers True, False, or None for "cannot tell"
+TOGGLE_PROBES = {
+    "bluetooth":  _cmd_probe(["rfkill", "--noheadings", "--output", "TYPE,SOFT"], _probe_bluetooth),
+    "wifi":       _cmd_probe(["nmcli", "radio", "wifi"], lambda t: _tri(t, "enabled", "disabled")),
+    "nightlight": _cmd_probe(["omarchy-toggle-nightlight", "--status"], _probe_nightlight),
+    "dnd":        _cmd_probe(["omarchy-shell", "notifications", "dndState"], lambda t: _tri(t, "on", "off")),
+    "mic":        _cmd_probe(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"], _probe_mic),
+    "speaker":    _probe_speaker,
+    "fullscreen": _cmd_probe(["hyprctl", "activewindow", "-j"], _probe_fullscreen),
+    "scrolling":  _cmd_probe(["hyprctl", "activeworkspace", "-j"], _probe_scrolling),
+    "batterypercent": _probe_battery_percent,
+    "transparency": _cmd_probe(
+        ["hyprctl", "-j", "getprop", "activewindow", "opaque"], _probe_opaque),
+}
+
+
+def cmd_toggle_states():
+    home = os.environ.get("HOME", "")
+    states = {}
+    if home.startswith("/"):
+        for name, (rel, present_is_on) in TOGGLE_FLAGS.items():
+            states[name] = os.path.exists(os.path.join(home, rel)) == present_is_on
+
+    # ponytail: probes run one after another, ~300ms worst case off the UI
+    # thread; parallelise with Popen if open latency ever shows it.
+    for name, probe in TOGGLE_PROBES.items():
+        try:
+            value = probe()
+        except (Denied, OSError, ValueError):
+            value = None
+        if value is not None:
+            states[name] = bool(value)
+    emit({"states": states})
+
+
 def cmd_suggest(argv):
     if len(argv) != 1:
         raise Denied("suggest takes one query")
@@ -1560,6 +1749,243 @@ def cmd_write_ics(argv):
         os.close(fd)
 
 
+def cmd_write_settings():
+    """Merge a patch of known keys into spotlight.json; unknown keys on disk survive."""
+    raw = read_stdin(SETTINGS_BYTES)
+    try:
+        patch = json.loads(raw.decode("utf-8", "replace")) if raw else None
+    except ValueError:
+        patch = None
+    if not isinstance(patch, dict):
+        raise Denied("settings patch is not a JSON object")
+    fd = walk([".config", "omarchy"], create=True)
+    try:
+        raw = read_file(fd, "spotlight.json", SETTINGS_BYTES)
+        try:
+            existing = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+        except ValueError:
+            existing = None
+        if not isinstance(existing, dict):
+            # A hand edit that no longer parses is never overwritten.
+            raise Denied("spotlight.json is not a JSON object")
+        known = normalize_settings({})
+        for key in known:
+            if key in patch:
+                existing[key] = patch[key]
+        settings = normalize_settings(existing)
+        for key in known:
+            if key in patch:
+                existing[key] = settings[key]
+        payload = (json.dumps(existing, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        if len(payload) > SETTINGS_BYTES:
+            raise Denied("spotlight.json would be larger than %d bytes" % SETTINGS_BYTES)
+        # ponytail: no lock - Spotlight.qml funnels every write through one
+        # Process; wrap in lock_at() if a second writer ever appears.
+        write_atomic(fd, "spotlight.json", payload)
+    finally:
+        os.close(fd)
+    emit({"settings": settings})
+
+
+# ---------------------------------------------------------------- bindings
+def _hypr_dir():
+    try:
+        return walk([".config", "hypr"])
+    except FileNotFoundError:
+        raise Denied("~/.config/hypr is missing")
+
+
+def _bindings_lines(dirfd):
+    raw = read_file(dirfd, "bindings.lua", BINDINGS_BYTES)
+    return None if raw is None else raw.decode("utf-8", "surrogateescape").split("\n")
+
+
+def _write_bindings(dirfd, lines):
+    try:
+        mode = stat.S_IMODE(os.stat("bindings.lua", dir_fd=dirfd, follow_symlinks=False).st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    write_atomic(dirfd, "bindings.lua", "\n".join(lines).encode("utf-8", "surrogateescape"), mode)
+
+
+def _canon_chord(text):
+    """'SUPER SHIFT CTRL + SPACE' or 'ctrl+space' -> 'SUPER + CTRL + SHIFT + SPACE'; None if malformed."""
+    parts = [CHORD_ALIASES.get(p, p)
+             for p in re.split(r"[\s+]+", str(text).upper()) if p]
+    keys = [p for p in parts if p not in CHORD_MODS]
+    if len(keys) != 1:
+        return None
+    return " + ".join([m for m in CHORD_MODS if m in parts] + keys)
+
+
+def _bound_chords():
+    """Every chord Hyprland binds right now, canonical chord -> description."""
+    try:
+        raw, truncated = run_bounded(["omarchy-menu-keybindings", "--print"],
+                                     BINDINGS_PRINT_BYTES, BINDINGS_PRINT_DEADLINE)
+    except Denied:
+        return None
+    if truncated:
+        return None
+    lines = raw.decode("utf-8", "replace").split("\n")
+    bound = {}
+    for line in lines:
+        left, arrow, desc = line.partition("\u2192")
+        chord = _canon_chord(left) if arrow else None
+        if chord and chord not in bound:
+            bound[chord] = clamp_text(desc, BINDINGS_DESC_CHARS).strip()
+    return bound
+
+
+def _strip_managed(lines):
+    """Drop the managed block and the blank line before it. -> (lines, block contents)"""
+    start = next((i for i, line in enumerate(lines) if line.strip() == MARK_START), None)
+    if start is None:
+        return lines, []
+    end = next((i for i in range(start, len(lines)) if lines[i].strip() == MARK_END), None)
+    if end is None:
+        raise Denied("managed block in bindings.lua is not closed")
+    block = lines[start + 1:end]
+    if start and lines[start - 1].strip() == "":
+        start -= 1
+    return lines[:start] + lines[end + 1:], block
+
+
+def _lua_call_end(lines, start):
+    """Return the last line of an o.bind call, ignoring parentheses inside strings."""
+    depth = 0
+    quote = None
+    escaped = False
+    opened = False
+    for end in range(start, len(lines)):
+        line = lines[end]
+        i = line.find("o.bind") if end == start else 0
+        while i < len(line):
+            char = line[i]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+            elif line.startswith("--", i):
+                break
+            elif char in "\"'":
+                quote = char
+            elif char == "(":
+                depth += 1
+                opened = True
+            elif char == ")":
+                depth -= 1
+                if opened and depth == 0:
+                    return end
+            i += 1
+    raise Denied("Spotlight binding in bindings.lua is not closed")
+
+
+def _disable_toggle_calls(lines):
+    """Comment every line of each live Spotlight toggle call."""
+    lines = list(lines)
+    i = 0
+    while i < len(lines):
+        match = TOGGLE_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        end = _lua_call_end(lines, i)
+        if i:
+            unbind = UNBIND_RE.match(lines[i - 1])
+            if unbind and _canon_chord(unbind.group(1)) == _canon_chord(match.group("chord")):
+                lines[i - 1] = DISABLED_PREFIX + lines[i - 1]
+        for line_no in range(i, end + 1):
+            lines[line_no] = DISABLED_PREFIX + lines[line_no]
+        i = end + 1
+    return lines
+
+
+def cmd_read_binding():
+    reply = {"current": None, "previous": None, "managed": False, "bound": _bound_chords()}
+    try:
+        fd = walk([".config", "hypr"])
+    except FileNotFoundError:
+        emit(reply)
+        return
+    try:
+        lines = _bindings_lines(fd) or []
+    finally:
+        os.close(fd)
+    for line in lines:
+        if line.strip() == MARK_START:
+            reply["managed"] = True
+        elif line.startswith(DISABLED_PREFIX):
+            old = TOGGLE_RE.match(line[len(DISABLED_PREFIX):])
+            if old and reply["previous"] is None:
+                reply["previous"] = old.group("chord")
+        else:
+            live = TOGGLE_RE.match(line)
+            if live and reply["current"] is None:
+                reply["current"] = live.group("chord")
+    emit(reply)
+
+
+def cmd_write_binding(argv):
+    if len(argv) != 1 or "+" not in argv[0] or not CHORD_RE.match(argv[0]):
+        raise Denied("bad chord")
+    chord = argv[0]
+    unbind = 'hl.unbind("%s")' % chord
+    fd = _hypr_dir()
+    try:
+        original = _bindings_lines(fd)
+        new_file = original is None
+        lines = original or [""]
+        own = {_canon_chord(m.group("chord")) for m in map(TOGGLE_RE.match, lines) if m}
+        lines, block = _strip_managed(lines)
+        lines = _disable_toggle_calls(lines)
+        # Unbind a chord someone else holds, and keep an unbind the previous
+        # block already carried: hyprctl reload rebuilds every default, so
+        # "not bound right now" may only mean our own block removed it.
+        bound = _bound_chords()
+        unbound = (any(line.strip() == unbind for line in block) or bound is None
+                   or (chord in bound and chord not in own))
+        block = [MARK_START] + ([unbind] if unbound else []) + [
+            'o.bind("%s", "Spotlight", "%s")' % (chord, TOGGLE_CMD), MARK_END]
+        body = "\n".join(lines)
+        trailing_newline = body.endswith("\n")
+        if body:
+            body += "\n" if trailing_newline else "\n\n"
+        body += "\n".join(block)
+        if trailing_newline or new_file:
+            body += "\n"
+        _write_bindings(fd, body.split("\n"))
+    finally:
+        os.close(fd)
+    emit({"chord": chord, "unbound": unbound,
+          "path": os.path.join(os.environ["HOME"], ".config", "hypr", "bindings.lua")})
+
+
+def cmd_revert_binding():
+    fd = _hypr_dir()
+    try:
+        original = _bindings_lines(fd)
+        if original is None:
+            emit({"restored": None})
+            return
+        lines, _ = _strip_managed(original)
+        restored = None
+        for i, line in enumerate(lines):
+            if line.startswith(DISABLED_PREFIX):
+                lines[i] = line = line[len(DISABLED_PREFIX):]
+                live = TOGGLE_RE.match(line)
+                if live and restored is None:
+                    restored = live.group("chord")
+        if lines != original:
+            _write_bindings(fd, lines)
+    finally:
+        os.close(fd)
+    emit({"restored": restored})
+
+
 # name -> (handler, whether it reads positional arguments)
 COMMANDS = {
     "read-settings": (cmd_read_settings, False),
@@ -1573,9 +1999,14 @@ COMMANDS = {
     "read-clipboard": (cmd_read_clipboard, False),
     "clipboard-copy": (cmd_clipboard_copy, True),
     "reminders": (cmd_reminders, False),
+    "toggle-states": (cmd_toggle_states, False),
     "suggest": (cmd_suggest, True),
     "files": (cmd_files, True),
     "write-ics": (cmd_write_ics, True),
+    "write-settings": (cmd_write_settings, False),
+    "read-binding": (cmd_read_binding, False),
+    "write-binding": (cmd_write_binding, True),
+    "revert-binding": (cmd_revert_binding, False),
 }
 
 

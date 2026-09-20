@@ -16,6 +16,7 @@ import "lib/Apps.js" as Apps
 import "lib/FileRank.js" as FileRank
 import "lib/Query.js" as Query
 import "lib/Ranking.js" as Ranking
+import "lib/Chord.js" as Chord
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -122,6 +123,12 @@ Item {
   // source.
   property var menuCommands: []
 
+  // Live state of every toggle the helper could actually read, as
+  // { stateId: bool }. An id the probe could not answer is absent rather than
+  // false, and an absent id draws no switch: a missing state is unknown, and
+  // a switch that is confidently wrong is worse than no switch at all.
+  property var toggleStates: ({})
+
   // Versioned learning store: stable items plus query-local contexts. The
   // helper validates and bounds it before it reaches this long-lived process.
   property var usage: Frecency.emptyStore()
@@ -149,6 +156,14 @@ Item {
   readonly property int maxAppCandidates: 512
   readonly property int maxWindowCandidates: 256
   readonly property int maxGlobalResults: 50
+
+  // The empty query is a digest, not a search: every source is capped on its
+  // own so the longest one cannot crowd the others off the list. Ranking.rank
+  // already orders the sections by result type.
+  readonly property int idleAppRows: 5
+  readonly property int idleWindowRows: 2
+  readonly property int idleCommandRows: 1
+  readonly property int idleFileRows: 2
   readonly property int maxTitleChars: 512
   readonly property int maxSubtitleChars: 1024
 
@@ -162,8 +177,22 @@ Item {
     learningEnabled: true,
     maxResults: 20,
     maxApps: 8,
-    maxSuggestions: 4
+    maxSuggestions: 4,
+    // true until the helper answers, so the tour never flashes before the
+    // first-run flag has actually been read.
+    setupCompleted: true
   })
+
+  // ------------------------------------------------------------- tour
+  // The setup tour replaces the search card inside the same PanelWindow.
+  // Spotlight.qml does all of the tour's I/O; SetupTour.qml only paints.
+  property bool tourActive: false
+  property string bindingState: ""
+  property var tourBinding: ({ current: "", previous: "", managed: false, bound: {} })
+  // Written on first run so a fresh install has a working shortcut before the
+  // tour is ever opened. The tour can still change it.
+  readonly property string defaultChord: "ALT + SPACE"
+  property bool autoBindDone: false
 
   // ------------------------------------------------------------- theme
   // Shares the [menu] surface tokens, so any theme that styles the Omarchy
@@ -175,28 +204,31 @@ Item {
   // and Hyprland's blur has no visible effect. 0.62 keeps text contrast while
   // letting the blurred wallpaper through as colour and shape.
   readonly property color glassBackground: Util.alpha(Color.menu.background, 0.62)
-  readonly property color glassBorder: Util.alpha(Color.foreground, 0.16)
+  readonly property color glassBorder: Util.alpha(Color.foreground, 0.09)
   readonly property color glassSheen: Util.alpha("#ffffff", 0.07)
   readonly property color scrim: Util.alpha(Color.menu.scrim, 0.25)
   readonly property color selectedBackground: Util.alpha(Color.foreground, 0.12)
   readonly property color selectedText: Color.menu.selectedText
-  readonly property color dividerColor: Util.alpha(Color.foreground, 0.10)
+  readonly property color dividerColor: Util.alpha(Color.foreground, 0.06)
   readonly property string fontFamily: Style.font.menuFamily
 
   // One left rail at `gutter`. The search glyph and every row icon align to
   // it; a row is inset by `listPadding` and carries
   // the remainder internally, so the rail survives the inset.
-  readonly property int gutter: Style.space(24)
+  readonly property int gutter: Style.space(21)
   readonly property int listPadding: Style.space(10)
   readonly property int rowInset: gutter - listPadding
 
   readonly property int cardRadius: Style.space(12)
   readonly property int rowRadius: Style.space(8)
   readonly property int searchHeight: Style.space(56)
-  readonly property int rowHeight: Style.space(40)
+  readonly property int rowHeight: Style.space(36)
   readonly property int sectionHeight: Style.space(24)
   readonly property int footerHeight: Style.space(36)
-  readonly property int maxListHeight: Style.space(400)
+  // Sized so the full empty-query digest lands above the fold: 5 apps, 1
+  // command, 2 files and 2 windows at rowHeight, plus their four section
+  // headings at sectionHeight. A query may still scroll.
+  readonly property int maxListHeight: Style.space(456)
   readonly property int hairline: Style.spacing.hairline
 
   // Between heading (16) and display (24): a hero input that is still an
@@ -225,6 +257,7 @@ Item {
     }
 
     root.opened = true
+    root.tourActive = false
     root.armedKey = ""
     root.rows = []
     root.pinnedKey = ""
@@ -249,10 +282,13 @@ Item {
     // up an edit just as promptly.
     root.refreshSettings()
     root.refreshReminders()
+    root.refreshToggleStates()
     root.rebuild()
     pointerGate.reset()
+    if (root.settings.setupCompleted === false || (tour.started && !tour.singleStep)) root.resumeTour()
     Qt.callLater(function() {
-      input.forceActiveFocus()
+      if (root.tourActive) tour.focusStep()
+      else input.forceActiveFocus()
       resultList.positionViewAtBeginning()
     })
   }
@@ -318,12 +354,23 @@ Item {
   function loadMenuCommands(raw) {
     var reply = root.helperReply(raw)
     var list = (reply && Array.isArray(reply.commands)) ? reply.commands : []
+    // The menu tree carries actions the catalogue already curates, only under
+    // the menu's own wording, so the merged list showed both. The catalogue
+    // copy wins: it is the one with the hand-written subtitle, the keywords
+    // and, for a toggle, the state the switch reads.
+    var known = {}
+    var catalogue = Commands.commands()
+    for (var k = 0; k < catalogue.length; k++) {
+      var id = Commands.argvId(catalogue[k].argv)
+      if (id) known[id] = true
+    }
     var out = []
     for (var i = 0; i < list.length; i++) {
       var c = list[i]
       if (!c || !Array.isArray(c.argv) || c.argv.length === 0) continue
       var argv = []
       for (var j = 0; j < c.argv.length; j++) argv.push(String(c.argv[j]))
+      if (known[Commands.argvId(argv)]) continue
       out.push({
         key: String(c.key || ""),
         title: String(c.title || "").slice(0, root.maxTitleChars),
@@ -351,6 +398,30 @@ Item {
     remindersProc.running = true
   }
 
+  function refreshToggleStates() {
+    toggleStatesProc.running = false
+    toggleStatesProc.command = root.helperArgv(["toggle-states"])
+    toggleStatesProc.running = true
+  }
+
+  function loadToggleStates(raw) {
+    var reply = root.helperReply(raw)
+    var states = (reply && reply.states && typeof reply.states === "object") ? reply.states : {}
+    var out = ({})
+    for (var id in states)
+      if (states[id] === true || states[id] === false) out[id] = states[id]
+    root.toggleStates = out
+  }
+
+  // The label under the cursor names what Enter will do, so a toggle row says
+  // which way it is about to go rather than a generic "Run".
+  function primaryLabelFor(r) {
+    var id = (r && r.payload) ? r.payload.stateId : ""
+    if (id && root.toggleStates[id] !== undefined)
+      return root.toggleStates[id] === true ? "Turn off" : "Turn on"
+    return r ? r.primaryLabel : ""
+  }
+
   // Escape and successful activations go through here so the shell's
   // openPanelIds stays in step — otherwise the next toggle would try to hide
   // an overlay that is already gone.
@@ -361,8 +432,99 @@ Item {
   }
 
   function toggle() {
+    // The current shortcut pressed while the recorder step is up: show it as
+    // "already your shortcut" instead of closing the tour.
+    if (root.opened && root.tourActive && tour.step === 1) {
+      tour.selected = root.tourBinding.current
+      return
+    }
     if (root.opened) root.dismiss()
     else root.open("{}")
+  }
+
+  // Re-raise an unfinished tour at the step the user left; fresh start otherwise.
+  function resumeTour() {
+    if (tour.started && !tour.singleStep) {
+      root.tourActive = true
+      root.readBinding()
+      tour.focusStep()
+    } else root.showTour(0, false)
+  }
+
+  // ------------------------------------------------------------- tour
+  function showTour(step, single) {
+    input.text = ""
+    root.armedKey = ""
+    root.bindingState = ""
+    root.tourActive = true
+    tour.start(root.settings, step, single)
+    root.readBinding()
+  }
+
+  // `patch` holds the settings keys to persist; {} means the tour was only
+  // looked at (single-step Done, or Esc on the shortcut chooser).
+  function finishTour(patch) {
+    root.tourActive = false
+    if (Object.keys(patch || {}).length > 0) {
+      settingsWriteProc.running = false
+      settingsWriteProc.stdinEnabled = true
+      settingsWriteProc.command = root.helperArgv(["write-settings"])
+      settingsWriteProc.running = true
+      settingsWriteProc.write(JSON.stringify(patch))
+      settingsWriteProc.stdinEnabled = false
+    }
+    Qt.callLater(function() { input.forceActiveFocus() })
+  }
+
+  function readBinding() {
+    bindingProc.running = false
+    bindingProc.action = "read"
+    bindingProc.command = root.helperArgv(["read-binding"])
+    bindingProc.running = true
+  }
+
+  function writeBinding(chord) {
+    root.bindingState = "busy"
+    bindingProc.running = false
+    bindingProc.action = "write"
+    bindingProc.command = root.helperArgv(["write-binding", chord])
+    bindingProc.running = true
+  }
+
+  function revertBinding() {
+    root.bindingState = "busy"
+    bindingProc.running = false
+    bindingProc.action = "revert"
+    bindingProc.command = root.helperArgv(["revert-binding"])
+    bindingProc.running = true
+  }
+
+  // Chords arrive in two spellings (bindings.lua and the keybindings menu),
+  // so every one is canonicalized before the tour compares them.
+  function loadBinding(reply) {
+    var bound = {}
+    var raw = (reply && reply.bound && typeof reply.bound === "object") ? reply.bound : {}
+    for (var key in raw) {
+      if (!Object.prototype.hasOwnProperty.call(raw, key)) continue
+      var chord = Chord.normalize(key)
+      if (chord && !Object.prototype.hasOwnProperty.call(bound, chord))
+        bound[chord] = String(raw[key]).slice(0, 80)
+    }
+    root.tourBinding = {
+      current: Chord.normalize(reply && reply.current ? reply.current : ""),
+      previous: Chord.normalize(reply && reply.previous ? reply.previous : ""),
+      managed: !!(reply && reply.managed === true),
+      bound: bound
+    }
+    // First run only: claim the recommended chord when Spotlight has no
+    // shortcut and nothing else holds it. A helper that could not read the
+    // live keybindings answers bound: null, and then nothing is taken.
+    if (!root.autoBindDone && root.settings.setupCompleted === false) {
+      root.autoBindDone = true
+      if (root.tourBinding.current === "" && reply && reply.bound
+          && !Object.prototype.hasOwnProperty.call(bound, root.defaultChord))
+        root.writeBinding(root.defaultChord)
+    }
   }
 
   // ------------------------------------------------------------- usage
@@ -427,8 +589,17 @@ Item {
       maxApps: isFinite(parsed.maxApps)
         ? Util.clamp(parsed.maxApps, 3, root.maxAppRows) : 8,
       maxSuggestions: isFinite(parsed.maxSuggestions)
-        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4
+        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4,
+      setupCompleted: parsed.setupCompleted !== false
     }
+    // First run: the flag usually lands after open() has already drawn the
+    // search card, so the tour is raised from here as well.
+    if (root.opened && !root.tourActive && root.settings.setupCompleted === false)
+      root.resumeTour()
+    // resumeTour has just read the binding when the launcher is open; only
+    // a closed launcher needs a read of its own.
+    if (root.settings.setupCompleted === false && !root.autoBindDone && !root.tourActive)
+      root.readBinding()
   }
 
   // ------------------------------------------------------------- providers
@@ -514,14 +685,18 @@ Item {
       out.push(root.row({
         key: "event.create", kind: "event",
         title: event.title,
-        subtitle: event.label + " · " + NaturalTime.formatDuration(event.durationMinutes),
+        subtitle: event.label + " · " + (event.allDay ? "All day" : NaturalTime.formatDuration(event.durationMinutes)),
         accessory: "Calendar", icon: "󰸗",
         primaryLabel: "Add to Google Calendar",
         secondaryLabel: "Save .ics file",
         payload: {
           title: event.title,
-          start: NaturalTime.toUtcBasic(event.start),
-          end: NaturalTime.toUtcBasic(event.end)
+          allDay: event.allDay === true,
+          // An all-day event travels as a plain date on both sides; DTEND and
+          // the Google range are exclusive, which is why end is the next day.
+          start: event.allDay ? NaturalTime.toDateBasic(event.start) : NaturalTime.toUtcBasic(event.start),
+          end: event.allDay ? NaturalTime.toDateBasic(event.end) : NaturalTime.toUtcBasic(event.end),
+          stamp: NaturalTime.toUtcBasic(event.start)
         }
       }))
     }
@@ -718,7 +893,10 @@ Item {
         keywords: c.keywords,
         resultType: isWeb ? "web" : "action",
         stableId: isWeb ? "" : "action:" + c.key,
-        payload: { argv: c.argv || [], id: c.id || "", url: c.url || "" }
+        payload: {
+          argv: c.argv || [], id: c.id || "", url: c.url || "",
+          stateId: c.state || ""
+        }
       }))
     }
     return out
@@ -844,18 +1022,27 @@ Item {
     return out
   }
 
+  // Ranks one source on its own and keeps the head, so a cap selects the best
+  // rows of that section rather than whichever ones the catalogue listed first.
+  function idleSlice(list, limit) {
+    return root.globallyRank(list, "").slice(0, limit)
+  }
+
   function idleRows() {
     var fallback = root.appRows("", false)
-    if (!root.settings.learningEnabled || !root.usage || !root.usage.items
-        || Object.keys(root.usage.items).length === 0) return fallback
-    var out = root.appRows("", true)
-      .concat(root.windowRows("", true))
-      .concat(root.commandRows("", true, true))
-      .concat(root.learnedFileRows())
-    for (var i = 0; i < fallback.length && out.length < root.maxGlobalResults; i++) {
-      if (!Frecency.hasItem(root.usage, fallback[i].stableId)) out.push(fallback[i])
+    var learned = root.settings.learningEnabled && root.usage && root.usage.items
+      && Object.keys(root.usage.items).length > 0
+    var apps = learned ? root.idleSlice(root.appRows("", true), root.idleAppRows) : []
+    // Top up from the catalogue until the section is full, so a fresh install
+    // still opens on a usable list rather than an empty one.
+    for (var i = 0; i < fallback.length && apps.length < root.idleAppRows; i++) {
+      if (!learned || !Frecency.hasItem(root.usage, fallback[i].stableId)) apps.push(fallback[i])
     }
-    return out.length ? out : fallback
+    if (!learned) return apps
+    return apps
+      .concat(root.idleSlice(root.commandRows("", true, true), root.idleCommandRows))
+      .concat(root.idleSlice(root.learnedFileRows(), root.idleFileRows))
+      .concat(root.idleSlice(root.windowRows("", true), root.idleWindowRows))
   }
 
   function suggestionResultRows(q) {
@@ -1000,6 +1187,7 @@ Item {
         rowImage: r.image,
         rowMono: r.mono,
         rowSection: root.resultSection(r),
+        rowState: (r.payload && r.payload.stateId) ? r.payload.stateId : "",
         selectable: r.kind !== "noop"
       })
     }
@@ -1116,6 +1304,21 @@ Item {
     root.activate(root.pinnedKey ? root.selectedIndex : root.firstSelectableIndex(), secondary)
   }
 
+  // The switch moves immediately and the probe confirms it after the detached
+  // command has had time to finish.
+  function flipToggle(r) {
+    var id = r.payload.stateId
+    var on = root.toggleStates[id] === true
+    var argv = r.payload.argv
+    if (!Array.isArray(argv) || argv.length === 0) return
+    Util.execArgv(argv)
+    var next = ({})
+    for (var k in root.toggleStates) next[k] = root.toggleStates[k]
+    next[id] = !on
+    root.toggleStates = next
+    toggleReconcile.restart()
+  }
+
   function activate(index, secondary) {
     var r = root.rows[index]
     if (!r || r.kind === "noop") return
@@ -1135,6 +1338,12 @@ Item {
       break
 
     case "shell":
+      // A toggle row keeps the panel open: its switch is the only feedback the
+      // press produces, and closing over it would hide exactly that.
+      if (r.payload.stateId && root.toggleStates[r.payload.stateId] !== undefined) {
+        root.flipToggle(r)
+        break
+      }
       root.dismiss()
       // execArgv, not execDetached: the catalogue holds argv vectors rather
       // than command lines, so nothing here is ever re-tokenized by a shell.
@@ -1213,6 +1422,14 @@ Item {
       root.openPath(root.pluginFolder)
       break
 
+    case "spotlight-tour":
+      root.showTour(0, false)
+      break
+
+    case "spotlight-shortcut":
+      root.showTour(1, true)
+      break
+
     case "spotlight-data":
       root.dismiss()
       maintenanceProc.running = false
@@ -1245,8 +1462,10 @@ Item {
   // is stepped over rather than written through, and it reports back the path
   // it actually used.
   function saveIcs(payload) {
-    var stamp = String(payload.start).replace(/[^0-9TZ]/g, "").slice(0, 32)
+    var stamp = String(payload.stamp || payload.start).replace(/[^0-9TZ]/g, "").slice(0, 32)
     if (!stamp) return
+    // DTSTAMP is always an instant; only the event's own bounds go date-only.
+    var dateOnly = payload.allDay ? ";VALUE=DATE" : ""
     var ics = [
       "BEGIN:VCALENDAR",
       "VERSION:2.0",
@@ -1255,9 +1474,9 @@ Item {
       "METHOD:PUBLISH",
       "BEGIN:VEVENT",
       "UID:spotlight-" + stamp + "@omarchy",
-      "DTSTAMP:" + payload.start,
-      "DTSTART:" + payload.start,
-      "DTEND:" + payload.end,
+      "DTSTAMP:" + stamp,
+      "DTSTART" + dateOnly + ":" + payload.start,
+      "DTEND" + dateOnly + ":" + payload.end,
       "SUMMARY:" + String(payload.title).replace(/([,;\\])/g, "\\$1").slice(0, 400),
       "END:VEVENT",
       "END:VCALENDAR",
@@ -1538,6 +1757,22 @@ Item {
   }
 
   Process {
+    id: toggleStatesProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadToggleStates(text)
+    }
+  }
+
+  // One late confirmation pass, not a poll. Night Light's cold start retries
+  // for up to two seconds, so probing earlier can capture an intermediate state.
+  Timer {
+    id: toggleReconcile
+    interval: 2500
+    onTriggered: root.refreshToggleStates()
+  }
+
+  Process {
     id: settingsProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -1612,6 +1847,48 @@ Item {
     }
   }
 
+  // Separate from maintenanceProc: a failed write must surface as an error
+  // state instead of being swallowed, and a settings write must never cancel
+  // an in-flight binding write.
+  Process {
+    id: bindingProc
+    property string action: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (bindingProc.action === "read") {
+          root.loadBinding(reply)
+        } else if (!reply) {
+          root.bindingState = "error"
+        } else {
+          bindingReloadProc.action = bindingProc.action
+          bindingReloadProc.command = ["hyprctl", "reload"]
+          bindingReloadProc.running = true
+        }
+      }
+    }
+  }
+
+  Process {
+    id: bindingReloadProc
+    property string action: ""
+    onExited: function(exitCode) {
+      root.bindingState = exitCode === 0
+        ? (bindingReloadProc.action === "write" ? "ok" : "reverted")
+        : "reloadError"
+      root.readBinding()
+    }
+  }
+
+  Process {
+    id: settingsWriteProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (root.helperReply(text)) root.loadSettings(text)
+    }
+  }
+
   Component.onCompleted: {
     if (root.appLibrary) root.appLibrary.refreshIcons()
     root.refreshSettings()
@@ -1632,6 +1909,9 @@ Item {
     usageWriteProc.running = false
     icsProc.running = false
     maintenanceProc.running = false
+    bindingProc.running = false
+    bindingReloadProc.running = false
+    settingsWriteProc.running = false
   }
 
   Connections {
@@ -1733,6 +2013,9 @@ Item {
 
     Rectangle {
       id: card
+      // Hidden items cannot hold focus, which is what keeps keystrokes away
+      // from the search input while the tour is up.
+      visible: !root.tourActive
 
       readonly property int listHeight: Math.min(root.maxListHeight, root.contentHeight)
       readonly property bool hasResults: displayModel.count > 0
@@ -1760,16 +2043,6 @@ Item {
 
       // Swallow clicks so they don't reach the dismiss MouseArea behind.
       MouseArea { anchors.fill: parent; onClicked: {} }
-
-      // The 1px light line along the top edge is what makes a translucent
-      // panel read as glass rather than as a flat tint.
-      Rectangle {
-        anchors { top: parent.top; left: parent.left; right: parent.right }
-        anchors.margins: root.hairline
-        height: root.hairline
-        color: root.glassSheen
-        radius: height
-      }
 
       // ------------------------------------------------------- search row
       Item {
@@ -1867,11 +2140,13 @@ Item {
         }
       }
 
+      // Both dividers stop where a row's highlight stops, so the list reads as
+      // one column with two rules across it rather than as three stacked bands.
       Rectangle {
         id: searchDivider
         anchors { top: searchRow.bottom; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.hairline
-        anchors.rightMargin: root.hairline
+        anchors.leftMargin: root.listPadding
+        anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
         visible: card.hasResults
@@ -1913,7 +2188,8 @@ Item {
               font.pixelSize: Style.font.caption
               anchors.left: parent.left
               anchors.leftMargin: root.gutter
-              anchors.verticalCenter: parent.verticalCenter
+              anchors.bottom: parent.bottom
+              anchors.bottomMargin: Style.space(3)
             }
           }
 
@@ -1931,9 +2207,12 @@ Item {
             required property string rowIcon
             required property string rowImage
             required property bool rowMono
+            required property string rowState
             required property bool selectable
 
             readonly property bool hasCursor: root.cursorActive && resultRow.index === root.selectedIndex
+            readonly property bool showSwitch: resultRow.rowState.length > 0
+              && root.toggleStates[resultRow.rowState] !== undefined
             readonly property bool armed: root.armedKey.length > 0
               && root.rows[resultRow.rowIndex]
               && root.rows[resultRow.rowIndex].key === root.armedKey
@@ -1983,8 +2262,21 @@ Item {
               anchors.verticalCenter: rowSurface.verticalCenter
             }
 
+            PillSwitch {
+              id: rowSwitch
+              visible: resultRow.showSwitch && !resultRow.armed
+              checked: root.toggleStates[resultRow.rowState] === true
+              accent: root.accent
+              foreground: root.foreground
+              anchors.right: rowSurface.right
+              anchors.rightMargin: root.rowInset
+              anchors.verticalCenter: rowSurface.verticalCenter
+            }
+
             Text {
               id: accessoryText
+              // The switch replaces the "Action" label rather than crowding it.
+              visible: !rowSwitch.visible
               text: resultRow.armed ? "Press ↵ again to confirm" : resultRow.rowAccessory
               textFormat: Text.PlainText
               color: resultRow.armed ? Color.urgent : root.foreground
@@ -1999,7 +2291,7 @@ Item {
             Row {
               anchors.left: rowGlyph.right
               anchors.leftMargin: Style.space(10)
-              anchors.right: accessoryText.left
+              anchors.right: rowSwitch.visible ? rowSwitch.left : accessoryText.left
               anchors.rightMargin: Style.space(14)
               anchors.verticalCenter: rowSurface.verticalCenter
               spacing: Style.space(8)
@@ -2060,8 +2352,8 @@ Item {
       // ------------------------------------------------------- footer
       Rectangle {
         anchors { bottom: footer.top; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.hairline
-        anchors.rightMargin: root.hairline
+        anchors.leftMargin: root.listPadding
+        anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
       }
@@ -2080,7 +2372,9 @@ Item {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           anchors.left: parent.left
-          anchors.leftMargin: root.gutter
+          // The mark sits inside the rail the rows use, so it reads as a corner
+          // signature, but not so far out that it crowds the rounded corner.
+          anchors.leftMargin: Style.space(15)
           anchors.verticalCenter: parent.verticalCenter
         }
 
@@ -2092,7 +2386,7 @@ Item {
 
           Text {
             readonly property var sel: root.selectedRow()
-            text: sel && sel.primaryLabel ? "↵  " + sel.primaryLabel : ""
+            text: sel && sel.primaryLabel ? "↵  " + root.primaryLabelFor(sel) : ""
             visible: text.length > 0
             textFormat: Text.PlainText
             color: root.foreground
@@ -2113,6 +2407,29 @@ Item {
           }
         }
       }
+    }
+
+    SetupTour {
+      id: tour
+      visible: root.tourActive
+      anchors.centerIn: parent
+      foreground: root.foreground
+      accent: root.accent
+      fontFamily: root.fontFamily
+      surface: root.glassBackground
+      surfaceBorder: root.glassBorder
+      sheen: root.glassSheen
+      hairline: root.hairline
+      surfaceRadius: root.cardRadius
+      rowRadius: root.rowRadius
+      currentBinding: root.tourBinding.current
+      previousBinding: root.tourBinding.previous
+      bindingManaged: root.tourBinding.managed
+      boundChords: root.tourBinding.bound
+      bindingState: root.bindingState
+      onBindingRequested: function(chord) { root.writeBinding(chord) }
+      onRevertRequested: root.revertBinding()
+      onFinished: function(patch) { root.finishTour(patch) }
     }
   }
 
