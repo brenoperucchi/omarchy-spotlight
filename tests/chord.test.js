@@ -28,3 +28,32 @@ test("normalize accepts both spellings and aliases", () => {
   assert.equal(Chord.normalize("constructor"), "CONSTRUCTOR")
   assert.equal(Chord.normalize(""), "")
 })
+
+test("mods is the modifier half of a canonical chord", () => {
+  assert.equal(Chord.mods("SUPER + ALT + 9"), "SUPER + ALT")
+  assert.equal(Chord.mods("ALT + SPACE"), "ALT")
+  assert.equal(Chord.mods("PRINT"), "")
+  assert.equal(Chord.mods(""), "")
+  assert.equal(Chord.mods(null), "")
+})
+
+test("isKnown refuses a chord the bind table cannot speak for", () => {
+  const bound = { "SUPER + SPACE": "Omarchy menu" }
+  // The compositor reported binds under SUPER it would not name, so a SUPER
+  // chord missing from the table is not evidence that it is free.
+  assert.equal(Chord.isKnown("SUPER + 1", bound, ["SUPER"]), false)
+  assert.equal(Chord.isKnown("SUPER + SPACE", bound, ["SUPER"]), false)
+  assert.equal(Chord.isKnown("ALT + SPACE", bound, ["SUPER"]), true)
+  assert.equal(Chord.isKnown("SUPER + ALT + K", bound, ["SUPER"]), true)
+  assert.equal(Chord.isKnown("ALT + SPACE", bound, []), true)
+  // No table at all is the older, coarser form of the same answer.
+  assert.equal(Chord.isKnown("ALT + SPACE", null, []), false)
+  assert.equal(Chord.isKnown("ALT + SPACE", undefined, []), false)
+  // A helper too old to send the field built its table by the rule this
+  // replaces, so a missing list is unknown rather than permission.
+  assert.equal(Chord.isKnown("ALT + SPACE", bound, undefined), false)
+  assert.equal(Chord.isKnown("ALT + SPACE", bound, null), false)
+  assert.equal(Chord.isKnown("SUPER + K", bound, "SUPER"), false)
+  assert.equal(Chord.isKnown("SUPER + K", bound, {}), false)
+  assert.equal(Chord.isKnown("SUPER + K", bound, 3), false)
+})
