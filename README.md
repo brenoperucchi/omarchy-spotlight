@@ -2,7 +2,7 @@
 
 **A fast, local-first command palette for Omarchy.**
 
-Launch apps, jump to open windows, find files, search your clipboard, run Omarchy commands, calculate, convert units, create reminders and calendar events, or search the web—all from one input.
+Launch apps, jump to open windows, find files, search your clipboard, run Omarchy commands, calculate, convert units, create reminders and calendar events, or search the web, all from one input.
 
 [View Spotlight in the Omarchy Plugin Marketplace](https://plugins.omarchy.org/plugin.html?id=io.github.maajix.spotlight)
 
@@ -62,7 +62,7 @@ From two characters onward, Spotlight searches enabled local providers together 
 | `f invoice` | Search files and folders |
 | `~/Downloads/` | Search within a path |
 | `cb ssh` | Search clipboard history; Enter copies the full item |
-| `man ssh` or `tldr ssh` | Show tldr examples for a command; Enter copies one, Shift+Enter opens it in a terminal without running it |
+| `man ssh` or `tldr ssh` | Show tldr examples for a command, each under its description; Enter copies one, Shift+Enter opens it in a terminal without running it |
 | `gh quickshell` | Search GitHub |
 | `tr what is this to german` | Translate into the named language |
 | `example.com` | Open a URL directly |
@@ -282,6 +282,6 @@ Restart `omarchy-shell` after changing QML because the plugin stays loaded insid
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
 
 Spotlight is not affiliated with Apple or Raycast.
