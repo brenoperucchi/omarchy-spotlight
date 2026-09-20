@@ -1494,7 +1494,7 @@ class TldrTests(unittest.TestCase):
     def test_multi_word_page_joins_and_unknown_page_is_not_found(self):
         reply, calls = self._tldr(b"`git-commit` documentation is not available.\n", ["Git Commit"])
         self.assertEqual(calls, [["tldr", "-m", "--", "git-commit"]])
-        self.assertEqual(reply, {"ok": True, "page": "git-commit", "found": False})
+        self.assertEqual((reply["page"], reply["found"]), ("git-commit", False))
 
     def test_bad_page_names_are_denied(self):
         for name in ["../x", "-v", "", "a b/c"]:

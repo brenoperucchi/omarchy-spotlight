@@ -1756,10 +1756,7 @@ def cmd_tldr(argv):
             examples.append({"description": clamp_text(pending, TLDR_FIELD_CHARS),
                              "command": clamp_text(command, TLDR_FIELD_CHARS)})
             pending = ""
-    if not title:
-        emit({"page": page, "found": False})
-        return
-    emit({"page": page, "found": True, "title": title,
+    emit({"page": page, "found": bool(title), "title": title,
           "description": clamp_text(" ".join(description), TLDR_FIELD_CHARS),
           "url": url, "examples": examples})
 
