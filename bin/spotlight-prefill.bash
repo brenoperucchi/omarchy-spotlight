@@ -6,7 +6,6 @@
 # Report; its reply (ESC[0n) arrives as keyboard input at the first prompt and
 # the binding on that sequence moves the command onto the line.
 # ponytail: bash only; zsh (print -z) and fish (commandline) when asked for.
-[[ -f /etc/bash.bashrc ]] && source /etc/bash.bashrc
 [[ -f ~/.bashrc ]] && source ~/.bashrc
 SPOTLIGHT_PREFILL=$1
 shift

@@ -102,7 +102,6 @@ Item {
   property var clipboardRows: []
   property string clipboardFor: ""
   property var tldrPage: null
-  property string tldrFor: ""
 
   // Destructive commands need a second Enter. Holds the row key that is armed.
   property string armedKey: ""
@@ -151,7 +150,6 @@ Item {
   readonly property int filePatternChars: 256
   readonly property int fileMaxTerms: 8
   readonly property int maxClipboardRows: 50
-  readonly property int maxTldrRows: 16
   readonly property int maxReminderRows: 50
   readonly property int maxQueryChars: 512
   readonly property int maxPayloadChars: 4096
@@ -275,7 +273,6 @@ Item {
     root.clipboardRows = []
     root.clipboardFor = ""
     root.tldrPage = null
-    root.tldrFor = ""
     // The panel appears under wherever the pointer already is. Hold the cursor
     // for the same beat a keystroke would, so opening over a row does not hand
     // it the selection before the first character is typed.
@@ -319,7 +316,6 @@ Item {
     root.clipboardRows = []
     root.clipboardFor = ""
     root.tldrPage = null
-    root.tldrFor = ""
   }
 
   function refreshSettings() {
@@ -901,14 +897,13 @@ Item {
 
   // A tldr page keeps its own order: every row scores as an exact match, so
   // ranking falls through to tieRank, which is the position on the page.
-  function tldrResultRows(q) {
+  function tldrResultRows() {
     var page = root.tldrPage
-    if (!page || root.tldrFor !== String(q || "").trim()) return []
+    if (!page) return []
     var out = []
     function push(spec) {
       spec.accessory = "tldr"
       spec.section = spec.section || "Command help"
-      spec.resultType = "intent"
       spec.textMatch = Fuzzy.MATCH_EXACT
       spec.tieRank = out.length
       out.push(root.row(spec))
@@ -920,14 +915,13 @@ Item {
     }
     push({ key: "tldr.head", kind: "noop", icon: "󰋼", primaryLabel: "",
            title: page.title, subtitle: page.description })
-    var examples = Array.isArray(page.examples) ? page.examples.slice(0, root.maxTldrRows) : []
+    var examples = page.examples
     for (var i = 0; i < examples.length; i++) {
-      var command = String(examples[i].command || "")
       // Each example sits under its own description heading, so the row is the command alone.
-      push({ key: "tldr.ex:" + i, kind: "command", icon: "󰆍", mono: true,
-             section: examples[i].description, title: command,
+      push({ key: "tldr.ex:" + i, kind: "copy", icon: "󰆍", mono: true,
+             section: examples[i].description, title: examples[i].command,
              primaryLabel: "Copy command", secondaryLabel: "Open in terminal",
-             payload: { text: command } })
+             payload: { text: examples[i].command } })
     }
     if (page.url) push({ key: "tldr.url", kind: "url", icon: "󰖟", section: "More information",
                          title: page.url, payload: { url: String(page.url) } })
@@ -1179,7 +1173,7 @@ Item {
       else if (parsed.filter === "file") push(root.fileResultRows(q))
       else if (parsed.filter === "action" && searchable) push(root.commandRows(parsed.text, true))
       else if (parsed.filter === "clipboard") push(root.clipboardResultRows(q))
-      else if (parsed.filter === "tldr") push(root.tldrResultRows(q))
+      else if (parsed.filter === "tldr") push(root.tldrResultRows())
       else if (parsed.filter === "web") {
         push(root.intentRows(parsed.text, "web"))
         push(root.bangRows(parsed.text))
@@ -1315,13 +1309,6 @@ Item {
     Util.execArgv(["omarchy-launch-browser", String(url)])
   }
 
-  // A terminal with the command on the prompt, not run: bash receives it as
-  // a positional parameter and the rc file moves it onto the readline buffer.
-  function openInTerminal(text) {
-    Util.execArgv(["omarchy-launch-terminal", "bash", "--rcfile",
-      root.pluginFolder + "/bin/spotlight-prefill.bash", "-s", "--", String(text || "")])
-  }
-
   function openPath(path) {
     var target = String(path || "")
     if (!target) {
@@ -1406,12 +1393,11 @@ Item {
     case "copy":
       root.dismiss()
       // wl-copy over argv, never a shell string: the text is user data.
-      Util.execArgv(["wl-copy", "--", String(r.payload.text || "")])
-      break
-
-    case "command":
-      root.dismiss()
-      if (secondary) root.openInTerminal(r.payload.text)
+      // Shift+Enter, on rows that offer it, puts the text on a terminal prompt
+      // unexecuted: bash gets it as $1 and the rc file moves it onto readline.
+      if (secondary && r.secondaryLabel)
+        Util.execArgv(["omarchy-launch-terminal", "bash", "--rcfile",
+          root.pluginFolder + "/bin/spotlight-prefill.bash", "-s", "--", String(r.payload.text || "")])
       else Util.execArgv(["wl-copy", "--", String(r.payload.text || "")])
       break
 
@@ -1646,7 +1632,6 @@ Item {
   function loadTldr(raw, forQuery) {
     if (forQuery !== String(root.query || "").trim()) return
     root.tldrPage = root.helperReply(raw)
-    root.tldrFor = forQuery
     if (root.opened) root.rebuild()
   }
 
@@ -1675,14 +1660,13 @@ Item {
       root.clipboardFor = ""
     }
 
+    // Any query change drops the page; loadTldr only stores a reply for the current query.
+    root.tldrPage = null
     if (parsed.filter === "tldr" && parsed.text) {
       tldrDebounce.forQuery = q
       tldrDebounce.text = parsed.text
       tldrDebounce.restart()
-    } else {
-      tldrDebounce.stop()
-      if (root.tldrPage) { root.tldrPage = null; root.tldrFor = "" }
-    }
+    } else tldrDebounce.stop()
 
     var target = root.settings.fileSearch ? root.fileSearchTarget(q) : null
     if (target && target.pattern.length >= 1) {
