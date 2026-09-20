@@ -101,6 +101,8 @@ Item {
   property var reminderRows: []
   property var clipboardRows: []
   property string clipboardFor: ""
+  property var tldrPage: null
+  property string tldrFor: ""
 
   // Destructive commands need a second Enter. Holds the row key that is armed.
   property string armedKey: ""
@@ -149,6 +151,7 @@ Item {
   readonly property int filePatternChars: 256
   readonly property int fileMaxTerms: 8
   readonly property int maxClipboardRows: 50
+  readonly property int maxTldrRows: 16
   readonly property int maxReminderRows: 50
   readonly property int maxQueryChars: 512
   readonly property int maxPayloadChars: 4096
@@ -271,6 +274,8 @@ Item {
     root.fileFor = ""
     root.clipboardRows = []
     root.clipboardFor = ""
+    root.tldrPage = null
+    root.tldrFor = ""
     // The panel appears under wherever the pointer already is. Hold the cursor
     // for the same beat a keystroke would, so opening over a row does not hand
     // it the selection before the first character is typed.
@@ -306,11 +311,15 @@ Item {
     suggestDebounce.stop()
     fileDebounce.stop()
     clipboardDebounce.stop()
+    tldrDebounce.stop()
     suggestProc.running = false
     fileProc.running = false
     clipboardProc.running = false
+    tldrProc.running = false
     root.clipboardRows = []
     root.clipboardFor = ""
+    root.tldrPage = null
+    root.tldrFor = ""
   }
 
   function refreshSettings() {
@@ -601,6 +610,7 @@ Item {
       kind: String(spec.kind || "noop").slice(0, 32),
       title: String(spec.title || "").slice(0, root.maxTitleChars),
       subtitle: String(spec.subtitle || "").slice(0, root.maxSubtitleChars),
+      section: String(spec.section || "").slice(0, root.maxTitleChars),
       accessory: String(spec.accessory || "").slice(0, 128),
       icon: String(spec.icon || "").slice(0, 128),
       image: String(spec.image || "").slice(0, 2048),
@@ -889,6 +899,41 @@ Item {
     return out
   }
 
+  // A tldr page keeps its own order: every row scores as an exact match, so
+  // ranking falls through to tieRank, which is the position on the page.
+  function tldrResultRows(q) {
+    var page = root.tldrPage
+    if (!page || root.tldrFor !== String(q || "").trim()) return []
+    var out = []
+    function push(spec) {
+      spec.accessory = "tldr"
+      spec.section = spec.section || "Command help"
+      spec.resultType = "intent"
+      spec.textMatch = Fuzzy.MATCH_EXACT
+      spec.tieRank = out.length
+      out.push(root.row(spec))
+    }
+    if (page.found !== true) {
+      push({ key: "tldr.none", kind: "noop", icon: "󰋼", primaryLabel: "",
+             title: "No tldr page for “" + page.page + "”" })
+      return out
+    }
+    push({ key: "tldr.head", kind: "noop", icon: "󰋼", primaryLabel: "",
+           title: page.title, subtitle: page.description })
+    var examples = Array.isArray(page.examples) ? page.examples.slice(0, root.maxTldrRows) : []
+    for (var i = 0; i < examples.length; i++) {
+      var command = String(examples[i].command || "")
+      // Each example sits under its own description heading, so the row is the command alone.
+      push({ key: "tldr.ex:" + i, kind: "command", icon: "󰆍", mono: true,
+             section: examples[i].description, title: command,
+             primaryLabel: "Copy command", secondaryLabel: "Open in terminal",
+             payload: { text: command } })
+    }
+    if (page.url) push({ key: "tldr.url", kind: "url", icon: "󰖟", section: "More information",
+                         title: page.url, payload: { url: String(page.url) } })
+    return out
+  }
+
   function clipboardSearchTarget(q) {
     if (!root.settings.clipboardSearch) return null
     var parsed = Query.parse(q)
@@ -1102,6 +1147,7 @@ Item {
 
   function resultSection(row) {
     if (!row || row.key === "filter.hint") return ""
+    if (row.section) return row.section
     if (row.resultType === "app") return "Applications"
     if (row.resultType === "window") return "Windows"
     if (row.resultType === "action") return "Commands"
@@ -1133,6 +1179,7 @@ Item {
       else if (parsed.filter === "file") push(root.fileResultRows(q))
       else if (parsed.filter === "action" && searchable) push(root.commandRows(parsed.text, true))
       else if (parsed.filter === "clipboard") push(root.clipboardResultRows(q))
+      else if (parsed.filter === "tldr") push(root.tldrResultRows(q))
       else if (parsed.filter === "web") {
         push(root.intentRows(parsed.text, "web"))
         push(root.bangRows(parsed.text))
@@ -1268,6 +1315,13 @@ Item {
     Util.execArgv(["omarchy-launch-browser", String(url)])
   }
 
+  // A terminal with the command on the prompt, not run: bash receives it as
+  // a positional parameter and the rc file moves it onto the readline buffer.
+  function openInTerminal(text) {
+    Util.execArgv(["omarchy-launch-terminal", "bash", "--rcfile",
+      root.pluginFolder + "/bin/spotlight-prefill.bash", "-s", "--", String(text || "")])
+  }
+
   function openPath(path) {
     var target = String(path || "")
     if (!target) {
@@ -1353,6 +1407,12 @@ Item {
       root.dismiss()
       // wl-copy over argv, never a shell string: the text is user data.
       Util.execArgv(["wl-copy", "--", String(r.payload.text || "")])
+      break
+
+    case "command":
+      root.dismiss()
+      if (secondary) root.openInTerminal(r.payload.text)
+      else Util.execArgv(["wl-copy", "--", String(r.payload.text || "")])
       break
 
     case "clipcopy":
@@ -1583,6 +1643,13 @@ Item {
     if (root.opened) root.rebuild()
   }
 
+  function loadTldr(raw, forQuery) {
+    if (forQuery !== String(root.query || "").trim()) return
+    root.tldrPage = root.helperReply(raw)
+    root.tldrFor = forQuery
+    if (root.opened) root.rebuild()
+  }
+
   // Query changes fan out to the async providers on a short debounce so a
   // fast typist does not spawn a process per keystroke.
   onQueryChanged: {
@@ -1606,6 +1673,15 @@ Item {
       clipboardDebounce.stop()
       if (root.clipboardRows.length > 0) root.clipboardRows = []
       root.clipboardFor = ""
+    }
+
+    if (parsed.filter === "tldr" && parsed.text) {
+      tldrDebounce.forQuery = q
+      tldrDebounce.text = parsed.text
+      tldrDebounce.restart()
+    } else {
+      tldrDebounce.stop()
+      if (root.tldrPage) { root.tldrPage = null; root.tldrFor = "" }
     }
 
     var target = root.settings.fileSearch ? root.fileSearchTarget(q) : null
@@ -1730,6 +1806,28 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.loadClipboard(text, clipboardProc.forQuery)
+    }
+  }
+
+  Timer {
+    id: tldrDebounce
+    interval: 160
+    property string text: ""
+    property string forQuery: ""
+    onTriggered: {
+      tldrProc.running = false
+      tldrProc.forQuery = tldrDebounce.forQuery
+      tldrProc.command = root.helperArgv(["tldr", tldrDebounce.text])
+      tldrProc.running = true
+    }
+  }
+
+  Process {
+    id: tldrProc
+    property string forQuery: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadTldr(text, tldrProc.forQuery)
     }
   }
 
@@ -2169,12 +2267,15 @@ Item {
             Text {
               text: parent.section
               textFormat: Text.PlainText
+              elide: Text.ElideRight
               color: root.foreground
               opacity: 0.5
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               anchors.left: parent.left
               anchors.leftMargin: root.gutter
+              anchors.right: parent.right
+              anchors.rightMargin: root.gutter
               anchors.bottom: parent.bottom
               anchors.bottomMargin: Style.space(3)
             }
