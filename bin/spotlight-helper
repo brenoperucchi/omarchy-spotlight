@@ -1897,6 +1897,14 @@ def _hypr_request(payload):
         sock.close()
 
 
+def _hypr_flag(record, name):
+    """A `j/binds` boolean, which Hyprland writes as the string "true"."""
+    value = record.get(name)
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
 def _hypr_mods(record):
     """The modifier set of a `j/binds` record, in _chord_mods form."""
     modmask = record.get("modmask")
@@ -1967,6 +1975,14 @@ def _bound_chords():
     because Hyprland reported a bind under them that this reply does not let
     us name. Absence of a chord under one of those is not evidence the chord
     is free; absence under any other modifier set is.
+
+    Two limits worth stating, since callers read absence as a fact. This
+    answers for binds the compositor holds, not for shortcuts some other
+    program grabs - the browser-extension chords in --print's static list
+    reach the table only through the merge below, and vanish with it. And a
+    bind carrying Hyprland's ignore_mods flag fires under modifier sets
+    other than its own, which `j/binds` does not report in either format on
+    0.56, so a modmask is taken at face value as the reach of its bind.
     """
     raw = _hypr_request(b"j/binds")
     if raw is None:
@@ -1983,8 +1999,11 @@ def _bound_chords():
         if not isinstance(record, dict):
             return None, []
         # A bind under a submap only fires after that submap is entered, so
-        # it does not occupy the chord in the default map.
-        if record.get("submap"):
+        # it does not occupy the chord in the default map - unless it is
+        # marked universal, which is exactly the flag that makes it fire
+        # everywhere. Hyprland serializes that one as the string "true",
+        # so Python truthiness would read "false" as yes.
+        if record.get("submap") and not _hypr_flag(record, "submap_universal"):
             continue
         chord = _canon_hypr_bind(record)
         if chord is None:

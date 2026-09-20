@@ -634,7 +634,8 @@ class BindingTests(unittest.TestCase):
         self.print_output = b""
         self.binds_output = json.dumps([
             {"modmask": 1 | 4 | 8 | 64, "key": "K", "submap": "", "description": "All mods"},
-            {"modmask": 8, "key": "SPACE", "submap": "resize", "description": "In a submap"},
+            {"modmask": 8, "key": "SPACE", "submap": "resize", "description": "In a submap",
+             "submap_universal": "false"},
             {"modmask": 0, "key": "mouse:272", "submap": "", "description": "Mouse"},
             {"modmask": 4, "key": "SPACE", "submap": "", "description": None},
             # An unmapped bit (CapsLock) still names the chord: reporting a
@@ -657,6 +658,39 @@ class BindingTests(unittest.TestCase):
                 dict({"key": "", "submap": "", "description": "bad"}, **bad),
             ]).encode("utf-8")
             self.assertEqual(HELPER._bound_chords(), (None, []), bad)
+
+    def test_a_universal_submap_bind_still_holds_the_chord(self):
+        # A bind under a submap normally waits for that submap to be
+        # entered, but the universal flag is what makes it fire everywhere,
+        # so it occupies the chord in the default map like any other.
+        # Hyprland writes the flag as the string "true", which means Python
+        # truthiness would read "false" as yes.
+        self.print_output = b""
+        for flag, occupied in (("true", True), (True, True), ("TRUE", True),
+                               ("false", False), (False, False), ("", False),
+                               (None, False), ("yes", False)):
+            record = {"modmask": 8, "key": "SPACE", "submap": "resize",
+                      "description": "Universal"}
+            if flag is not None:
+                record["submap_universal"] = flag
+            self.binds_output = json.dumps([
+                {"modmask": 64, "key": "B", "submap": "", "description": "Browser"},
+                record,
+            ]).encode("utf-8")
+            bound, unknown = HELPER._bound_chords()
+            self.assertEqual("ALT + SPACE" in bound, occupied, flag)
+            self.assertEqual(unknown, [], flag)
+
+    def test_a_universal_submap_bind_it_cannot_name_marks_its_modifiers(self):
+        self.print_output = b""
+        self.binds_output = json.dumps([
+            {"modmask": 64, "key": "B", "submap": "", "description": "Browser"},
+            {"modmask": 8, "key": "", "submap": "resize", "submap_universal": "true",
+             "description": "Universal, unnameable"},
+        ]).encode("utf-8")
+        bound, unknown = HELPER._bound_chords()
+        self.assertEqual(unknown, ["ALT"])
+        self.assertFalse(HELPER._chord_is_known("ALT + SPACE", bound, unknown))
 
     def test_hypr_socket_path_refuses_a_signature_it_cannot_trust(self):
         env = {"XDG_RUNTIME_DIR": "/run/user/1000",
