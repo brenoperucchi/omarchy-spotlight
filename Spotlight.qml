@@ -1287,6 +1287,22 @@ Item {
   // With no deliberate cursor the intent is always "the best row for what I
   // typed", and resolving that at the keystroke closes the window between a
   // rebuild landing and the cursor settling onto it.
+  // The path a Ctrl+C would copy, or "" when the selected row has none. A
+  // folder copies as its own path, not its parent's.
+  function copyPathTarget() {
+    var r = root.selectedRow()
+    return (r && r.resultType === "file" && r.payload && r.payload.path)
+      ? String(r.payload.path) : ""
+  }
+
+  function copySelectedPath() {
+    var path = root.copyPathTarget()
+    if (path === "") return
+    root.dismiss()
+    // wl-copy over argv, never a shell string: the path is user data.
+    Util.execArgv(["wl-copy", "--", path])
+  }
+
   function activateSelection(secondary) {
     root.activate(root.pinnedKey ? root.selectedIndex : root.firstSelectableIndex(), secondary)
   }
@@ -2116,6 +2132,13 @@ Item {
               var secondary = (event.modifiers & Qt.ShiftModifier) || (event.modifiers & Qt.ControlModifier)
               root.activateSelection(secondary ? true : false)
               event.accepted = true
+            } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier)
+                && input.selectedText.length === 0 && root.copyPathTarget() !== "") {
+              // Ctrl+C on a file result copies its path, the way Cmd+C does in
+              // Spotlight. Only when nothing is selected in the query: with a
+              // selection this is an ordinary copy and has to stay one.
+              root.copySelectedPath()
+              event.accepted = true
             } else if (event.key === Qt.Key_Tab) {
               // Tab completes the query with the selected row's title, the way
               // a shell completes a path — handy for narrowing an app search.
@@ -2385,6 +2408,16 @@ Item {
           Text {
             readonly property var sel: root.selectedRow()
             text: sel && sel.secondaryLabel ? "⇧↵  " + sel.secondaryLabel : ""
+            visible: text.length > 0
+            textFormat: Text.PlainText
+            color: root.foreground
+            opacity: 0.4
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            text: root.copyPathTarget() !== "" ? "⌃C  Copy path" : ""
             visible: text.length > 0
             textFormat: Text.PlainText
             color: root.foreground
