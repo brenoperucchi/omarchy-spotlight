@@ -2082,7 +2082,8 @@ def _bound_chords():
     # turn into a guess. An unreliable modifier set stays unreliable until
     # the compositor itself names those binds.
     for chord, desc in (_print_chords() or {}).items():
-        bound.setdefault(chord, desc)
+        if not bound.get(chord):
+            bound[chord] = desc
     return bound, sorted(unknown)
 
 

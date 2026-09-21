@@ -623,6 +623,18 @@ class BindingTests(unittest.TestCase):
         self.print_status = 0
         self.assertEqual(HELPER._print_chords(), {})
 
+    def test_print_fills_empty_descriptions_without_replacing_compositor_labels(self):
+        self.print_output = "ALT + SPACE \u2192 Menu label\n".encode("utf-8")
+        for description, expected in (("", "Menu label"), (None, "Menu label"),
+                                      ("Compositor label", "Compositor label")):
+            self.binds_output = json.dumps([
+                {"modmask": 8, "key": "SPACE", "submap": "", "description": description},
+            ]).encode("utf-8")
+            self.assertEqual(HELPER._bound_chords(), ({"ALT + SPACE": expected}, []))
+        self.print_output = None
+        self.binds_output = b'[{"modmask": 8, "key": "SPACE", "description": ""}]'
+        self.assertEqual(HELPER._bound_chords(), ({"ALT + SPACE": ""}, []))
+
     def test_bound_chords_rejects_a_bind_table_it_cannot_trust(self):
         for raw in (b"", b"not json", b"[]", b"{}", b'["bind"]', b"[[]]",
                     b'[{"modmask": 4, "key": "SPACE"}, 7]', b"\xff\xfe"):

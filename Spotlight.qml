@@ -508,7 +508,7 @@ Item {
       if (chord && !Object.prototype.hasOwnProperty.call(bound, chord))
         bound[chord] = String(raw[key]).slice(0, 80)
     }
-    var unknownMods = (reply && Array.isArray(reply.unknownMods)) ? reply.unknownMods : []
+    var unknownMods = (reply && Array.isArray(reply.unknownMods)) ? reply.unknownMods : null
     root.tourBinding = {
       current: Chord.normalize(reply && reply.current ? reply.current : ""),
       previous: Chord.normalize(reply && reply.previous ? reply.previous : ""),
